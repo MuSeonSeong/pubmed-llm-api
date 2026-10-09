@@ -110,15 +110,16 @@ class ModelManager:
 
     async def generate(self, model_id: str, messages: list[dict], tools: list[dict],
                        max_tokens: int, temperature: float, *, on_text: Callable[[str], None] | None = None,
-                       cancel: threading.Event | None = None) -> GenerationResult:
+                       cancel: threading.Event | None = None, thinking: bool = False) -> GenerationResult:
         """on_text runs on the worker thread with the cumulative raw completion text."""
         if model_id not in self.catalog:
             raise ServiceError('unknown_model', f'Unknown model: {model_id}', 422)
         return await anyio.to_thread.run_sync(partial(self._generate_sync, model_id, messages, tools,
-                                                     max_tokens, temperature, on_text, cancel),
+                                                     max_tokens, temperature, on_text, cancel, thinking),
                                               abandon_on_cancel=False)
 
-    def _generate_sync(self, model_id, messages, tools, max_tokens, temperature, on_text=None, cancel=None):
+    def _generate_sync(self, model_id, messages, tools, max_tokens, temperature, on_text=None, cancel=None,
+                       thinking=False):
         with self._lock:
             if cancel is not None and cancel.is_set():
                 return GenerationResult('', 'cancelled', 0, 0)
@@ -129,7 +130,7 @@ class ModelManager:
                     self._loaded_id = model_id
                 tokenizer, model = self._tokenizer, self._model
                 inputs = tokenizer.apply_chat_template(messages, tools=tools or None, tokenize=True,
-                    return_dict=True, return_tensors='pt', add_generation_prompt=True, enable_thinking=False)
+                    return_dict=True, return_tensors='pt', add_generation_prompt=True, enable_thinking=thinking)
                 count = inputs['input_ids'].shape[-1]
                 if count + max_tokens > self.settings.max_context_tokens:
                     raise ServiceError('context_overflow', 'Input plus requested output exceeds context budget',

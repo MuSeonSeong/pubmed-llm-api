@@ -13,8 +13,9 @@ class Generator:
     def __init__(self,outputs):
         self.outputs=iter(outputs)
         self.messages=[]
-    async def generate(self,model_id,messages,tools,max_tokens,temperature,on_text=None,cancel=None):
+    async def generate(self,model_id,messages,tools,max_tokens,temperature,on_text=None,cancel=None,thinking=False):
         self.messages.append(list(messages))
+        self.thinking=thinking
         value=next(self.outputs)
         if isinstance(value,Exception):
             raise value
@@ -256,3 +257,48 @@ def test_drop_oldest_turn_removes_a_whole_turn():
     assert drop_oldest_turn(messages) == 2
     assert [m['content'] for m in messages] == ['q2']
     assert drop_oldest_turn(messages) == 0
+
+
+@pytest.mark.parametrize('raw,expected',[
+    ('<think>\nplan\n</think>\n\nAnswer', ('plan','\n\nAnswer')),   # Qwen3 writes the tag
+    ('plan\n</think>\n\nAnswer', ('plan','\n\nAnswer')),             # Qwen3.5 pre-fills it
+    ('<thi', ('',None)),
+    ('<think>still going', ('still going',None)),
+    ('still going</thi', ('still going',None)),
+])
+def test_split_reasoning(raw,expected):
+    from app.chat_service import split_reasoning
+    assert split_reasoning(raw) == expected
+
+
+def test_thinking_streams_reasoning_separately_and_returns_it():
+    events=stream(['<think>\nLet me add.\n</think>\n\n4'],use_pubmed=False,thinking=True)
+    reasoning=''.join(e['content'] for e in events if e['type']=='reasoning')
+    answer=''.join(e['content'] for e in events if e['type']=='delta')
+    assert reasoning == 'Let me add.'
+    assert answer == '4'
+    message=events[-1]['choices'][0]['message']
+    assert message['content'] == '4'
+    assert message['reasoning_content'] == 'Let me add.'
+
+
+def test_thinking_ignores_tool_markup_inside_reasoning_and_runs_real_calls():
+    raw='<think>I could write <tool_call> here</think>'+call()
+    r,g,p=complete([raw,'<think>ok</think>Final'],thinking=True)
+    assert len(p.executed) == 1
+    assert r.choices[0].message.content.startswith('Final')
+    assert r.choices[0].message.reasoning_content == 'I could write <tool_call> here\n\nok'
+    assert g.thinking is True
+
+
+def test_thinking_cut_off_by_length_returns_reasoning_without_answer():
+    r,_,_=complete([GenerationResult('<think>long reasoning','length',5,5)],use_pubmed=False,thinking=True)
+    assert r.choices[0].message.content == ''
+    assert r.choices[0].message.reasoning_content == 'long reasoning'
+    assert r.choices[0].finish_reason == 'length'
+
+
+def test_without_thinking_reasoning_field_is_absent():
+    r,g,_=complete(['hello'],use_pubmed=False)
+    assert r.choices[0].message.reasoning_content is None
+    assert g.thinking is False

@@ -27,6 +27,7 @@
     <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16Zm9.5-13.5 4 4"/></symbol>
     <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3Z"/></symbol>
     <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14m-6-6 6 6 6-6"/></symbol>
   </svg>
 
@@ -87,7 +88,10 @@
           <label class="sr-only" for="prompt">메시지</label>
           <textarea id="prompt" placeholder="메시지를 입력하세요" rows="1" aria-label="메시지" required></textarea>
           <div class="composer-bottom">
-            <label class="pubmed-toggle" for="use-pubmed"><input id="use-pubmed" type="checkbox" checked><svg class="icon"><use href="#i-search"/></svg><span>PubMed 검색</span><span class="toggle-indicator"></span></label>
+            <div class="toggles">
+              <label class="pubmed-toggle" for="use-pubmed" title="논문이 필요할 때 PubMed를 검색합니다"><input id="use-pubmed" type="checkbox" checked><svg class="icon"><use href="#i-search"/></svg><span>PubMed 검색</span><span class="toggle-indicator"></span></label>
+              <label class="pubmed-toggle" for="use-thinking" title="답하기 전에 생각합니다. 더 정확할 수 있지만 느립니다"><input id="use-thinking" type="checkbox"><svg class="icon"><use href="#i-bulb"/></svg><span>추론</span><span class="toggle-indicator"></span></label>
+            </div>
             <div class="send-controls"><span class="input-hint">Shift + Enter로 줄바꿈</span><button id="send" class="send-button" type="submit" aria-label="메시지 보내기" disabled><svg class="icon"><use href="#i-arrow"/></svg></button><button id="stop" class="send-button stop-button" type="button" aria-label="답변 중지" title="답변 중지" hidden><svg class="icon"><use href="#i-stop"/></svg></button></div>
           </div>
         </form>

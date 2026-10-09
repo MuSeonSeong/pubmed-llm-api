@@ -37,10 +37,12 @@ let lastChatId;
 let shownIds = new Set();
 let nodeCache = new Map();
 let editingId = null;
+let editingText = '';
 let renamingId = null;
 let followOutput = true;
 let toastTimer;
 let renderQueued = false;
+const reasoningOpen = new Map();  // message id -> the user's own expand/collapse choice
 
 function toast(text) {
   $('toast').textContent = text;
@@ -95,7 +97,7 @@ function renameField(chat) {
 
 function renderHistory() {
   const history = $('chat-list');
-  if (history.contains(document.activeElement) && renamingId) return;  // keep the rename field alive
+  if (renamingId && document.activeElement?.classList.contains('rename-input')) return;  // keep the field alive
   history.replaceChildren();
   const query = $('chat-search').value.trim().toLowerCase();
   const chats = store.chats.filter(chat => chat.messages.length)
@@ -185,11 +187,32 @@ function toolDetails(calls, open) {
   return details;
 }
 
+function reasoningPanel(message) {
+  const thinking = message.streaming && !message.content && !message.toolCalls.some(call => call.running);
+  const details = element('details', 'reasoning-panel' + (thinking ? ' active' : ''));
+  const initial = reasoningOpen.has(message.id) ? reasoningOpen.get(message.id) : thinking;
+  details.open = initial;
+  const seconds = Math.max(1, Math.round((message.thinkMs || 0) / 1000));
+  details.append(element('summary', '', thinking ? '생각하는 중…'
+    : message.thinkMs !== undefined ? seconds + '초 동안 생각함' : '생각 과정'));
+  details.append(element('div', 'reasoning-text', message.reasoning));
+  // Setting .open above also fires a toggle event; only a change from that state is the user's choice.
+  details.addEventListener('toggle', () => { if (details.open !== initial) reasoningOpen.set(message.id, details.open); });
+  return details;
+}
+
+function startEdit(message) {
+  editingId = message.id;
+  editingText = message.content;
+  render();
+}
+
 function editForm(message) {
   const form = element('form', 'edit-form');
   const field = element('textarea', 'edit-input');
-  field.value = message.content;
+  field.value = editingText;
   field.setAttribute('aria-label', '질문 수정');
+  field.addEventListener('input', () => { editingText = field.value; });
   const resize = () => { field.style.height = 'auto'; field.style.height = Math.min(field.scrollHeight, 260) + 'px'; };
   field.addEventListener('input', resize);
   field.addEventListener('keydown', event => {
@@ -209,7 +232,8 @@ function editForm(message) {
   form.append(field, buttons);
   form.addEventListener('submit', event => {
     event.preventDefault();
-    if (!field.value.trim() || store.busy) return;
+    if (!field.value.trim()) return;
+    if (store.busy) { toast('지금 답변이 끝난 뒤에 보낼 수 있어요.'); return; }
     editingId = null;
     followOutput = true;
     store.edit(message.id, field.value);
@@ -228,7 +252,7 @@ function renderUser(message) {
   article.append(element('div', 'user-content', message.content));
   const actions = element('div', 'message-actions user-actions');
   actions.append(iconButton('copy', '질문 복사', () => copyText(message.content, '질문을 복사했습니다.')));
-  const edit = iconButton('edit', '질문 수정', () => { editingId = message.id; render(); });
+  const edit = iconButton('edit', '질문 수정', () => startEdit(message));
   edit.disabled = store.busy;
   actions.append(edit);
   article.append(actions);
@@ -251,13 +275,16 @@ function renderAssistant(message, chat) {
   article.setAttribute('aria-label', '답변');
   article.append(assistantHeading());
   const body = element('div', 'assistant-body');
+  if (message.reasoning) body.append(reasoningPanel(message));
   if (message.streaming && message.toolCalls.length) body.append(toolDetails(message.toolCalls, false));
   if (message.content) {
     const text = element('div', 'markdown' + (message.streaming ? ' streaming' : ''));
     text.innerHTML = renderMarkdown(message.content);
     body.append(text);
   }
-  if (message.streaming && !message.content) body.append(progressLine(message, chat));
+  if (message.streaming && !message.content && !(message.reasoning && !message.toolCalls.some(call => call.running))) {
+    body.append(progressLine(message, chat));
+  }
   if (message.stopped) body.append(element('div', 'truncated-note', '답변 생성을 중지했습니다.'));
   if (message.dropped) body.append(element('div', 'truncated-note',
     '대화가 길어 앞부분 메시지 ' + message.dropped + '개는 참고하지 않고 답했어요. 새 주제라면 새 대화를 시작해 보세요.'));
@@ -283,8 +310,9 @@ function renderMessages() {
   const nextCache = new Map();
   const nodes = chat.messages.map((message, index) => {
     // Rebuild a message only when its content or available actions change; streaming touches one node.
-    const key = JSON.stringify(message) + store.busy + (index === chat.messages.length - 1)
-      + (editingId === message.id) + chat.usePubmed;
+    // An open edit form is never rebuilt, so typed text and the caret survive unrelated updates.
+    const key = editingId === message.id ? 'editing' : JSON.stringify(message) + store.busy
+      + (index === chat.messages.length - 1) + chat.usePubmed + reasoningOpen.get(message.id);
     const cached = nodeCache.get(message.id);
     const node = cached?.key === key ? cached.node
       : message.role === 'user' ? renderUser(message) : renderAssistant(message, chat);
@@ -332,6 +360,8 @@ function render() {
   $('model').disabled = store.busy;
   $('use-pubmed').checked = chat.usePubmed;
   $('use-pubmed').disabled = store.busy;
+  $('use-thinking').checked = chat.thinking;
+  $('use-thinking').disabled = store.busy;
   $('new-chat').disabled = store.busy;
   $('storage-warning').textContent = store.storageWarning;
   $('storage-warning').hidden = !store.storageWarning;
@@ -367,7 +397,7 @@ prompt.addEventListener('keydown', event => {
   }
   if (event.key === 'ArrowUp' && !prompt.value && !store.busy) {
     const last = store.current.messages.findLast(message => message.role === 'user');
-    if (last) { event.preventDefault(); editingId = last.id; render(); }
+    if (last) { event.preventDefault(); startEdit(last); }
   }
 });
 conversation.addEventListener('scroll', () => {
@@ -388,6 +418,7 @@ $('messages').addEventListener('click', event => {
 });
 $('model').addEventListener('change', event => { store.current.model = event.target.value; store.emit(); });
 $('use-pubmed').addEventListener('change', event => { store.current.usePubmed = event.target.checked; store.emit(); });
+$('use-thinking').addEventListener('change', event => { store.current.thinking = event.target.checked; store.emit(); });
 $('chat-search').addEventListener('input', renderHistory);
 function newChat() {
   if (store.busy) return;

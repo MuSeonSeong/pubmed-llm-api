@@ -3,7 +3,9 @@ const MODELS = ['qwen3.5-2b', 'qwen3-0.6b'];
 export const DEFAULT_SETTINGS = Object.freeze({ systemPrompt: '', temperature: 0.2, maxTokens: 512 });
 const id = () => globalThis.crypto.randomUUID();
 const freshChat = () => ({ id: id(), title: '새 대화', model: MODELS[0],
-  usePubmed: true, messages: [], updatedAt: Date.now() });
+  usePubmed: true, thinking: false, messages: [], updatedAt: Date.now() });
+/** Reasoning spends tokens before the answer starts, so thinking requests get a larger floor. */
+export const THINKING_MIN_TOKENS = 1024;
 const STOPPED = '답변 생성을 중지했습니다.';
 
 function normalizeTools(calls) {
@@ -33,6 +35,8 @@ function restoreChat(chat) {
       toolCalls: normalizeTools(message.toolCalls), truncated: message.truncated === true,
       stopped: message.stopped === true || message.streaming === true,
       ...(Number.isInteger(message.dropped) && message.dropped > 0 ? { dropped: message.dropped } : {}),
+      ...(typeof message.reasoning === 'string' && message.reasoning ? { reasoning: message.reasoning } : {}),
+      ...(Number.isFinite(message.thinkMs) && message.thinkMs >= 0 ? { thinkMs: message.thinkMs } : {}),
       ...(typeof message.error === 'string' ? { error: message.error } : {}),
       ...(message.role === 'user' && message.pending === true ? { pending: true } : {}) }));
   messages.forEach((message, index) => {
@@ -43,7 +47,8 @@ function restoreChat(chat) {
     }
   });
   return { id: chat.id, title: chat.title, model: MODELS.includes(chat.model) ? chat.model : MODELS[0],
-    usePubmed: chat.usePubmed !== false, messages, updatedAt: Number(chat.updatedAt) || Date.now() };
+    usePubmed: chat.usePubmed !== false, thinking: chat.thinking === true, messages,
+    updatedAt: Number(chat.updatedAt) || Date.now() };
 }
 
 function errorMessage(error, status) {
@@ -92,8 +97,11 @@ function finish(draft, data) {
   draft.toolCalls = normalizeTools(data.tool_calls);
   draft.truncated = choice.finish_reason === 'length';
   draft.stopped = choice.finish_reason === 'cancelled';
+  if (typeof choice.message.reasoning_content === 'string' && choice.message.reasoning_content) {
+    draft.reasoning = choice.message.reasoning_content;
+  }
   if (Number.isInteger(data.dropped_messages) && data.dropped_messages > 0) draft.dropped = data.dropped_messages;
-  if (!content.trim() && !draft.stopped) throw new Error('빈 응답을 받았습니다. 다시 시도해 주세요.');
+  if (!content.trim() && !draft.stopped && !draft.reasoning) throw new Error('빈 응답을 받았습니다. 다시 시도해 주세요.');
 }
 
 export class ChatStore {
@@ -233,14 +241,16 @@ export class ChatStore {
     chat.messages.push(draft);
     const controller = new AbortController();
     this.controller = controller;
+    let finished = false;
     this.emit();
     try {
       const fetcher = this.fetcher;
       const response = await fetcher('/v1/chat/completions', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-        body: JSON.stringify({ model: chat.model, messages: history, max_tokens: this.settings.maxTokens,
+        body: JSON.stringify({ model: chat.model, messages: history,
+          max_tokens: chat.thinking ? Math.max(this.settings.maxTokens, THINKING_MIN_TOKENS) : this.settings.maxTokens,
           temperature: this.settings.temperature, use_pubmed: chat.usePubmed, stream: true,
-          truncate_history: true }),
+          truncate_history: true, ...(chat.thinking ? { thinking: true } : {}) }),
       });
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
@@ -248,14 +258,21 @@ export class ChatStore {
       }
       if (!(response.headers?.get('content-type') || '').includes('text/event-stream')) {
         finish(draft, await response.json());
+        finished = true;
       } else {
-        let done = false;
         for await (const event of readEvents(response.body)) {
-          if (event.type === 'delta') draft.content += event.content;
+          if (event.type === 'reasoning') {
+            draft.thinkStart ??= Date.now();
+            draft.reasoning = (draft.reasoning || '') + event.content;
+          } else if (event.type === 'delta') {
+            if (draft.thinkStart && draft.thinkMs === undefined) draft.thinkMs = Date.now() - draft.thinkStart;
+            draft.content += event.content;
+          }
           else if (event.type === 'status') draft.stage = event.stage;
           else if (event.type === 'tool') {
             if (event.status === 'running') {
               draft.content = '';  // text before a tool call is superseded by the grounded answer
+              if (draft.reasoning) draft.reasoning += '\n\n';
               draft.toolCalls.push({ name: event.name, arguments: event.arguments || {}, running: true });
             } else {
               const call = draft.toolCalls.findLast(item => item.running && item.name === event.name);
@@ -264,14 +281,15 @@ export class ChatStore {
             }
           } else if (event.type === 'done') {
             finish(draft, event);
-            done = true;
+            finished = true;
           } else if (event.type === 'error') throw new Error(errorMessage(event.error, event.status));
           this.onChange();
         }
-        if (!done) throw new Error('응답이 중간에 끊겼습니다. 다시 시도해 주세요.');
+        if (!finished) throw new Error('응답이 중간에 끊겼습니다. 다시 시도해 주세요.');
       }
     } catch (error) {
-      if (controller.signal.aborted && draft.content.trim()) draft.stopped = true;
+      if (finished) { /* stopped after the complete answer arrived: keep it as finished */ }
+      else if (controller.signal.aborted && draft.content.trim()) draft.stopped = true;
       else {
         chat.messages.splice(chat.messages.indexOf(draft), 1);
         message.error = controller.signal.aborted ? STOPPED : error instanceof TypeError
@@ -279,6 +297,8 @@ export class ChatStore {
           : error.message || '응답을 받지 못했습니다. 다시 시도해 주세요.';
       }
     } finally {
+      if (draft.thinkStart && draft.thinkMs === undefined) draft.thinkMs = Date.now() - draft.thinkStart;
+      delete draft.thinkStart;
       delete draft.streaming;
       delete draft.stage;
       draft.toolCalls = normalizeTools(draft.toolCalls.map(({ running, ...call }) => call));

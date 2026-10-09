@@ -58,6 +58,7 @@ PowerShell 환경에서 활성화 스크립트가 차단되어 있으면 가상�
 - 마지막 답변의 **다시 생성** 버튼으로 새 답변을 받을 수 있습니다. 질문에 마우스를 올려 **수정**하면 그 뒤의 대화를 지우고 다시 답합니다. 빈 입력창에서 ↑를 누르면 마지막 질문을 수정합니다.
 - 왼쪽 목록은 날짜별로 묶이고, 검색·이름 변경(더블클릭 또는 연필)·삭제를 할 수 있습니다. **새 대화**는 ⌘K 또는 Ctrl+K입니다.
 - 상단에서 모델을 고르고, 입력창의 **PubMed 검색**으로 논문 검색 사용 여부를 대화마다 바꿉니다.
+- 입력창의 **추론**을 켜면 모델이 답하기 전에 생각하며, 생각 과정을 접을 수 있는 패널에 실시간으로 보여줍니다. 더 신중하지만 느리고 토큰을 많이 쓰므로 최대 답변 길이를 최소 1024로 올려 요청합니다.
 - 오른쪽 위 **설정**에서 모든 대화에 적용할 맞춤 지시문, 창의성(temperature), 최대 답변 길이, 밝은/어두운 테마를 정합니다. 대화를 JSON으로 내보내거나 모두 삭제할 수도 있습니다.
 - 대화가 모델의 문맥 한도를 넘으면 오래된 질문과 답변부터 빼고 답하며, 몇 개를 뺐는지 알려줍니다.
 - 표, 인용, 코드 블록(복사 버튼 포함), 링크를 서식에 맞춰 표시합니다. PMID 링크와 검색·조회 내역도 확인할 수 있습니다.
@@ -123,7 +124,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"qwen3.5-2b","messages":[{"role":"user","content":"PubMed에서 A programmable dual-RNA-guided DNA endonuclease in adaptive bacterial immunity 논문을 1건 검색하고, 검색된 PMID로 초록을 조회한 뒤 한국어 두 문장으로 요약해줘."}],"max_tokens":512,"temperature":0,"use_pubmed":true}'
 ```
 
-`model` 생략 시 `qwen3.5-2b`, `max_tokens` 기본 512·범위 1~2048, `temperature` 기본 0.2·범위 0~2, `use_pubmed` 기본 true, `stream`·`truncate_history` 기본 false입니다. 메시지는 system/user/assistant 텍스트를 지원하며 최소 한 개의 user 메시지가 필요합니다. system 메시지는 템플릿 호환을 위해 앞쪽에서 병합합니다. 대화는 서버에 저장하지 않으므로 다음 요청에 필요한 기록을 포함하세요.
+`model` 생략 시 `qwen3.5-2b`, `max_tokens` 기본 512·범위 1~2048, `temperature` 기본 0.2·범위 0~2, `use_pubmed` 기본 true, `stream`·`truncate_history`·`thinking` 기본 false입니다. `thinking: true`이면 Qwen의 생각 모드를 켜고, 생각 내용은 답변과 분리해 `choices[0].message.reasoning_content`로 반환합니다. 메시지는 system/user/assistant 텍스트를 지원하며 최소 한 개의 user 메시지가 필요합니다. system 메시지는 템플릿 호환을 위해 앞쪽에서 병합합니다. 대화는 서버에 저장하지 않으므로 다음 요청에 필요한 기록을 포함하세요.
 
 응답의 `choices[0].message.content`에 답변이 있고 `tool_calls`에 실행된 도구와 실제 자료가 있습니다. PubMed 답변에는 실제 결과의 PMID 링크를 덧붙입니다. 검색·조회 출처 목록은 모델의 모든 문장이 검증되었다는 뜻은 아닙니다. 작은 모델의 논문 해석과 도구 선택 정확도는 별도 평가가 필요합니다.
 
@@ -136,6 +137,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 | `status` | `stage`: `loading_model`(모델 로딩) 또는 `generating`(생성 시작) |
 | `tool` | PubMed 도구 `name`, `arguments`, `status`(`running`/`done`/`error`) |
 | `delta` | 새로 생성된 답변 텍스트 `content`. 도구 호출 표기는 보내지 않습니다 |
+| `reasoning` | `thinking` 요청에서 새로 생성된 생각 텍스트 `content` |
 | `done` | 비스트리밍 응답과 같은 최종 본문. 출처 링크가 붙은 최종 답변은 이 이벤트의 내용을 사용하세요 |
 | `error` | `status`(HTTP 상태에 해당), `error`(`code`, `message`, `details`) |
 
@@ -216,6 +218,7 @@ git status
 | 스트리밍 중 연결 끊기 | 1800토큰 요청을 3초 후 끊고 다음 요청이 약 1초 만에 응답, 생성 중단 확인 |
 | 긴 대화 (프롬프트 12,663토큰) | 기본값은 413, `truncate_history`는 메시지 12개를 빼고 HTTP 200 |
 | 브라우저 UI (Chromium) | 스트리밍·중지·다시 생성·질문 수정·검색·다크 모드·모바일 화면, 2B PubMed 진행 표시 확인 |
+| 추론 모드 | Qwen3-0.6B 약 3초, Qwen3.5-2B 약 37초 생각 후 답변, 생각 과정 분리 표시 |
 | Windows/Linux 네이티브, NVIDIA CUDA | 실장비 미검증 |
 
 Qwen3.5는 플랫폼 전용 최적화 커널 없이 PyTorch 기본 구현을 사용합니다. 최초 실행 시 커널 대체 경로 안내가 표시될 수 있으며 GPU·CPU별 속도 차이가 있습니다.

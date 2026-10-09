@@ -367,3 +367,53 @@ test('requests ask the server to trim old turns and show how many were dropped',
   assert.equal(store.current.messages.at(-1).dropped, 4);
   assert.equal(new ChatStore(storage).current.messages.at(-1).dropped, 4);
 });
+
+
+test('thinking mode streams reasoning separately and raises the token floor', async () => {
+  let body;
+  const store = new ChatStore(memory(), async (_, init) => {
+    body = JSON.parse(init.body);
+    return sse([{ type: 'reasoning', content: '더해 보면' }, { type: 'reasoning', content: ' 4' },
+      { type: 'delta', content: '4' },
+      { type: 'done', choices: [{ message: { content: '4', reasoning_content: '더해 보면 4' }, finish_reason: 'stop' }] }]);
+  });
+  store.current.thinking = true;
+  await store.send('2+2?');
+  assert.equal(body.thinking, true);
+  assert.equal(body.max_tokens, 1024);
+  const answer = store.current.messages.at(-1);
+  assert.equal(answer.reasoning, '더해 보면 4');
+  assert.ok(Number.isFinite(answer.thinkMs));
+  assert.equal(answer.thinkStart, undefined);
+});
+
+test('reasoning-only answers are kept, and plain chats never send the thinking flag', async () => {
+  const bodies = [];
+  const store = new ChatStore(memory(), async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return sse([{ type: 'done', choices: [{ message: { content: '', reasoning_content: '길게 생각' }, finish_reason: 'length' }] }]);
+  });
+  await store.send('질문');
+  assert.equal(bodies[0].thinking, undefined);
+  const answer = store.current.messages.at(-1);
+  assert.equal(answer.role, 'assistant');
+  assert.equal(answer.truncated, true);
+  await store.send('다음');
+  assert.deepEqual(bodies[1].messages.map(m => m.content), ['질문', '다음']);
+});
+
+
+test('stopping after the final event keeps the answer complete', async () => {
+  let stream;
+  const store = new ChatStore(memory(), async (_, init) => (stream = controlledStream(init.signal)).response);
+  const pending = store.send('질문');
+  await tick();
+  stream.push(done('완성된 답'));
+  await tick();
+  store.stop();
+  await pending;
+  const answer = store.current.messages.at(-1);
+  assert.equal(answer.content, '완성된 답');
+  assert.equal(answer.stopped, false);
+  assert.equal(store.current.messages[0].error, undefined);
+});

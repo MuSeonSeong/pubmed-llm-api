@@ -227,3 +227,15 @@ def test_streamer_waits_for_complete_multibyte_characters(monkeypatch):
     streamer.put(torch.tensor([1]))
     streamer.put(torch.tensor([2]))
     assert seen == ['', '안녕']
+
+
+def test_thinking_flag_reaches_the_chat_template(monkeypatch):
+    seen=[]
+    class Recording(Tokenizer):
+        def apply_chat_template(self, messages, **kw):
+            seen.append(kw['enable_thinking'])
+            return super().apply_chat_template(messages, **kw)
+    obj=manager(monkeypatch,loader=lambda spec:(Model(),Recording()))
+    asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0))
+    asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0,thinking=True))
+    assert seen == [False, True]

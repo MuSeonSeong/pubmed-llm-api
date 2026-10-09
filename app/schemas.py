@@ -16,6 +16,8 @@ class ChatRequest(BaseModel):
     stream: bool = False
     # Drop the oldest turns instead of failing when the conversation exceeds the context budget.
     truncate_history: bool = False
+    # Let the model reason before answering; the reasoning is returned separately.
+    thinking: bool = False
 
     @model_validator(mode='after')
     def require_user_query(self):
@@ -32,6 +34,7 @@ class ToolTrace(BaseModel):
 class AssistantMessage(BaseModel):
     role: Literal['assistant'] = 'assistant'
     content: str
+    reasoning_content: str | None = None
 
 class Choice(BaseModel):
     index: int = 0

@@ -85,6 +85,25 @@ def visible_text(raw_text: str) -> str:
     return text.lstrip()
 
 
+def split_reasoning(raw_text: str) -> tuple[str, str | None]:
+    """Split thinking-mode output into (reasoning, rest); rest is None while still reasoning.
+
+    Qwen3 writes its own <think> tag, while the Qwen3.5 template pre-fills it in the prompt.
+    """
+    text = raw_text.lstrip()
+    if text.startswith('<think>'):
+        text = text[len('<think>'):]
+    elif '<think>'.startswith(text):
+        return '', None
+    if '</think>' in text:
+        reasoning, rest = text.split('</think>', 1)
+        return reasoning.strip(), rest
+    tail = text.rfind('<')
+    if tail != -1 and '</think>'.startswith(text[tail:]):
+        text = text[:tail]
+    return text.strip(), None
+
+
 def drop_oldest_turn(messages: list[dict]) -> int:
     """Remove the oldest question and its replies, never the latest question; return how many went."""
     start = 1 if messages and messages[0]['role'] == 'system' else 0
@@ -135,30 +154,37 @@ class ChatService:
             emit({'type': 'error', 'status': 500, 'error': {
                 'code': 'internal_error', 'message': str(exc) or 'Internal error', 'details': {}}})
 
-    def _text_relay(self, emit: Callable[[dict], None]) -> Callable[[str], None]:
-        shown, started = '', False
+    def _text_relay(self, emit: Callable[[dict], None], thinking: bool) -> Callable[[str], None]:
+        shown = {'reasoning': '', 'delta': ''}
+        started = False
+        def send(event: dict) -> None:
+            try:
+                anyio.from_thread.run_sync(emit, event)
+            except Exception:
+                pass  # the client is gone; cancellation stops generation shortly
+        def grow(kind: str, text: str) -> None:
+            if len(text) > len(shown[kind]) and text.startswith(shown[kind]):
+                send({'type': kind, 'content': text[len(shown[kind]):]})
+                shown[kind] = text
         def relay(raw_text: str) -> None:  # runs on the generation worker thread
-            nonlocal shown, started
+            nonlocal started
             if not started:  # the model is loaded and generation has begun
                 started = True
-                try:
-                    anyio.from_thread.run_sync(emit, {'type': 'status', 'stage': 'generating'})
-                except Exception:
-                    pass
-            text = visible_text(raw_text)
-            if len(text) > len(shown) and text.startswith(shown):
-                delta, shown = text[len(shown):], text
-                try:
-                    anyio.from_thread.run_sync(emit, {'type': 'delta', 'content': delta})
-                except Exception:
-                    pass  # the client is gone; cancellation stops generation shortly
+                send({'type': 'status', 'stage': 'generating'})
+            if thinking:
+                reasoning, rest = split_reasoning(raw_text)
+                grow('reasoning', reasoning)
+                if rest is not None:
+                    grow('delta', visible_text(rest))
+            else:
+                grow('delta', visible_text(raw_text))
         return relay
 
     async def _run(self, request: ChatRequest, emit: Callable[[dict], None] | None = None,
                    cancel: threading.Event | None = None) -> ChatResponse:
         notify = emit or (lambda event: None)
         messages = [message.model_dump() for message in request.messages]
-        traces, dropped = [], 0
+        traces, reasonings, dropped = [], [], 0
         try:
             tools = await self.pubmed.tool_schemas() if request.use_pubmed else []
             system = [message['content'] for message in messages if message['role'] == 'system']
@@ -170,7 +196,9 @@ class ChatService:
             while True:
                 if self.manager.status().get('loaded_model') != request.model:
                     notify({'type': 'status', 'stage': 'loading_model', 'model': request.model})
-                stream = {'on_text': self._text_relay(emit), 'cancel': cancel} if emit else {}
+                stream = {'on_text': self._text_relay(emit, request.thinking), 'cancel': cancel} if emit else {}
+                if request.thinking:
+                    stream['thinking'] = True
                 try:
                     result = await self.manager.generate(request.model, messages, tools,
                                                          request.max_tokens, request.temperature, **stream)
@@ -181,14 +209,22 @@ class ChatService:
                         raise
                     dropped += removed
                     continue
+                raw, reasoning = result.raw_text, None
+                if request.thinking:
+                    reasoning, rest = split_reasoning(raw)
+                    raw = rest or ''
+                    if reasoning:
+                        reasonings.append(reasoning)
                 if result.finish_reason == 'cancelled':
                     return ChatResponse(model=request.model, choices=[Choice(
-                        message=AssistantMessage(content=visible_text(result.raw_text).strip()),
+                        message=AssistantMessage(content=visible_text(raw).strip(),
+                                                 reasoning_content='\n\n'.join(reasonings) or None),
                         finish_reason='cancelled')], tool_calls=traces, dropped_messages=dropped)
-                calls = parse_tool_calls(result.raw_text, tools)
+                calls = parse_tool_calls(raw, tools)
                 if not calls:
                     return ChatResponse(model=request.model, choices=[Choice(
-                        message=AssistantMessage(content=append_citations(clean_text(result.raw_text), traces)),
+                        message=AssistantMessage(content=append_citations(clean_text(raw), traces),
+                                                 reasoning_content='\n\n'.join(reasonings) or None),
                         finish_reason=result.finish_reason)], tool_calls=traces, dropped_messages=dropped)
                 if not tools:
                     raise ServiceError('tools_disabled', 'Model requested tools when PubMed is disabled', 502)
