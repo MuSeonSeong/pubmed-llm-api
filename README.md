@@ -226,7 +226,7 @@ uv lock --check
 git status
 ```
 
-로컬 Git `main`에 초기 설정과 구현 커밋을 저장합니다. 원격 저장소는 아직 설정하지 않았습니다. `.venv/`, `models/`, `.env`, 캐시는 Git에서 제외됩니다.
+로컬 Git `main`에 초기 설정과 구현 커밋을 저장합니다. ChatGPT형 웹 UI 확장은 `feat/chatgpt-web-ui` 브랜치에 있으며 검토 후 `main`에 병합합니다. 원격 저장소는 아직 설정하지 않았습니다. `.venv/`, `models/`, `.env`, 캐시는 Git에서 제외됩니다.
 
 ## 실제 검증 기록 — 2026-10-09
 
