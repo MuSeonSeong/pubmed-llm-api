@@ -1,0 +1,1024 @@
+[
+  {
+    "name": "pubmed_search_articles",
+    "title": "Pubmed Search Articles",
+    "description": "Search PubMed with full query syntax, filters, and date ranges. Returns PMIDs and optional brief summaries. Supports field-specific filters (author, journal, MeSH terms), common filters (language, species, free full text), and pagination via offset for paging through large result sets.",
+    "inputSchema": {
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "description": "PubMed search query (supports full NCBI syntax). Must carry a search term: a value that is blank once markup, bracketed field tags (`[pdat]`), parentheses, and invisible characters such as a zero-width space are disregarded is rejected rather than sent to PubMed."
+        },
+        "maxResults": {
+          "default": 20,
+          "description": "Maximum results to return. 0 returns only `totalCount`.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000
+        },
+        "offset": {
+          "default": 0,
+          "description": "Result offset for pagination (0-based). PubMed serves at most the first 9999 records of a result set, so this caps at 9998; narrow the query or add filters to reach anything beyond it.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9998
+        },
+        "sort": {
+          "default": "relevance",
+          "description": "Sort order: relevance (default), pub_date (newest first), author, or journal",
+          "type": "string",
+          "enum": [
+            "relevance",
+            "pub_date",
+            "author",
+            "journal"
+          ]
+        },
+        "dateRange": {
+          "description": "Filter by date range. The filter is applied only when both `minDate` and `maxDate` are non-empty; either one empty disables the entire date range. A partial date covers its whole year or month, and a range whose `minDate` falls after its `maxDate` is rejected: `2024/06` to `2024` is valid, `2024/07` to `2024/06/30` is not.",
+          "type": "object",
+          "properties": {
+            "minDate": {
+              "type": "string",
+              "pattern": "^$|^\\d{4}([/\\-.]\\d{1,2}([/\\-.]\\d{1,2})?)?$",
+              "description": "Start date (YYYY/MM/DD, YYYY/MM, or YYYY). Must be a real calendar date — `2023/02/29` is rejected. Leaving it empty drops the whole date range, not just this bound; for no lower bound pass a wide sentinel such as `1000`."
+            },
+            "maxDate": {
+              "type": "string",
+              "pattern": "^$|^\\d{4}([/\\-.]\\d{1,2}([/\\-.]\\d{1,2})?)?$",
+              "description": "End date (YYYY/MM/DD, YYYY/MM, or YYYY). Must be a real calendar date — `2023/02/29` is rejected. Leaving it empty drops the whole date range, not just this bound; for no upper bound pass a wide sentinel such as `3000`."
+            },
+            "dateType": {
+              "default": "pdat",
+              "description": "Date type: pdat (publication), mdat (modification), edat (entrez)",
+              "type": "string",
+              "enum": [
+                "pdat",
+                "mdat",
+                "edat"
+              ]
+            }
+          },
+          "required": [
+            "minDate",
+            "maxDate"
+          ]
+        },
+        "publicationTypes": {
+          "description": "Filter by publication type (e.g. \"Review\", \"Clinical Trial\", \"Meta-Analysis\"). Multiple values are OR'd — any match qualifies. Empty strings are skipped; an element of only whitespace, invisible characters, markup, parentheses, brackets, or double quotes is rejected.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "author": {
+          "description": "Filter by author name (e.g. \"Smith J\"). An empty string applies no filter; a value of only whitespace, invisible characters, markup, parentheses, brackets, or double quotes is rejected.",
+          "type": "string"
+        },
+        "journal": {
+          "description": "Filter by journal name. An empty string applies no filter; a value of only whitespace, invisible characters, markup, parentheses, brackets, or double quotes is rejected.",
+          "type": "string"
+        },
+        "meshTerms": {
+          "description": "Filter by MeSH terms. Multiple terms are AND'd — all must match. Empty strings are skipped; an element of only whitespace, invisible characters, markup, parentheses, brackets, or double quotes is rejected.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "language": {
+          "description": "Filter by language (e.g. \"english\"). An empty string applies no filter; a value of only whitespace, invisible characters, markup, parentheses, brackets, or double quotes is rejected.",
+          "type": "string"
+        },
+        "hasAbstract": {
+          "description": "Only include articles with abstracts",
+          "type": "boolean"
+        },
+        "freeFullText": {
+          "description": "Only include free full text articles",
+          "type": "boolean"
+        },
+        "species": {
+          "description": "Filter by species",
+          "type": "string",
+          "enum": [
+            "humans",
+            "animals"
+          ]
+        },
+        "summaryCount": {
+          "default": 0,
+          "description": "Fetch brief summaries for top N results (0 = PMIDs only). Above the 50 cap, pass the remaining PMIDs to pubmed_fetch_articles.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 50
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Original query"
+        },
+        "offset": {
+          "type": "number",
+          "description": "Result offset used"
+        },
+        "pmids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "PubMed IDs"
+        },
+        "summaries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "pmid": {
+                "type": "string",
+                "description": "PubMed ID"
+              },
+              "title": {
+                "description": "Article title",
+                "type": "string"
+              },
+              "authors": {
+                "description": "Formatted author string — the first three of the record's own authors, then \"et al.\". On an NCBI Bookshelf chapter these are the chapter's authors; the book's editors are reported separately in `editors`.",
+                "type": "string"
+              },
+              "source": {
+                "description": "Journal the article appeared in. Absent on an NCBI Bookshelf record, which has no journal — its venue is in `bookTitle` and `publisherName` instead, and `docType` says which kind of record it is.",
+                "type": "string"
+              },
+              "bookTitle": {
+                "description": "Title of the book an NCBI Bookshelf record belongs to, e.g. \"GeneReviews(®)\". Present instead of `source` on a book record; absent on a journal article.",
+                "type": "string"
+              },
+              "publisherName": {
+                "description": "Publisher of the book an NCBI Bookshelf record belongs to. Present only on a book record; absent on a journal article.",
+                "type": "string"
+              },
+              "docType": {
+                "description": "What PubMed classifies this record as: \"chapter\" or \"book\" for an NCBI Bookshelf record, \"citation\" for an ordinary journal article. Absent when PubMed supplies none.",
+                "type": "string"
+              },
+              "editors": {
+                "description": "Editors of the containing book, kept out of `authors` so they cannot displace the record's own authors. Absent on a journal article and on a book that credits no editors.",
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "description": "One editor, \"Surname Initials\" as ESummary renders it"
+                }
+              },
+              "pubDate": {
+                "description": "Publication date as YYYY-MM-DD; a month- or year-only date reads as the first day of that month or year. On an NCBI Bookshelf chapter (`docType` \"chapter\") it is the chapter's own date — its last revision, otherwise its contribution — not the year its book began.",
+                "type": "string"
+              },
+              "doi": {
+                "description": "DOI, cased as NCBI reports it. DOIs are case-insensitive by spec and no case normalization is applied here, so casing can differ from a Europe PMC-sourced `doi` — compare the two case-insensitively.",
+                "type": "string"
+              },
+              "pmcId": {
+                "description": "PMC ID",
+                "type": "string"
+              },
+              "pmcUrl": {
+                "description": "PMC URL",
+                "type": "string"
+              },
+              "pubmedUrl": {
+                "description": "PubMed URL",
+                "type": "string"
+              }
+            },
+            "required": [
+              "pmid"
+            ],
+            "additionalProperties": false,
+            "description": "Brief article summary"
+          },
+          "description": "Brief summaries (empty array when summaryCount is 0)"
+        },
+        "searchUrl": {
+          "type": "string",
+          "description": "PubMed search URL"
+        },
+        "totalCount": {
+          "type": "number",
+          "description": "Total matching articles"
+        },
+        "effectiveQuery": {
+          "type": "string",
+          "description": "Sanitized query sent to PubMed after applying all active filters"
+        },
+        "appliedFilters": {
+          "type": "object",
+          "properties": {
+            "dateRange": {
+              "description": "Date range filter applied to the search",
+              "type": "object",
+              "properties": {
+                "minDate": {
+                  "type": "string",
+                  "description": "Applied minimum date"
+                },
+                "maxDate": {
+                  "type": "string",
+                  "description": "Applied maximum date"
+                },
+                "dateType": {
+                  "type": "string",
+                  "enum": [
+                    "pdat",
+                    "mdat",
+                    "edat"
+                  ],
+                  "description": "Applied date field used for the range filter"
+                }
+              },
+              "required": [
+                "minDate",
+                "maxDate",
+                "dateType"
+              ],
+              "additionalProperties": false
+            },
+            "publicationTypes": {
+              "description": "Publication type filters applied to the search",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "author": {
+              "description": "Author filter applied to the search",
+              "type": "string"
+            },
+            "journal": {
+              "description": "Journal filter applied to the search",
+              "type": "string"
+            },
+            "meshTerms": {
+              "description": "MeSH term filters applied to the search",
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "language": {
+              "description": "Language filter applied to the search",
+              "type": "string"
+            },
+            "hasAbstract": {
+              "description": "Whether results were restricted to articles with abstracts",
+              "type": "boolean"
+            },
+            "freeFullText": {
+              "description": "Whether results were restricted to free full-text articles",
+              "type": "boolean"
+            },
+            "species": {
+              "description": "Species filter applied to the search",
+              "type": "string",
+              "enum": [
+                "humans",
+                "animals"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "description": "Normalized filter values that were applied to the PubMed query"
+        },
+        "notice": {
+          "description": "Optional guidance when the result set does not reflect what was asked for — a field tag PubMed ignored, a phrase it matched nothing for, a dateRange dropped for having one bound, no matches at all, or paging past the end. Absent when nothing applies.",
+          "type": "string"
+        },
+        "error": {
+          "description": "Present when the call failed. Absent on success.",
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991,
+              "description": "JSON-RPC error code for this failure."
+            },
+            "message": {
+              "type": "string",
+              "description": "Human-readable description of what went wrong."
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "description": "Machine-readable failure mode. Declared by this tool: `queue_full`: The local NCBI request queue shed the call — the queue is full, or the call cannot start before its total deadline (for example behind the cooldown that follows an NCBI 429). `ncbi_unreachable`: NCBI E-utilities failed on every attempt the retry budget allowed — retries ran out, or the next backoff would overrun the total deadline. `ncbi_rate_limited`: NCBI answered HTTP 429 (too many requests) and the call stopped on it — retries ran out, the next backoff would overrun the total deadline, or the Retry-After NCBI named outlasts the time left or the 30-second backoff cap. `ncbi_deadline_exceeded`: The total NCBI request deadline expired before NCBI answered successfully — mid-request, while queued, or during a retry backoff. `ncbi_invalid_response`: NCBI returned a body that could not be parsed (invalid XML/JSON). `ncbi_resource_not_found`: NCBI returned a structured \"not found\" error for the requested ID(s). `blank_query`: The query contains no search term: nothing is left once whitespace and invisible characters such as a zero-width space are disregarded. pubmed_search_articles and pubmed_europepmc_search first decode HTML entities and also disregard markup and parentheses, so `()`, `<b></b>`, and `&nbsp;` hold no term there; pubmed_search_articles also disregards bracketed field tags such as `[pdat]`. `invalid_date_range`: A `dateRange` bound is not a real calendar date — a month outside 01–12, day 00, or a day past the end of its month such as `2023/02/29` — or `minDate` falls after `maxDate` once PubMed expands each partial date: `minDate` from the start of its year or month, `maxDate` to the end. `blank_filter`: An `author`, `journal`, or `language` value, or a `publicationTypes` or `meshTerms` element, holds no term once markup is removed and HTML entities are decoded — only whitespace, invisible characters such as a zero-width space, parentheses, brackets, or double quotes are left, as in `()` or `\"\"` — so its field clause would carry no term. An exactly-empty string is not blank here; it sets no filter. Other values are possible when a failure originates below the handler.",
+                  "examples": [
+                    "queue_full",
+                    "ncbi_unreachable",
+                    "ncbi_rate_limited",
+                    "ncbi_deadline_exceeded",
+                    "ncbi_invalid_response",
+                    "ncbi_resource_not_found",
+                    "blank_query",
+                    "invalid_date_range",
+                    "blank_filter"
+                  ]
+                },
+                "recovery": {
+                  "description": "Actionable next step for the caller.",
+                  "type": "object",
+                  "properties": {
+                    "hint": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "hint"
+                  ],
+                  "additionalProperties": {}
+                },
+                "retryable": {
+                  "description": "Whether retrying may succeed.",
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "not": {
+            "required": [
+              "error"
+            ]
+          },
+          "required": [
+            "query",
+            "offset",
+            "pmids",
+            "summaries",
+            "searchUrl",
+            "totalCount",
+            "effectiveQuery",
+            "appliedFilters"
+          ]
+        },
+        {
+          "required": [
+            "error"
+          ]
+        }
+      ]
+    },
+    "icons": null,
+    "annotations": {
+      "title": null,
+      "readOnlyHint": true,
+      "destructiveHint": null,
+      "idempotentHint": null,
+      "openWorldHint": true
+    },
+    "meta": {
+      "io.mcpmed/concepts": [
+        {
+          "id": "https://schema.org/SearchAction",
+          "label": "Search action"
+        },
+        {
+          "id": "https://edamontology.org/operation_2421",
+          "label": "Database search"
+        },
+        {
+          "id": "https://edamontology.org/data_1187",
+          "label": "PubMed ID"
+        }
+      ]
+    },
+    "execution": null
+  },
+  {
+    "name": "pubmed_fetch_articles",
+    "title": "Pubmed Fetch Articles",
+    "description": "Fetch full article metadata by PubMed IDs. Returns detailed article information including abstract, authors, journal, MeSH terms, and linked retraction, erratum, and comment notices. Set `maxResponseCharacters` to bound the whole response: articles past the ceiling are deferred whole and listed in `deferred.ids` for a follow-up call.",
+    "inputSchema": {
+      "type": "object",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "pmids": {
+          "minItems": 1,
+          "maxItems": 200,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^\\d+$"
+          },
+          "description": "PubMed IDs to fetch"
+        },
+        "includeMesh": {
+          "default": true,
+          "description": "Include MeSH terms",
+          "type": "boolean"
+        },
+        "includeGrants": {
+          "default": false,
+          "description": "Include grant information",
+          "type": "boolean"
+        },
+        "maxResponseCharacters": {
+          "description": "Opt-in ceiling for the whole response, in characters. Each article is measured as the JSON record it is returned as — title, abstract, authors, journal, MeSH terms, grants, identifiers, every field it carries. Articles are kept in response order until the next one would cross the ceiling; that article and the rest are deferred whole (never partially populated) and listed in `deferred.ids`. Response envelope fields — counts, `unavailablePmids`, `deferred` itself — are not counted. Omit to return every resolved article.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        }
+      },
+      "required": [
+        "pmids"
+      ],
+      "additionalProperties": false
+    },
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "articles": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "recordType": {
+                "type": "string",
+                "enum": [
+                  "journal-article",
+                  "book-chapter",
+                  "book"
+                ],
+                "description": "Which kind of PubMed record this is, set from the XML element it arrived in: `journal-article` for an ordinary article, `book-chapter` for an NCBI Bookshelf chapter, `book` for a whole Bookshelf book. Read this to tell the three apart — `publicationTypes` cannot, because PubMed labels a Bookshelf record \"Review\" or \"Study Guide\". `journalInfo` is present only on `journal-article`; `book` only on the other two."
+              },
+              "pmid": {
+                "description": "PubMed ID",
+                "type": "string"
+              },
+              "title": {
+                "description": "Article title — the chapter title on a `book-chapter`, and the book title on a `book` record, where it repeats `book.title`.",
+                "type": "string"
+              },
+              "abstractText": {
+                "description": "Abstract text",
+                "type": "string"
+              },
+              "affiliations": {
+                "description": "Deduplicated author affiliations",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "authors": {
+                "description": "Author list. On a `book-chapter` these are the chapter's own authors, never the book's editors, which are in `book.editors`. Empty on a Bookshelf record that credits neither.",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "lastName": {
+                      "description": "Last name",
+                      "type": "string"
+                    },
+                    "firstName": {
+                      "description": "First/given name",
+                      "type": "string"
+                    },
+                    "initials": {
+                      "description": "Author initials",
+                      "type": "string"
+                    },
+                    "collectiveName": {
+                      "description": "Group/collective author name",
+                      "type": "string"
+                    },
+                    "affiliationIndices": {
+                      "description": "Indices into the top-level affiliations array",
+                      "type": "array",
+                      "items": {
+                        "type": "number"
+                      }
+                    },
+                    "orcid": {
+                      "description": "ORCID identifier",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "description": "Author record"
+                }
+              },
+              "journalInfo": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "description": "Full journal title",
+                    "type": "string"
+                  },
+                  "isoAbbreviation": {
+                    "description": "ISO journal abbreviation",
+                    "type": "string"
+                  },
+                  "issn": {
+                    "description": "Print ISSN",
+                    "type": "string"
+                  },
+                  "eIssn": {
+                    "description": "Electronic ISSN",
+                    "type": "string"
+                  },
+                  "volume": {
+                    "description": "Volume number",
+                    "type": "string"
+                  },
+                  "issue": {
+                    "description": "Issue number",
+                    "type": "string"
+                  },
+                  "pages": {
+                    "description": "Page range (e.g. \"48-55\")",
+                    "type": "string"
+                  },
+                  "elocationId": {
+                    "description": "Electronic article locator from NCBI `ELocationID` — the publisher-assigned article number (e.g. \"2400512\"). Journals that assign article numbers instead of pages often omit pagination entirely, leaving this the only locator. Never a substitute for `pages`, and never the DOI: a DOI-typed `ELocationID` is reported in `doi` instead. Absent when the only locator NCBI supplies is marked invalid.",
+                    "type": "string"
+                  },
+                  "elocationIdType": {
+                    "description": "Type of `elocationId`, from NCBI's `EIdType` attribute — \"pii\" in practice. Free-form: NCBI does not close the set, so treat an unfamiliar value as opaque.",
+                    "type": "string"
+                  },
+                  "publicationDate": {
+                    "type": "object",
+                    "properties": {
+                      "year": {
+                        "description": "Publication year",
+                        "type": "string"
+                      },
+                      "month": {
+                        "description": "Publication month",
+                        "type": "string"
+                      },
+                      "day": {
+                        "description": "Publication day",
+                        "type": "string"
+                      },
+                      "medlineDate": {
+                        "description": "Non-standard date string (e.g. \"2000 Spring\")",
+                        "type": "string"
+                      }
+                    },
+                    "additionalProperties": false,
+                    "description": "Journal publication date"
+                  }
+                },
+                "additionalProperties": false,
+                "description": "Journal information. Present on `journal-article` records only — absent on `book-chapter` and `book` records, because a Bookshelf record has no journal and its book title is never reported as one; read `book` for those. (#114)"
+              },
+              "book": {
+                "type": "object",
+                "properties": {
+                  "title": {
+                    "description": "Title of the containing book, from `Book/BookTitle` (e.g. \"GeneReviews®\"). On a `book` record this is the same value as the record's own `title`.",
+                    "type": "string"
+                  },
+                  "publisher": {
+                    "description": "Publisher of the book, from `Book/Publisher/PublisherName`.",
+                    "type": "string"
+                  },
+                  "publisherLocation": {
+                    "description": "Place of publication, from `Book/Publisher/PublisherLocation` (e.g. \"Seattle (WA)\"). Absent when NCBI supplies no place.",
+                    "type": "string"
+                  },
+                  "pubDate": {
+                    "description": "Publication year from `Book/PubDate`. Year only — NCBI's month and day are not reported, since no citation style uses them for a book.",
+                    "type": "string"
+                  },
+                  "beginningDate": {
+                    "description": "First year of a continuously-updated book, from `Book/BeginningDate` (GeneReviews runs from 1993). Absent on a book published once.",
+                    "type": "string"
+                  },
+                  "endingDate": {
+                    "description": "Last year of a closed date range, from `Book/EndingDate`. Absent while a book is still being updated, which leaves the range open-ended.",
+                    "type": "string"
+                  },
+                  "medium": {
+                    "description": "Medium the book is published in, from `Book/Medium` — \"Internet\" wherever NCBI supplies it. Absent when NCBI supplies none; it is never defaulted.",
+                    "type": "string"
+                  },
+                  "edition": {
+                    "description": "Edition statement from `Book/Edition`. Rare on Bookshelf titles — absent unless NCBI supplies one.",
+                    "type": "string"
+                  },
+                  "collectionTitle": {
+                    "description": "Series the book belongs to, from `Book/CollectionTitle` (e.g. \"ADA Clinical Compendia Series\"). Absent for a book outside a series.",
+                    "type": "string"
+                  },
+                  "isbns": {
+                    "description": "Every `Book/Isbn` on the record. A book commonly carries a print and an electronic ISBN, so this is a list. Absent for a Bookshelf title with no ISBN, which is most of them.",
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "description": "One ISBN, verbatim as NCBI reports it — leading zeros intact"
+                    }
+                  },
+                  "doi": {
+                    "description": "The book's own DOI, from `Book/ELocationID` with `EIdType=\"doi\"`. Distinct from the record-level `doi`, which is the chapter's: a chapter does not inherit this one.",
+                    "type": "string"
+                  },
+                  "editors": {
+                    "description": "Editors of the containing book, from `Book/AuthorList` marked `Type=\"editors\"`. Kept out of `authors`, which carries the chapter's own writers. Absent when the book credits no editors.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "lastName": {
+                          "description": "Editor surname, from the book's `Book/AuthorList Type=\"editors\"` entry. Absent on a group editor, which carries `collectiveName` instead.",
+                          "type": "string"
+                        },
+                        "firstName": {
+                          "description": "Editor given name as NCBI supplies it (`ForeName`, often \"Margaret P\"). Absent when NCBI carries initials only, or on a group editor.",
+                          "type": "string"
+                        },
+                        "initials": {
+                          "description": "Editor initials with no separators (e.g. \"MP\"). Absent when NCBI supplies none, or on a group editor.",
+                          "type": "string"
+                        },
+                        "collectiveName": {
+                          "description": "Group or committee credited as editor, when the entry names an organization rather than a person. Mutually exclusive with the name-part fields.",
+                          "type": "string"
+                        }
+                      },
+                      "additionalProperties": false,
+                      "description": "One editor of the containing book. Name parts only — editors are a citation credit, not a contributor record, so no affiliations or ORCID are reported for them."
+                    }
+                  },
+                  "accession": {
+                    "description": "NCBI Bookshelf accession from `ArticleIdList` (`bookaccession`), e.g. \"NBK1247\". The record is readable at `https://www.ncbi.nlm.nih.gov/books/<accession>/`.",
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false,
+                "description": "The containing book of a `book-chapter`, or the book itself on a `book` record. Present only on those two record types, and never a stand-in for `journalInfo`."
+              },
+              "doi": {
+                "description": "DOI, cased as NCBI reports it (usually the publisher's mixed case). DOIs are case-insensitive by spec and no case normalization is applied here, so the same DOI can arrive in a different case from `pubmed_europepmc_search` and `pubmed_europepmc_fetch` (NCBI `10.1056/NEJMoa2212948`, Europe PMC `10.1056/nejmoa2212948`) — a byte-for-byte comparison across the two reports a false mismatch.",
+                "type": "string"
+              },
+              "pmcId": {
+                "description": "PMC ID",
+                "type": "string"
+              },
+              "pubmedUrl": {
+                "description": "PubMed article URL",
+                "type": "string"
+              },
+              "pmcUrl": {
+                "description": "PMC full text URL",
+                "type": "string"
+              },
+              "publicationTypes": {
+                "description": "Publication types",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "commentsCorrections": {
+                "description": "Records NCBI links to this article — for example retraction notices, errata, expressions of concern, comments, and updates — from `CommentsCorrectionsList`, in NCBI's order and uncapped. `Cites` entries are excluded: they list a bibliography, which `pubmed_find_related` covers with its `references` relationship. Read this alongside `publicationTypes`, not in place of it: that field describes the record itself, and a corrected or questioned article often carries no matching type. Absent when NCBI links nothing other than `Cites` entries, and never set on `book-chapter` or `book` records.",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "refType": {
+                      "type": "string",
+                      "description": "Link type, verbatim from NCBI's `RefType` — e.g. \"RetractionIn\", \"RetractionOf\", \"ErratumIn\", \"ErratumFor\", \"ExpressionOfConcernIn\", \"CommentIn\", \"CommentOn\", \"UpdateIn\". The set is open: treat an unfamiliar value as opaque."
+                    },
+                    "refSource": {
+                      "type": "string",
+                      "description": "Citation of the linked record as NCBI writes it (e.g. \"Lancet. 2010 Feb 6;375(9713):445. doi: 10.1016/S0140-6736(10)60175-4.\")."
+                    },
+                    "pmid": {
+                      "description": "PMID of the linked record — pass it to `pubmed_fetch_articles` to read that record. Absent when the linked record has no PMID, as with many errata.",
+                      "type": "string"
+                    },
+                    "note": {
+                      "description": "NCBI's note on the link, e.g. what an erratum corrected (\"Fuβer, Fabian [corrected to Fußer, Fabian]\"). Absent unless NCBI supplies one.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "refType",
+                    "refSource"
+                  ],
+                  "additionalProperties": false,
+                  "description": "One record NCBI links to this article and published separately from it — for example a retraction notice, erratum, expression of concern, comment, update, or republication."
+                }
+              },
+              "keywords": {
+                "description": "Keywords",
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "meshTerms": {
+                "description": "MeSH terms",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "descriptorName": {
+                      "description": "MeSH descriptor name",
+                      "type": "string"
+                    },
+                    "descriptorUi": {
+                      "description": "MeSH descriptor unique ID",
+                      "type": "string"
+                    },
+                    "isMajorTopic": {
+                      "type": "boolean",
+                      "description": "Whether this is a major topic of the article"
+                    },
+                    "qualifiers": {
+                      "description": "MeSH qualifiers/subheadings",
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "qualifierName": {
+                            "type": "string",
+                            "description": "Qualifier/subheading name"
+                          },
+                          "qualifierUi": {
+                            "description": "Qualifier unique ID",
+                            "type": "string"
+                          },
+                          "isMajorTopic": {
+                            "type": "boolean",
+                            "description": "Whether this qualifier is a major topic"
+                          }
+                        },
+                        "required": [
+                          "qualifierName",
+                          "isMajorTopic"
+                        ],
+                        "additionalProperties": false,
+                        "description": "MeSH qualifier/subheading"
+                      }
+                    }
+                  },
+                  "required": [
+                    "isMajorTopic"
+                  ],
+                  "additionalProperties": false,
+                  "description": "MeSH descriptor term"
+                }
+              },
+              "grantList": {
+                "description": "Grant information",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "grantId": {
+                      "description": "Grant identifier",
+                      "type": "string"
+                    },
+                    "acronym": {
+                      "description": "Acronym of the funding institute or agency from `Grant/Acronym` (e.g. \"EY\" for the National Eye Institute) — it names the funder, never the grant, so it is no substitute for `grantId`.",
+                      "type": "string"
+                    },
+                    "agency": {
+                      "description": "Funding agency",
+                      "type": "string"
+                    },
+                    "country": {
+                      "description": "Agency country",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "description": "Grant record"
+                }
+              },
+              "articleDates": {
+                "description": "Dates of the record itself, each named by `dateType`. On a journal article, PubMed's `ArticleDate` entries (`Electronic` — the electronic publication date). On a Bookshelf record, its own `ContributionDate` (when the chapter was contributed) and `DateRevised` (when it was last updated), distinct from the containing book's dates in `book`; `pubmed_format_citations` cites a chapter by `DateRevised` when present, otherwise `ContributionDate`. Absent when NCBI supplies none.",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "dateType": {
+                      "description": "Date type",
+                      "type": "string"
+                    },
+                    "year": {
+                      "description": "Year",
+                      "type": "string"
+                    },
+                    "month": {
+                      "description": "Month",
+                      "type": "string"
+                    },
+                    "day": {
+                      "description": "Day",
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": false,
+                  "description": "Dated article event"
+                }
+              }
+            },
+            "required": [
+              "recordType"
+            ],
+            "additionalProperties": false,
+            "description": "Parsed PubMed article"
+          },
+          "description": "Parsed articles"
+        },
+        "totalReturned": {
+          "type": "number",
+          "description": "Number of articles in this response. Under a `maxResponseCharacters` budget this counts the kept articles only; `deferred.deferredCount` covers the rest."
+        },
+        "unavailablePmids": {
+          "description": "PMIDs PubMed returned no record for. That is all this reports: PubMed omits an unknown PMID silently, with no error and no reason, so the absence says nothing about whether the PMID exists. Reported in full regardless of where a `maxResponseCharacters` cutoff lands — these are misses, not deferrals. Use `pubmed_search_articles` to find PMIDs that do resolve.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "deferred": {
+          "type": "object",
+          "properties": {
+            "maxResponseCharacters": {
+              "type": "number",
+              "description": "The `maxResponseCharacters` ceiling this response was budgeted against"
+            },
+            "returnedCharacters": {
+              "type": "number",
+              "description": "Serialized characters the returned article records account for"
+            },
+            "deferredCount": {
+              "type": "number",
+              "description": "Articles that resolved but were withheld to stay under the ceiling"
+            },
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "PMIDs of the deferred articles, in response order. Re-call `pubmed_fetch_articles` with these as `pmids` and the same other inputs to retrieve them. Never contains a PMID from `unavailablePmids`."
+            },
+            "nextDeferredCharacters": {
+              "type": "number",
+              "description": "Serialized size of the next deferred article — the first entry in `ids`, where the response stopped. Raise `maxResponseCharacters` to at least this to make progress; a smaller article further down `ids` cannot be reached until this one fits."
+            }
+          },
+          "required": [
+            "maxResponseCharacters",
+            "returnedCharacters",
+            "deferredCount",
+            "ids",
+            "nextDeferredCharacters"
+          ],
+          "additionalProperties": false,
+          "description": "Continuation state for articles the whole-response budget withheld. Present only when `maxResponseCharacters` deferred at least one article."
+        },
+        "notice": {
+          "description": "Optional guidance when no articles were returned — points to discovery tools — or when `maxResponseCharacters` deferred articles, naming how to retrieve them. Absent on successful unbudgeted fetches.",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "True when `maxResponseCharacters` withheld at least one resolved article. Absent when the response carries every article that resolved. The continuation state is in `deferred`.",
+          "type": "boolean"
+        },
+        "error": {
+          "description": "Present when the call failed. Absent on success.",
+          "type": "object",
+          "properties": {
+            "code": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991,
+              "description": "JSON-RPC error code for this failure."
+            },
+            "message": {
+              "type": "string",
+              "description": "Human-readable description of what went wrong."
+            },
+            "data": {
+              "type": "object",
+              "properties": {
+                "reason": {
+                  "type": "string",
+                  "description": "Machine-readable failure mode. Declared by this tool: `queue_full`: The local NCBI request queue shed the call — the queue is full, or the call cannot start before its total deadline (for example behind the cooldown that follows an NCBI 429). `ncbi_unreachable`: NCBI E-utilities failed on every attempt the retry budget allowed — retries ran out, or the next backoff would overrun the total deadline. `ncbi_rate_limited`: NCBI answered HTTP 429 (too many requests) and the call stopped on it — retries ran out, the next backoff would overrun the total deadline, or the Retry-After NCBI named outlasts the time left or the 30-second backoff cap. `ncbi_deadline_exceeded`: The total NCBI request deadline expired before NCBI answered successfully — mid-request, while queued, or during a retry backoff. `ncbi_invalid_response`: NCBI returned a body that could not be parsed (invalid XML/JSON). `ncbi_resource_not_found`: NCBI returned a structured \"not found\" error for the requested ID(s). `invalid_efetch_response`: NCBI EFetch returned a payload missing the PubmedArticleSet wrapper. Other values are possible when a failure originates below the handler.",
+                  "examples": [
+                    "queue_full",
+                    "ncbi_unreachable",
+                    "ncbi_rate_limited",
+                    "ncbi_deadline_exceeded",
+                    "ncbi_invalid_response",
+                    "ncbi_resource_not_found",
+                    "invalid_efetch_response"
+                  ]
+                },
+                "recovery": {
+                  "description": "Actionable next step for the caller.",
+                  "type": "object",
+                  "properties": {
+                    "hint": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "hint"
+                  ],
+                  "additionalProperties": {}
+                },
+                "retryable": {
+                  "description": "Whether retrying may succeed.",
+                  "type": "boolean"
+                }
+              },
+              "additionalProperties": {}
+            }
+          },
+          "required": [
+            "code",
+            "message"
+          ],
+          "additionalProperties": {}
+        }
+      },
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "not": {
+            "required": [
+              "error"
+            ]
+          },
+          "required": [
+            "articles",
+            "totalReturned"
+          ]
+        },
+        {
+          "required": [
+            "error"
+          ]
+        }
+      ]
+    },
+    "icons": null,
+    "annotations": {
+      "title": null,
+      "readOnlyHint": true,
+      "destructiveHint": null,
+      "idempotentHint": null,
+      "openWorldHint": true
+    },
+    "meta": {
+      "io.mcpmed/concepts": [
+        {
+          "id": "https://schema.org/ScholarlyArticle",
+          "label": "Scholarly article"
+        },
+        {
+          "id": "https://edamontology.org/operation_2422",
+          "label": "Data retrieval"
+        },
+        {
+          "id": "https://edamontology.org/data_1187",
+          "label": "PubMed ID"
+        }
+      ]
+    },
+    "execution": null
+  }
+]
