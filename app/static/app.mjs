@@ -1,4 +1,4 @@
-import { ChatStore, renderMarkdown } from './chat.mjs';
+import { ATTACHMENT_LIMIT, ChatStore, MODEL_LABELS, chatMarkdown, readAttachments, renderMarkdown } from './chat.mjs';
 
 const $ = id => document.getElementById(id);
 const icon = name => {
@@ -42,6 +42,7 @@ let renamingId = null;
 let followOutput = true;
 let toastTimer;
 let renderQueued = false;
+let pendingFiles = [];
 const reasoningOpen = new Map();  // message id -> the user's own expand/collapse choice
 
 function toast(text) {
@@ -125,6 +126,7 @@ function renderHistory() {
     select.append(icon('chat'), element('span', 'chat-title', chat.title));
     select.addEventListener('click', () => {
       store.select(chat.id);
+      render();
       hideSidebar();
       prompt.focus();
     });
@@ -141,12 +143,26 @@ function renderHistory() {
   }
 }
 
-function assistantHeading() {
+function assistantHeading(message) {
   const heading = element('div', 'assistant-heading');
   const avatar = element('span', 'assistant-avatar');
   avatar.append(icon('spark'));
   heading.append(avatar, element('span', '', 'PubMed Chat'));
+  if (MODEL_LABELS[message.model]) heading.append(element('span', 'model-tag', MODEL_LABELS[message.model]));
   return heading;
+}
+
+function fileChips(files, onRemove) {
+  const list = element('div', 'attachment-list');
+  files.forEach((file, index) => {
+    const chip = element('span', 'attachment-chip');
+    chip.title = file.name + (file.truncated ? ' · 길어서 앞부분만 첨부' : '');
+    chip.append(icon('file'), element('span', 'attachment-name', file.name),
+      element('span', 'attachment-size', file.text.length.toLocaleString() + '자' + (file.truncated ? '+' : '')));
+    if (onRemove) chip.append(iconButton('close', file.name + ' 첨부 취소', () => onRemove(index)));
+    list.append(chip);
+  });
+  return list;
 }
 
 function describeCall(call) {
@@ -166,7 +182,8 @@ function progressLine(message, chat) {
   if (running) {
     const { kind, query } = describeCall(running);
     text = 'PubMed ' + kind + ' 중' + (query ? ' · ' + query : '');
-  } else if (message.stage === 'loading_model') text = '모델을 불러오는 중이에요. 처음이나 모델을 바꾼 뒤에는 시간이 걸려요';
+  } else if (message.stage === 'queued') text = '다른 요청이 끝나기를 기다리고 있어요';
+  else if (message.stage === 'loading_model') text = '모델을 불러오는 중이에요. 처음이나 모델을 바꾼 뒤에는 시간이 걸려요';
   else if (message.toolCalls.length) text = '찾은 논문을 읽고 답변을 쓰고 있어요';
   else if (!message.stage && chat.usePubmed) text = 'PubMed 연결을 준비하고 있어요';
   line.append(dots, document.createTextNode(text));
@@ -249,6 +266,7 @@ function renderUser(message) {
     article.append(editForm(message));
     return article;
   }
+  if (message.attachments?.length) article.append(fileChips(message.attachments));
   article.append(element('div', 'user-content', message.content));
   const actions = element('div', 'message-actions user-actions');
   actions.append(iconButton('copy', '질문 복사', () => copyText(message.content, '질문을 복사했습니다.')));
@@ -273,7 +291,7 @@ function renderUser(message) {
 function renderAssistant(message, chat) {
   const article = element('article', 'message message-assistant');
   article.setAttribute('aria-label', '답변');
-  article.append(assistantHeading());
+  article.append(assistantHeading(message));
   const body = element('div', 'assistant-body');
   if (message.reasoning) body.append(reasoningPanel(message));
   if (message.streaming && message.toolCalls.length) body.append(toolDetails(message.toolCalls, false));
@@ -345,10 +363,41 @@ function updateScrollButton() {
   $('scroll-bottom').hidden = distance < 120;
 }
 
+function renderPendingFiles() {
+  $('attachments').hidden = !pendingFiles.length;
+  $('attachments').replaceChildren(...fileChips(pendingFiles, index => {
+    pendingFiles.splice(index, 1);
+    renderPendingFiles();
+    updateComposer();
+  }).children);
+}
+
+async function attachFiles(files) {
+  if (!files.length) return;
+  const used = pendingFiles.reduce((sum, file) => sum + file.text.length, 0);
+  if (used >= ATTACHMENT_LIMIT) { toast('첨부는 모두 합쳐 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지예요.'); return; }
+  try {
+    const added = await readAttachments([...files].slice(0, 5 - pendingFiles.length), used);
+    pendingFiles.push(...added);
+    if (added.some(file => file.truncated)) toast('파일이 길어 앞부분 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지만 첨부했어요.');
+  } catch (error) { toast(error.message || '파일을 읽을 수 없습니다.'); }
+  renderPendingFiles();
+  updateComposer();
+  prompt.focus();
+}
+
+let lastAnnounced = false;
+function announce() {
+  // Streaming text is not announced token by token; screen readers hear start and finish.
+  if (store.busy === lastAnnounced) return;
+  lastAnnounced = store.busy;
+  $('request-status').textContent = store.busy ? '답변을 생성하고 있어요.' : '답변이 끝났어요.';
+}
+
 function updateComposer() {
   $('send').hidden = store.busy;
   $('stop').hidden = !store.busy;
-  $('send').disabled = !prompt.value.trim();
+  $('send').disabled = !prompt.value.trim() && !pendingFiles.length;
   prompt.style.height = 'auto';
   prompt.style.height = Math.min(prompt.scrollHeight, 220) + 'px';
 }
@@ -366,6 +415,9 @@ function render() {
   $('storage-warning').textContent = store.storageWarning;
   $('storage-warning').hidden = !store.storageWarning;
   document.title = chat.messages.length ? chat.title + ' · PubMed Chat' : 'PubMed Chat';
+  $('export-chat').hidden = !chat.messages.length;
+  $('attach').disabled = store.busy;
+  announce();
   renderHistory();
   renderMessages();
   updateComposer();
@@ -378,17 +430,41 @@ function scheduleRender() {
 }
 
 store.onChange = scheduleRender;
+window.addEventListener('storage', event => { if (event.key === 'pubmed-chat.v1') store.sync(); });
 $('chat-form').addEventListener('submit', event => {
   event.preventDefault();
-  if (store.busy || !prompt.value.trim()) return;
+  if (store.busy || (!prompt.value.trim() && !pendingFiles.length)) return;
   const content = prompt.value;
+  const files = pendingFiles;
   prompt.value = '';
+  pendingFiles = [];
+  renderPendingFiles();
   followOutput = true;
   updateComposer();
-  store.send(content);
+  store.send(content, files);
   prompt.focus();
 });
 $('stop').addEventListener('click', () => { store.stop(); prompt.focus(); });
+$('attach').addEventListener('click', () => $('file-input').click());
+$('file-input').addEventListener('change', event => { attachFiles(event.target.files); event.target.value = ''; });
+const composer = $('chat-form');
+composer.addEventListener('dragover', event => {
+  if (![...event.dataTransfer.types].includes('Files')) return;
+  event.preventDefault();
+  composer.classList.add('dragging');
+});
+composer.addEventListener('dragleave', () => composer.classList.remove('dragging'));
+composer.addEventListener('drop', event => {
+  composer.classList.remove('dragging');
+  if (!event.dataTransfer.files.length) return;
+  event.preventDefault();
+  if (!store.busy) attachFiles(event.dataTransfer.files);
+});
+$('export-chat').addEventListener('click', () => {
+  const chat = store.current;
+  const name = chat.title.replace(/[\\/:*?"<>|]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 60).replace(/[.\s]+$/, '');
+  download(chatMarkdown(chat), 'text/markdown', (name || 'pubmed-chat') + '.md');
+});
 prompt.addEventListener('input', updateComposer);
 prompt.addEventListener('keydown', event => {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
@@ -423,6 +499,7 @@ $('chat-search').addEventListener('input', renderHistory);
 function newChat() {
   if (store.busy) return;
   store.newChat();
+  render();  // controls must reflect the new chat before the next input event
   prompt.value = '';
   updateComposer();
   hideSidebar();
@@ -488,14 +565,17 @@ $('temperature').addEventListener('input', showTemperature);
 $('temperature').addEventListener('change', event => store.updateSettings({ temperature: Number(event.target.value) }));
 $('max-tokens').addEventListener('change', event => store.updateSettings({ maxTokens: Number(event.target.value) }));
 $('theme').addEventListener('change', event => applyTheme(event.target.value));
-$('export-chats').addEventListener('click', () => {
-  const data = JSON.stringify({ exportedAt: new Date().toISOString(),
-    chats: store.chats.filter(chat => chat.messages.length) }, null, 2);
+function download(text, type, name) {
   const link = element('a');
-  link.href = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
-  link.download = 'pubmed-chat-' + new Date().toISOString().slice(0, 10) + '.json';
+  link.href = URL.createObjectURL(new Blob([text], { type }));
+  link.download = name;
   link.click();
   setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+$('export-chats').addEventListener('click', () => {
+  download(JSON.stringify({ exportedAt: new Date().toISOString(),
+    chats: store.chats.filter(chat => chat.messages.length) }, null, 2),
+  'application/json', 'pubmed-chat-' + new Date().toISOString().slice(0, 10) + '.json');
 });
 $('clear-chats').addEventListener('click', () => {
   if (store.busy || !confirm('모든 대화를 삭제할까요? 이 작업은 되돌릴 수 없습니다.')) return;

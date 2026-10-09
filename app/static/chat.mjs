@@ -1,5 +1,9 @@
 const STORAGE_KEY = 'pubmed-chat.v1';
 const MODELS = ['qwen3.5-2b', 'qwen3-0.6b'];
+export const MODEL_LABELS = { 'qwen3.5-2b': 'Qwen3.5 · 2B', 'qwen3-0.6b': 'Qwen3 · 0.6B' };
+/** Small local models have a few thousand tokens of context, so attachments are capped. */
+export const ATTACHMENT_LIMIT = 12000;
+const DEFAULT_FILE_PROMPT = '첨부한 파일의 내용을 요약해 줘.';
 export const DEFAULT_SETTINGS = Object.freeze({ systemPrompt: '', temperature: 0.2, maxTokens: 512 });
 const id = () => globalThis.crypto.randomUUID();
 const freshChat = () => ({ id: id(), title: '새 대화', model: MODELS[0],
@@ -15,6 +19,42 @@ function normalizeTools(calls) {
       ...(typeof call.error === 'string' ? { error: call.error } : {}) })) : [];
 }
 
+function restoreAttachments(files) {
+  return Array.isArray(files) ? files.filter(file => file && typeof file.name === 'string'
+    && typeof file.text === 'string').slice(0, 5).map(file => ({ name: file.name.slice(0, 200),
+    text: file.text.slice(0, ATTACHMENT_LIMIT), truncated: file.truncated === true })) : [];
+}
+
+/** What the model sees for a user turn: the question followed by each attached file. */
+export function messageText(message) {
+  const files = message.attachments || [];
+  return [message.content, ...files.map(file => '[첨부 파일: ' + file.name
+    + (file.truncated ? ' (앞부분만)' : '') + ']\n```\n' + file.text + '\n```')].join('\n\n');
+}
+
+/** Read text files for attaching; the total across files stays within ATTACHMENT_LIMIT. */
+export async function readAttachments(files, used = 0) {
+  const result = [];
+  let budget = ATTACHMENT_LIMIT - used;
+  for (const file of files) {
+    if (budget <= 0) break;
+    const text = (await file.text()).replace(/\r\n/g, '\n');
+    if (text.includes('\u0000')) throw new Error(file.name + '은(는) 텍스트 파일이 아닙니다.');
+    result.push({ name: file.name, text: text.slice(0, budget), truncated: text.length > budget });
+    budget -= Math.min(text.length, budget);
+  }
+  return result;
+}
+
+export function chatMarkdown(chat) {
+  const lines = ['# ' + chat.title, ''];
+  for (const message of chat.messages) {
+    if (message.role === 'user') lines.push('## 나', '', messageText(message), '');
+    else lines.push('## ' + (MODEL_LABELS[message.model] || 'PubMed Chat'), '', message.content, '');
+  }
+  return lines.join('\n');
+}
+
 function restoreSettings(value) {
   const number = (input, min, max, fallback) =>
     Number.isFinite(input) && input >= min && input <= max ? input : fallback;
@@ -24,23 +64,28 @@ function restoreSettings(value) {
       ? number(value.maxTokens, 1, 2048, DEFAULT_SETTINGS.maxTokens) : DEFAULT_SETTINGS.maxTokens };
 }
 
-function restoreChat(chat) {
+/** live: the chat comes from another open tab, so an in-progress request there is still running. */
+function restoreChat(chat, live = false) {
   if (!chat || typeof chat.id !== 'string' || typeof chat.title !== 'string'
       || !Array.isArray(chat.messages)) return null;
   const messages = chat.messages.filter(message => message && typeof message.id === 'string'
     && ['user', 'assistant'].includes(message.role) && typeof message.content === 'string')
     // A draft that never received text was interrupted before it said anything.
-    .filter(message => !(message.streaming === true && !message.content.trim()))
+    .filter(message => live || !(message.streaming === true && !message.content.trim()))
     .map(message => ({ id: message.id, role: message.role, content: message.content,
       toolCalls: normalizeTools(message.toolCalls), truncated: message.truncated === true,
-      stopped: message.stopped === true || message.streaming === true,
+      stopped: message.stopped === true || (!live && message.streaming === true),
+      ...(live && message.streaming === true ? { streaming: true } : {}),
       ...(Number.isInteger(message.dropped) && message.dropped > 0 ? { dropped: message.dropped } : {}),
       ...(typeof message.reasoning === 'string' && message.reasoning ? { reasoning: message.reasoning } : {}),
       ...(Number.isFinite(message.thinkMs) && message.thinkMs >= 0 ? { thinkMs: message.thinkMs } : {}),
+      ...(MODELS.includes(message.model) ? { model: message.model } : {}),
+      ...(message.role === 'user' && restoreAttachments(message.attachments).length
+        ? { attachments: restoreAttachments(message.attachments) } : {}),
       ...(typeof message.error === 'string' ? { error: message.error } : {}),
       ...(message.role === 'user' && message.pending === true ? { pending: true } : {}) }));
   messages.forEach((message, index) => {
-    if (!message.pending) return;
+    if (!message.pending || live) return;
     delete message.pending;
     if (messages[index + 1]?.role !== 'assistant') {
       message.error = '페이지가 닫혀 응답을 받지 못했습니다. 다시 시도해 주세요.';
@@ -113,10 +158,13 @@ export class ChatStore {
     this.onChange = () => {};
     this.storageWarning = '';
     this.chats = [];
+    this.deleted = new Set();
+    this.requestChat = null;
     this.settings = { ...DEFAULT_SETTINGS };
     try {
       const saved = JSON.parse(storage.getItem(STORAGE_KEY) || 'null');
-      if (Array.isArray(saved?.chats)) this.chats = saved.chats.map(restoreChat).filter(Boolean);
+      if (Array.isArray(saved?.chats)) this.chats = saved.chats.map(chat => restoreChat(chat)).filter(Boolean);
+      if (Array.isArray(saved?.deleted)) this.deleted = new Set(saved.deleted.filter(item => typeof item === 'string'));
       this.settings = restoreSettings(saved?.settings);
       this.activeId = this.chats.some(chat => chat.id === saved?.activeId)
         ? saved.activeId : this.chats[0]?.id;
@@ -131,10 +179,40 @@ export class ChatStore {
 
   get current() { return this.chats.find(chat => chat.id === this.activeId); }
 
+  /**
+   * Fold in what other tabs saved: their new chats, newer versions of idle chats and deletions.
+   * The chat this tab is answering keeps its in-memory object, which the request still writes to.
+   */
+  merge(saved, { adoptSettings = false } = {}) {
+    if (!saved || !Array.isArray(saved.chats)) return;
+    if (Array.isArray(saved.deleted)) saved.deleted.forEach(item => typeof item === 'string' && this.deleted.add(item));
+    for (const stored of saved.chats.map(chat => restoreChat(chat, true)).filter(Boolean)) {
+      if (this.deleted.has(stored.id)) continue;
+      const index = this.chats.findIndex(chat => chat.id === stored.id);
+      if (index === -1) this.chats.push(stored);
+      else if (stored.updatedAt > this.chats[index].updatedAt && this.chats[index] !== this.requestChat) {
+        this.chats[index] = stored;
+      }
+    }
+    this.chats = this.chats.filter(chat => !this.deleted.has(chat.id));
+    if (!this.chats.length) this.chats = [freshChat()];
+    if (!this.current) this.activeId = this.chats[0].id;
+    if (adoptSettings) this.settings = restoreSettings(saved.settings);
+  }
+
+  /** Called when another tab wrote to storage. */
+  sync() {
+    try {
+      this.merge(JSON.parse(this.storage.getItem(STORAGE_KEY) || 'null'), { adoptSettings: true });
+    } catch { return; }
+    this.onChange();
+  }
+
   save() {
     try {
+      try { this.merge(JSON.parse(this.storage.getItem(STORAGE_KEY) || 'null')); } catch { /* unreadable: overwrite */ }
       this.storage.setItem(STORAGE_KEY, JSON.stringify({ chats: this.chats, activeId: this.activeId,
-        settings: this.settings }));
+        settings: this.settings, deleted: [...this.deleted].slice(-300) }));
     } catch {
       this.storageWarning = '브라우저에 기록을 저장할 수 없습니다. 페이지를 닫으면 대화가 사라질 수 있습니다.';
     }
@@ -166,12 +244,14 @@ export class ChatStore {
     const clean = String(title).replace(/\s+/g, ' ').trim().slice(0, 80);
     if (chat && clean) {
       chat.title = clean;
+      chat.updatedAt = Date.now();
       this.emit();
     }
   }
 
   remove(chatId) {
     if (this.busy) return;
+    this.deleted.add(chatId);
     this.chats = this.chats.filter(chat => chat.id !== chatId);
     if (!this.chats.length) this.chats = [freshChat()];
     if (!this.chats.some(chat => chat.id === this.activeId)) this.activeId = this.chats[0].id;
@@ -183,10 +263,12 @@ export class ChatStore {
     this.emit();
   }
 
-  async send(content) {
-    if (this.busy || !content.trim()) return;
+  async send(content, attachments = []) {
+    const files = restoreAttachments(attachments);
+    if (this.busy || (!content.trim() && !files.length)) return;
     const chat = this.current;
-    const message = { id: id(), role: 'user', content: content.trim() };
+    const message = { id: id(), role: 'user', content: content.trim() || DEFAULT_FILE_PROMPT,
+      ...(files.length ? { attachments: files } : {}) };
     chat.messages.push(message);
     if (chat.title === '새 대화') chat.title = message.content.replace(/\s+/g, ' ').slice(0, 36);
     return this.request(chat, message);
@@ -229,15 +311,16 @@ export class ChatStore {
 
   async request(chat, message) {
     this.busy = true;
+    this.requestChat = chat;
     delete message.error;
     message.pending = true;
     chat.updatedAt = Date.now();
     const history = chat.messages.filter(item => !item.error && item.content.trim())
-      .map(({ role, content }) => ({ role, content }));
+      .map(item => ({ role: item.role, content: item.role === 'user' ? messageText(item) : item.content }));
     if (this.settings.systemPrompt.trim()) {
       history.unshift({ role: 'system', content: this.settings.systemPrompt.trim() });
     }
-    const draft = { id: id(), role: 'assistant', content: '', toolCalls: [], streaming: true };
+    const draft = { id: id(), role: 'assistant', content: '', toolCalls: [], streaming: true, model: chat.model };
     chat.messages.push(draft);
     const controller = new AbortController();
     this.controller = controller;
@@ -304,6 +387,7 @@ export class ChatStore {
       draft.toolCalls = normalizeTools(draft.toolCalls.map(({ running, ...call }) => call));
       delete message.pending;
       this.busy = false;
+      this.requestChat = null;
       this.controller = null;
       chat.updatedAt = Date.now();
       this.emit();

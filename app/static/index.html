@@ -28,6 +28,9 @@
     <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></symbol>
     <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
     <symbol id="i-bulb" viewBox="0 0 24 24"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3Z"/></symbol>
+    <symbol id="i-clip" viewBox="0 0 24 24"><path d="m20 11.5-8.2 8.2a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7L9.4 17.3a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H6v18h12V7Zm0 0v4h4M9 13h6M9 17h6"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11m-5-5 5 5 5-5M5 20h14"/></symbol>
     <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14m-6-6 6 6 6-6"/></symbol>
   </svg>
 
@@ -61,6 +64,7 @@
         </div>
         <div class="topbar-actions">
           <div id="server-status" class="server-status"><span class="status-dot"></span><span>서버 확인 중</span></div>
+          <button id="export-chat" class="icon-button" aria-label="이 대화를 마크다운으로 저장" title="이 대화를 마크다운으로 저장" hidden><svg class="icon"><use href="#i-download"/></svg></button>
           <button id="open-settings" class="icon-button" aria-label="설정" title="설정"><svg class="icon"><use href="#i-settings"/></svg></button>
         </div>
       </header>
@@ -83,12 +87,15 @@
       <button id="scroll-bottom" class="scroll-bottom" aria-label="맨 아래로" hidden><svg class="icon"><use href="#i-down"/></svg></button>
 
       <div class="composer-area">
-        <div id="request-status" class="request-status" role="status" aria-live="polite"></div>
+        <div id="request-status" class="sr-only" role="status" aria-live="polite"></div>
         <form id="chat-form" class="composer">
+          <div id="attachments" class="attachment-list" hidden></div>
           <label class="sr-only" for="prompt">메시지</label>
-          <textarea id="prompt" placeholder="메시지를 입력하세요" rows="1" aria-label="메시지" required></textarea>
+          <textarea id="prompt" placeholder="메시지를 입력하세요" rows="1" aria-label="메시지"></textarea>
           <div class="composer-bottom">
             <div class="toggles">
+              <button id="attach" class="icon-button attach-button" type="button" aria-label="텍스트 파일 첨부" title="텍스트 파일 첨부 (.txt, .md, .csv 등)"><svg class="icon"><use href="#i-clip"/></svg></button>
+              <input id="file-input" type="file" multiple accept=".txt,.md,.markdown,.csv,.tsv,.json,.xml,.html,.htm,.log,.py,.js,.ts,.r,.tex,.bib,.ris,.yaml,.yml,text/*" hidden>
               <label class="pubmed-toggle" for="use-pubmed" title="논문이 필요할 때 PubMed를 검색합니다"><input id="use-pubmed" type="checkbox" checked><svg class="icon"><use href="#i-search"/></svg><span>PubMed 검색</span><span class="toggle-indicator"></span></label>
               <label class="pubmed-toggle" for="use-thinking" title="답하기 전에 생각합니다. 더 정확할 수 있지만 느립니다"><input id="use-thinking" type="checkbox"><svg class="icon"><use href="#i-bulb"/></svg><span>추론</span><span class="toggle-indicator"></span></label>
             </div>

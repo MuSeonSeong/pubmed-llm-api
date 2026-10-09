@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ChatStore, readEvents, renderMarkdown } from '../app/static/chat.mjs';
+import { ATTACHMENT_LIMIT, ChatStore, chatMarkdown, readAttachments, readEvents, renderMarkdown } from '../app/static/chat.mjs';
 
 const memory = () => {
   const data = new Map();
@@ -416,4 +416,63 @@ test('stopping after the final event keeps the answer complete', async () => {
   assert.equal(answer.content, '완성된 답');
   assert.equal(answer.stopped, false);
   assert.equal(store.current.messages[0].error, undefined);
+});
+
+
+test('attachments are sent to the model, kept for display and persisted', async () => {
+  const storage = memory();
+  const bodies = [];
+  const store = new ChatStore(storage, async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return sse([done('요약')]);
+  });
+  await store.send('', [{ name: 'notes.txt', text: '혈당 측정 결과', truncated: false }]);
+  const question = store.current.messages[0];
+  assert.equal(question.content, '첨부한 파일의 내용을 요약해 줘.');
+  assert.ok(bodies[0].messages[0].content.includes('[첨부 파일: notes.txt]'));
+  assert.ok(bodies[0].messages[0].content.includes('혈당 측정 결과'));
+  assert.equal(store.current.messages[1].model, 'qwen3.5-2b');
+  const restored = new ChatStore(storage);
+  assert.equal(restored.current.messages[0].attachments[0].name, 'notes.txt');
+  assert.ok(chatMarkdown(restored.current).includes('## Qwen3.5 · 2B'));
+});
+
+test('reading attachments enforces a shared size budget and rejects binary files', async () => {
+  const file = (name, text) => ({ name, text: async () => text });
+  const files = await readAttachments([file('a.txt', 'x'.repeat(ATTACHMENT_LIMIT - 10)), file('b.txt', 'y'.repeat(50))]);
+  assert.equal(files[1].text.length, 10);
+  assert.equal(files[1].truncated, true);
+  assert.equal(files.reduce((sum, f) => sum + f.text.length, 0), ATTACHMENT_LIMIT);
+  await assert.rejects(readAttachments([file('img.png', 'PNG\u0000\u0001')]), /텍스트 파일이 아닙니다/);
+});
+
+
+test('two tabs sharing storage keep each other\'s chats and deletions', async () => {
+  const storage = memory();
+  const tabA = new ChatStore(storage, async () => sse([done('A 답')]));
+  const tabB = new ChatStore(storage, async () => sse([done('B 답')]));
+  await tabA.send('A 질문');
+  tabB.newChat();
+  await tabB.send('B 질문');
+  tabA.save();
+  const titles = chats => chats.filter(c => c.messages.length).map(c => c.title).sort();
+  assert.deepEqual(titles(new ChatStore(storage).chats), ['A 질문', 'B 질문']);
+  const chatA = tabA.chats.find(c => c.title === 'A 질문').id;
+  tabB.sync();
+  tabB.remove(chatA);
+  tabA.save();  // A still holds the chat in memory but must not resurrect it
+  assert.deepEqual(titles(new ChatStore(storage).chats), ['B 질문']);
+});
+
+test('a request running in another tab is shown as in progress, not as failed', () => {
+  const storage = memory();
+  storage.setItem('pubmed-chat.v1', JSON.stringify({ chats: [] }));
+  const tab = new ChatStore(storage);
+  storage.setItem('pubmed-chat.v1', JSON.stringify({ chats: [{ id: 'live', title: 't', updatedAt: Date.now() + 1000,
+    messages: [{ id: 'q', role: 'user', content: 'q', pending: true },
+      { id: 'd', role: 'assistant', content: '', streaming: true }] }] }));
+  tab.sync();
+  const live = tab.chats.find(c => c.id === 'live');
+  assert.equal(live.messages[0].error, undefined);
+  assert.equal(live.messages[1].streaming, true);
 });

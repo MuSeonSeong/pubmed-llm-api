@@ -239,3 +239,10 @@ def test_thinking_flag_reaches_the_chat_template(monkeypatch):
     asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0))
     asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0,thinking=True))
     assert seen == [False, True]
+
+
+def test_status_reports_whether_generation_is_running(monkeypatch):
+    obj=manager(monkeypatch)
+    assert obj.status()['busy'] is False
+    with obj._lock:
+        assert obj.status()['busy'] is True

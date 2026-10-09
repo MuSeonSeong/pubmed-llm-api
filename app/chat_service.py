@@ -194,7 +194,10 @@ class ChatService:
             if system:
                 messages.insert(0, {'role': 'system', 'content': '\n\n'.join(system)})
             while True:
-                if self.manager.status().get('loaded_model') != request.model:
+                state = self.manager.status()
+                if state.get('busy'):  # another request holds the model; generation is serialized
+                    notify({'type': 'status', 'stage': 'queued'})
+                if state.get('loaded_model') != request.model:
                     notify({'type': 'status', 'stage': 'loading_model', 'model': request.model})
                 stream = {'on_text': self._text_relay(emit, request.thinking), 'cancel': cancel} if emit else {}
                 if request.thinking:

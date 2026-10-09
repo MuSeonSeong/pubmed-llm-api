@@ -302,3 +302,18 @@ def test_without_thinking_reasoning_field_is_absent():
     r,g,_=complete(['hello'],use_pubmed=False)
     assert r.choices[0].message.reasoning_content is None
     assert g.thinking is False
+
+
+def test_stream_reports_queueing_behind_another_request():
+    import threading
+    from app.chat_service import ChatService
+    from app.schemas import ChatRequest
+    class Busy(Generator):
+        def status(self):
+            return {**super().status(),'busy':True,'loaded_model':'qwen3.5-2b'}
+    events=[]
+    request=ChatRequest(messages=[{'role':'user','content':'q'}],use_pubmed=False,stream=True)
+    asyncio.run(ChatService(Busy(['hi']),PubMed()).stream(request,events.append,threading.Event()))
+    stages=[e['stage'] for e in events if e['type']=='status']
+    assert stages[0] == 'queued'
+    assert 'loading_model' not in stages

@@ -151,7 +151,20 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .streaming > :is(p, h3, h4, blockquote):last-child::after, .streaming > :is(ul, ol):last-child > li:last-child::after { content: ''; display: inline-block; width: 7px; height: 15px; margin-left: 3px; vertical-align: -2px; background: var(--green); border-radius: 1px; animation: blink 1s steps(2, start) infinite; }
 .message-actions { display: flex; gap: 2px; padding-left: 28px; margin-top: 6px; }
 .message-actions .icon { width: 15px; height: 15px; }
-.toggles { display: flex; gap: 6px; flex-wrap: wrap; }
+.toggles { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.attach-button { width: 30px; height: 30px; border-radius: 50%; }
+.attach-button .icon { width: 17px; height: 17px; }
+.composer.dragging { border-color: var(--green); border-style: dashed; background: var(--green-soft); }
+.attachment-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+.message-user .attachment-list { justify-content: flex-end; margin-bottom: 6px; max-width: 85%; }
+.attachment-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 260px; border: 1px solid var(--line-2); background: var(--raised); border-radius: 9px; padding: 5px 4px 5px 9px; font-size: 12px; }
+.message-user .attachment-chip { padding-right: 10px; }
+.attachment-chip > .icon { width: 15px; height: 15px; color: var(--green); }
+.attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attachment-size { color: var(--faint); font-size: 11px; flex-shrink: 0; }
+.attachment-chip .icon-button { width: 22px; height: 22px; }
+.attachment-chip .icon-button .icon { width: 12px; height: 12px; }
+.model-tag { color: var(--faint); font-weight: 400; }
 .reasoning-panel { margin: 0 0 12px; border-left: 2px solid var(--line-2); padding-left: 12px; }
 .reasoning-panel summary { cursor: pointer; color: var(--muted); font-size: 12.5px; list-style: none; display: inline-flex; align-items: center; gap: 6px; }
 .reasoning-panel summary::-webkit-details-marker { display: none; }

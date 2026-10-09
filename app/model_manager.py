@@ -63,7 +63,7 @@ class ModelManager:
         self._loaded_id = None
 
     def status(self) -> dict:
-        return {'device': self.device, 'loaded_model': self._loaded_id,
+        return {'device': self.device, 'loaded_model': self._loaded_id, 'busy': self._lock.locked(),
                 'model_files': {name: self._files_available(self.settings.models_dir / spec.directory)
                                 for name, spec in self.catalog.items()}}
 
