@@ -7,7 +7,7 @@ const DEFAULT_FILE_PROMPT = '첨부한 파일의 내용을 요약해 줘.';
 export const DEFAULT_SETTINGS = Object.freeze({ systemPrompt: '', temperature: 0.2, maxTokens: 512 });
 const id = () => globalThis.crypto.randomUUID();
 const freshChat = () => ({ id: id(), title: '새 대화', model: MODELS[0],
-  usePubmed: true, thinking: false, messages: [], updatedAt: Date.now() });
+  usePubmed: true, thinking: false, messages: [], updatedAt: Date.now(), rev: Date.now() });
 /** Reasoning spends tokens before the answer starts, so thinking requests get a larger floor. */
 export const THINKING_MIN_TOKENS = 1024;
 const STOPPED = '답변 생성을 중지했습니다.';
@@ -266,15 +266,16 @@ export class ChatStore {
     if (!this.locks) return;
     let held;
     try { held = new Set((await this.locks.query()).held.map(lock => lock.name)); } catch { return; }
+    // The answering tab saves its final state before releasing the lock, so read storage again now:
+    // otherwise a released lock could make us settle an older copy than the one already saved.
+    try { this.merge(JSON.parse(this.storage.getItem(STORAGE_KEY) || 'null')); } catch { /* keep what we have */ }
     let changed = false;
     const live = new Set();
     for (const chat of this.chats) {
       if (chat === this.requestChat || !inProgress(chat)) continue;
       if (held.has(LOCK_PREFIX + chat.id)) live.add(chat.id);
-      else if (settleInterrupted(chat)) {
-        this.touch(chat);
-        changed = true;
-      }
+      // No touch(): a settled copy must never outrank a real save that arrives later.
+      else if (settleInterrupted(chat)) changed = true;
     }
     changed ||= live.size !== this.liveChats.size || [...live].some(chatId => !this.liveChats.has(chatId));
     this.liveChats = live;
@@ -294,7 +295,7 @@ export class ChatStore {
       if (index === -1) {
         this.chats.push(stored);
         if (inProgress(stored)) this.liveChats.add(stored.id);  // refreshLive() confirms or settles it
-      } else if (stored.rev > this.chats[index].rev && this.chats[index] !== this.requestChat) {
+      } else if ((stored.rev || 0) > (this.chats[index].rev || 0) && this.chats[index] !== this.requestChat) {
         this.chats[index] = stored;
         if (inProgress(stored)) this.liveChats.add(stored.id);
         else this.liveChats.delete(stored.id);
@@ -393,15 +394,41 @@ export class ChatStore {
     this.emit();
   }
 
+  /**
+   * Mark this tab busy and take the chat's lock before changing anything, so a refused request leaves
+   * the chat untouched. Returns the lock release, or null when another tab is answering this chat.
+   */
+  async claim(chat) {
+    this.busy = true;
+    this.requestChat = chat;
+    if (!this.locks) return () => {};
+    let release = () => {};
+    const granted = await new Promise(resolve => {
+      this.locks.request(LOCK_PREFIX + chat.id, { ifAvailable: true }, lock => {
+        if (!lock) return resolve(false);
+        return new Promise(done => { release = done; resolve(true); });
+      }).catch(() => resolve(true));
+    });
+    if (granted) return release;
+    this.busy = false;
+    this.requestChat = null;
+    this.liveChats.add(chat.id);
+    this.notice = '다른 탭에서 이 대화의 답변을 만들고 있어요.';
+    this.onChange();
+    return null;
+  }
+
   async send(content, attachments = []) {
     const files = restoreAttachments(attachments);
     const chat = this.current;
     if (!this.canModify(chat) || (!content.trim() && !files.length)) return;
+    const release = await this.claim(chat);
+    if (!release) return;
     const message = { id: id(), role: 'user', content: content.trim() || DEFAULT_FILE_PROMPT,
       ...(files.length ? { attachments: files } : {}) };
     chat.messages.push(message);
     if (chat.title === '새 대화') chat.title = message.content.replace(/\s+/g, ' ').slice(0, 36);
-    return this.request(chat, message);
+    return this.request(chat, message, { release });
   }
 
   canRetry(messageId) {
@@ -410,7 +437,10 @@ export class ChatStore {
   }
 
   async retry(messageId) {
-    if (this.canRetry(messageId)) return this.request(this.current, this.current.messages.at(-1));
+    if (!this.canRetry(messageId)) return;
+    const chat = this.current;
+    const release = await this.claim(chat);
+    if (release) return this.request(chat, chat.messages.at(-1), { release });
   }
 
   canRegenerate(messageId) {
@@ -423,9 +453,11 @@ export class ChatStore {
   async regenerate(messageId) {
     if (!this.canRegenerate(messageId)) return;
     const chat = this.current;
+    const release = await this.claim(chat);
+    if (!release) return;
     const previous = chat.messages.pop();
     const versions = previous.versions?.length ? previous.versions : [snapshot(previous)];
-    return this.request(chat, chat.messages.at(-1), { versions, fallback: previous });
+    return this.request(chat, chat.messages.at(-1), { versions, fallback: previous, release });
   }
 
   canSelectVersion(messageId) {
@@ -450,10 +482,12 @@ export class ChatStore {
     const chat = this.current;
     const index = chat.messages.findIndex(message => message.id === messageId);
     if (!this.canModify(chat) || !content.trim() || chat.messages[index]?.role !== 'user') return;
+    const release = await this.claim(chat);
+    if (!release) return;
     const message = chat.messages[index];
     chat.messages.splice(index + 1);
     message.content = content.trim();
-    return this.request(chat, message);
+    return this.request(chat, message, { release });
   }
 
   canContinue(messageId) {
@@ -467,46 +501,35 @@ export class ChatStore {
   async continueAnswer(messageId) {
     if (!this.canContinue(messageId)) return;
     const chat = this.current;
-    const target = chat.messages.at(-1);
-    return this.request(chat, chat.messages.at(-2), { continueFrom: target });
+    const release = await this.claim(chat);
+    if (!release) return;
+    return this.request(chat, chat.messages.at(-2), { continueFrom: chat.messages.at(-1), release });
   }
 
   stop() { this.controller?.abort(); }
 
-  async request(chat, message, { versions = null, fallback = null, continueFrom = null } = {}) {
-    this.busy = true;
-    this.requestChat = chat;
-    let releaseLock = () => {};
-    if (this.locks) {
-      // Hold the chat's lock before announcing the request, so no tab can mistake it for a dead one.
-      const granted = await new Promise(resolve => {
-        this.locks.request(LOCK_PREFIX + chat.id, { ifAvailable: true }, lock => {
-          if (!lock) return resolve(false);
-          return new Promise(release => { releaseLock = release; resolve(true); });
-        }).catch(() => resolve(true));
-      });
-      if (!granted) {
-        this.busy = false;
-        this.requestChat = null;
-        this.notice = '다른 탭에서 이 대화의 답변을 만들고 있어요.';
-        if (fallback) chat.messages.push(fallback);
-        this.onChange();
-        return;
-      }
-    }
+  /** Answer `message`; callers claim() the chat first and pass the lock release. */
+  async request(chat, message, { versions = null, fallback = null, continueFrom = null, release = () => {} } = {}) {
+    const releaseLock = release;
     delete message.error;
     message.pending = true;
     chat.updatedAt = Date.now();
     this.touch(chat);
+    // A continuation extends the answer text, so the appended citation list is set aside meanwhile.
+    const original = continueFrom ? snapshot(continueFrom) : null;
+    const answerText = continueFrom ? withoutCitationList(continueFrom.content) : '';
+    const citationTail = continueFrom ? continueFrom.content.slice(answerText.length) : '';
     const history = chat.messages.filter(item => !item.error && item.content.trim())
-      .map(item => ({ role: item.role, content: item.role === 'user' ? messageText(item) : item.content }));
+      .map(item => ({ role: item.role, content: item.role === 'user' ? messageText(item)
+        : item === continueFrom ? answerText : item.content }));
     if (this.settings.systemPrompt.trim()) {
       history.unshift({ role: 'system', content: this.settings.systemPrompt.trim() });
     }
-    const base = continueFrom ? { ...snapshot(continueFrom), content: continueFrom.content } : null;
+    const base = continueFrom ? { ...snapshot(continueFrom), content: answerText } : null;
     let draft;
     if (continueFrom) {
       draft = continueFrom;  // stream straight into the answer being extended
+      draft.content = answerText;
       delete draft.truncated;
       delete draft.stopped;
       draft.streaming = true;
@@ -538,7 +561,7 @@ export class ChatStore {
       const complete = data => {
         finish(draft, data);
         if (base) {  // the server returns only the added text; keep what the answer already had
-          draft.content = base.content + draft.content;
+          draft.content = base.content + draft.content + citationTail;
           for (const key of ['sources', 'reasoning', 'thinkMs', 'dropped']) if (draft[key] === undefined && base[key] !== undefined) draft[key] = base[key];
           if (!draft.toolCalls.length) draft.toolCalls = base.toolCalls || [];
           draft.tokens = (base.tokens || 0) + (draft.tokens || 0);
@@ -583,12 +606,14 @@ export class ChatStore {
       if (finished) { /* stopped after the complete answer arrived: keep it as finished */ }
       else if (base && !(controller.signal.aborted && draft.content.length > base.content.length)) {
         for (const key of VERSION_FIELDS) delete draft[key];
-        Object.assign(draft, base);  // a failed continuation leaves the answer as it was
+        Object.assign(draft, original);  // a failed continuation leaves the answer as it was
         if (!controller.signal.aborted) this.notice = error instanceof TypeError
           ? '서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하고 다시 시도해 주세요.'
           : error.message || '이어서 생성하지 못했습니다.';
-      } else if (controller.signal.aborted && draft.content.trim()) draft.stopped = true;
-      else {
+      } else if (controller.signal.aborted && draft.content.trim()) {
+        draft.stopped = true;
+        draft.content += citationTail;
+      } else {
         chat.messages.splice(chat.messages.indexOf(draft), 1);
         const reason = controller.signal.aborted ? STOPPED : error instanceof TypeError
           ? '서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하고 다시 시도해 주세요.'

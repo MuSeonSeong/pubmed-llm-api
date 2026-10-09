@@ -77,6 +77,7 @@ test('duplicate submission is blocked and response stays with its original conve
   const original = store.current;
   const pending = store.send('질문');
   await store.send('중복');
+  await tick();  // the first request reaches fetch once it holds the chat's lock
   assert.equal(calls, 1);
   assert.equal(store.busy, true);
   store.select(other.id);
@@ -649,4 +650,65 @@ test('code highlighting colours tokens and escapes everything', () => {
   assert.equal(highlight('<x> if', 'unknown'), '&lt;x&gt; if');
   assert.ok(highlight('SELECT * FROM t', 'sql').includes('<span class="tok-keyword">SELECT</span>'));
   assert.ok(renderMarkdown('```js\nconst a = `x`;\n```').includes('<span class="tok-string">`x`</span>'));
+});
+
+
+test('a chat created in one tab picks up a conversation another tab started in it', async () => {
+  const storage = memory();
+  const tabA = new ChatStore(storage);
+  tabA.save();
+  const tabB = new ChatStore(storage, async () => sse([done('답')]));
+  await tabB.send('hello');
+  await tabA.sync();
+  assert.equal(tabA.current.messages.length, 2);
+  tabA.select(tabA.current.id);  // any save from A must not wipe B's turn
+  assert.equal(new ChatStore(storage).current.messages.length, 2);
+});
+
+test('a released lock never settles an older copy over the final answer', async () => {
+  const storage = memory();
+  let stream;
+  const owner = new ChatStore(storage, async (_, init) => (stream = controlledStream(init.signal)).response);
+  const pending = owner.send('hello');
+  await tick();
+  const watcher = new ChatStore(storage);
+  await watcher.refreshLive();
+  assert.ok(watcher.liveChats.has(owner.current.id));
+  stream.push(done('full answer'));
+  stream.close();
+  await pending;
+  await watcher.refreshLive();  // before any storage event reached it
+  const chat = watcher.chats.find(c => c.id === owner.current.id);
+  assert.deepEqual(chat.messages.map(m => m.content), ['hello', 'full answer']);
+  assert.equal(chat.messages[0].error, undefined);
+  watcher.save();
+  assert.deepEqual(new ChatStore(storage).current.messages.map(m => m.content), ['hello', 'full answer']);
+});
+
+test('continuing a cited answer extends the text and keeps the citation list last', async () => {
+  const bodies = [];
+  const cited = '봄에는\n\nPubMed 검색·조회 출처:\n- PMID [1](https://pubmed.ncbi.nlm.nih.gov/1/)';
+  const store = new ChatStore(memory(), async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return bodies.length === 1 ? sse([{ ...done(cited, 'length'), sources: [{ pmid: '1' }] }]) : sse([done(' 꽃이 핍니다.')]);
+  });
+  await store.send('사계절');
+  const answer = store.current.messages.at(-1);
+  await store.continueAnswer(answer.id);
+  assert.equal(bodies[1].messages.at(-1).content, '봄에는');
+  assert.equal(answer.content, '봄에는 꽃이 핍니다.\n\nPubMed 검색·조회 출처:\n- PMID [1](https://pubmed.ncbi.nlm.nih.gov/1/)');
+  assert.equal(withoutCitationList(answer.content), '봄에는 꽃이 핍니다.');
+});
+
+test('a question refused because another tab holds the chat is not half-added', async () => {
+  const storage = memory();
+  const store = new ChatStore(storage, async () => sse([done('답')]));
+  let release;
+  await new Promise(resolve => navigator.locks.request('pubmed-chat:' + store.current.id,
+    () => new Promise(done => { release = done; resolve(); })));
+  await store.send('질문');
+  assert.equal(store.current.messages.length, 0);
+  assert.equal(store.busy, false);
+  assert.ok(store.notice);
+  release();
 });
