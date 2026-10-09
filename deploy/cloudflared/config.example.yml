@@ -1,0 +1,14 @@
+# 직접 관리하는 Cloudflare Tunnel 설정 예시입니다. 순서는 docs/deploy.md의 "직접 관리하는 방식"을 따르세요.
+# ~/.cloudflared/config.yml로 복사한 뒤 <TUNNEL-ID>, <사용자 이름>, chat.example.com을 바꿉니다.
+#   cloudflared tunnel create pubmed-chat     # 터널 ID와 인증 파일 ~/.cloudflared/<TUNNEL-ID>.json을 만듭니다
+#   cloudflared tunnel route dns pubmed-chat chat.example.com
+# 인증 파일은 터널의 비밀번호와 같습니다. 남에게 보내거나 Git에 올리지 마세요.
+tunnel: <TUNNEL-ID>
+credentials-file: /Users/<사용자 이름>/.cloudflared/<TUNNEL-ID>.json
+
+ingress:
+  # 이 주소로 들어온 요청을 이 PC의 앱으로 보냅니다. 앱은 127.0.0.1에서만 접속을 받습니다.
+  - hostname: chat.example.com
+    service: http://127.0.0.1:8000
+  # 그 밖의 주소는 모두 404로 거절합니다. 마지막 규칙은 hostname 없이 모든 요청을 받아야 합니다.
+  - service: http_status:404

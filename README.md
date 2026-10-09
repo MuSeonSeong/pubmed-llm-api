@@ -43,9 +43,11 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 PowerShell 환경에서 활성화 스크립트가 차단되어 있으면 가상환경 활성화 없이 `uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1`로 실행할 수 있습니다.
 
 - 채팅 화면: <http://127.0.0.1:8000>
-- API 문서: <http://127.0.0.1:8000/docs>
+- API 문서: <http://127.0.0.1:8000/docs> (로컬 모드에서만 제공)
 - 상태: <http://127.0.0.1:8000/health>
 - 모델 목록: <http://127.0.0.1:8000/v1/models>
+
+`AUTH_ENABLED`를 따로 정하지 않고 이렇게 직접 실행하면 로그인 없는 **로컬 모드**이며 모든 대화를 `local` 사용자 하나로 저장합니다. 대화와 설정, 첨부 이미지는 처음 사용할 때 생기는 이 프로젝트의 `data/`(`data/chat.db`, `data/files/`)에 저장되고 Git에서는 제외됩니다. 친구들이 인터넷으로 접속하게 하려면 [서버 PC로 배포하기](#서버-pc로-배포하기)를 따르세요.
 
 프로젝트를 어느 경로에 두어도 모델 경로 기본값은 이 프로젝트의 `models/`입니다. 다운로드 스크립트는 Hugging Face 캐시를 활용하며 모델 파일을 역참조해 저장하므로 기존 캐시 폴더의 심볼릭 링크에 의존하지 않습니다. 완료된 모델은 다시 다운로드하지 않습니다.
 
@@ -63,14 +65,16 @@ PowerShell 환경에서 활성화 스크립트가 차단되어 있으면 가상�
 - 오른쪽 위 **설정**에서 모든 대화에 적용할 맞춤 지시문, 창의성(temperature), 최대 답변 길이, 밝은/어두운 테마를 정합니다. 대화를 JSON으로 내보내거나 모두 삭제할 수도 있습니다.
 - 답변이 길이 한도로 잘리거나 중지된 경우 **이어서 생성**을 누르면 같은 답변을 끊긴 지점부터 이어 씁니다.
 - 대화가 모델의 문맥 한도를 넘으면 오래된 질문과 답변부터 빼고 답하며, 몇 개를 뺐는지 알려줍니다.
-- **이미지 질문**: 클립 버튼, 끌어다 놓기, 스크린샷 붙여넣기(⌘V/Ctrl+V)로 PNG·JPEG·WebP·GIF 이미지를 첨부하고 그림에 대해 물을 수 있습니다. 이미지는 Qwen3.5 · 2B만 이해하므로 첨부하면 이 모델로 바뀝니다. 한 요청에 최근 이미지 4장까지 보내며, 브라우저 저장 공간이 부족하면 오래된 대화의 이미지부터 지웁니다.
+- **이미지 질문**: 클립 버튼, 끌어다 놓기, 스크린샷 붙여넣기(⌘V/Ctrl+V)로 PNG·JPEG·WebP·GIF 이미지를 첨부하고 그림에 대해 물을 수 있습니다. 이미지는 Qwen3.5 · 2B만 이해하므로 첨부하면 이 모델로 바뀝니다. 한 요청에 최근 이미지 4장까지 보냅니다. 첨부한 이미지는 바로 서버의 `data/files/`에 올라가며, 계정마다 대화와 합쳐 `USER_STORAGE_MB`(기본 500 MB)까지 저장할 수 있습니다.
 - 텍스트 파일(.txt, .md, .csv, .json, 코드 등)과 **PDF**(논문 등)도 같은 방법으로 첨부할 수 있습니다. PDF는 서버에서 글자를 추출하며, 스캔본처럼 글자가 없는 PDF나 암호가 걸린 PDF는 읽지 못합니다. 작은 모델의 문맥 한도 때문에 텍스트 첨부는 모두 합쳐 12,000자, 그리고 문맥의 약 42%(기본 약 3,400토큰)까지이며 넘으면 앞부분만 보냅니다. 한국어는 글자당 토큰이 많아 영어보다 짧게 잘립니다.
 - 답변의 스피커 버튼으로 **소리 내어 읽기**를 할 수 있습니다. 브라우저에 내장된 음성을 사용하며 코드 블록은 건너뜁니다.
 - 답변마다 어떤 모델이 답했는지 표시합니다. 상단의 저장 버튼으로 현재 대화를 마크다운 파일로 내려받을 수 있습니다.
-- 여러 탭에서 동시에 써도 대화가 서로 지워지지 않습니다. 다른 탭에서 답변 중인 대화는 그 답변이 끝날 때까지 읽기 전용으로 진행 상황을 보여줍니다. 모델은 한 번에 한 요청만 처리하므로 다른 요청이 진행 중이면 "기다리고 있어요"로 표시됩니다.
+- 여러 탭이나 여러 기기에서 동시에 써도 대화가 서로 지워지지 않습니다. 다른 탭이나 기기에서 답변 중인 대화는 그 답변이 끝날 때까지 읽기 전용입니다. 모델은 한 번에 한 요청만 처리하므로 다른 요청이 진행 중이면 "기다리고 있어요"로 표시됩니다.
 - PubMed를 사용한 답변 아래에 **참고한 논문** 카드(제목·저널·연도·저자, 초록 확인 여부)를 보여주며 누르면 PubMed 페이지가 열립니다.
 - 표, 인용, 코드 블록(복사 버튼 포함), 링크를 서식에 맞춰 표시합니다. 검색·조회 내역도 펼쳐서 확인할 수 있습니다.
-- 대화 기록과 설정은 현재 브라우저의 로컬 저장소에 저장됩니다. 브라우저 데이터를 지우면 기록도 삭제됩니다. 연결 오류가 나면 질문 아래 **다시 시도**를 누르세요.
+- 대화 기록과 설정은 서버의 `data/chat.db`에 계정별로 저장됩니다. 브라우저는 화면을 빨리 띄우기 위한 사본(캐시)만 두므로, 브라우저 데이터를 지워도 기록은 남고 같은 계정으로 로그인한 다른 기기에서도 이어서 볼 수 있습니다. 연결 오류가 나면 질문 아래 **다시 시도**를 누르세요.
+- 서버 저장 이전에 이 브라우저에만 저장했던 기록은, 지금 사용자(계정 모드에서는 로그인한 계정, 로컬 모드에서는 `local`)에게 아직 서버 대화가 없을 때 한 번 가져올지 묻습니다. 가져오든 거절하든 브라우저의 예전 사본은 지우지 않으며, 거절하면 다시 묻지 않습니다. 브라우저 저장소는 주소마다 따로이므로 예전에 쓰던 브라우저에서 같은 주소(예: `http://127.0.0.1:8000`)로 열어야 합니다.
+- 계정 모드(`AUTH_ENABLED=true`)에서는 먼저 로그인 화면(`/login`)이 나오고, 로그인은 `SESSION_DAYS`(기본 30일) 동안 유지됩니다.
 
 로컬 UI는 별도 프런트엔드 설치 없이 같은 서버에서 제공되며 Docker에서도 사용할 수 있습니다.
 
@@ -84,6 +88,10 @@ PowerShell 환경에서 활성화 스크립트가 차단되어 있으면 가상�
 | `MODELS_DIR` | `models` | 프로젝트 기준 상대 경로 또는 절대 경로 |
 | `MAX_CONTEXT_TOKENS` | `8192` | 입력 템플릿·도구 스키마·첨부·이미지·생성 토큰의 합, 최대 8192. 메모리가 적은 CPU 환경에서는 4096으로 줄일 수 있습니다 |
 | `PUBMED_MCP_URL` | `https://pubmed.caseyjhand.com/mcp` | Streamable HTTP MCP 주소 |
+| `DATA_DIR` | `data` | 계정·대화·설정을 담는 `chat.db`(SQLite)와 첨부 이미지 `files/`를 두는 폴더. 프로젝트 기준 상대 경로 또는 절대 경로 |
+| `AUTH_ENABLED` | `false` | `false`: 로그인 없는 로컬 모드(`local` 사용자 하나). `true`: 계정 모드, 로그인해야 화면과 API를 쓸 수 있음. 인터넷에 공개할 때는 반드시 `true`이며 `scripts/serve.py`가 켭니다 |
+| `SESSION_DAYS` | `30` | 로그인 유지 기간(일), 1~365 |
+| `USER_STORAGE_MB` | `500` | 계정마다 저장할 수 있는 대화 JSON과 첨부 파일 용량의 합(MB) |
 
 맥 MPS는 FP16, CPU는 FP32, CUDA는 BF16 지원 시 BF16/그 외 FP16을 사용합니다. 명시한 장치를 사용할 수 없으면 오류를 반환합니다. 맥에서는 원본 가중치를 CPU에서 읽은 뒤 MPS로 옮깁니다. 직접 MPS로 로드할 때 발생한 프로세스 종료를 피하기 위한 경로이며 로딩 중 일시적인 메모리 사용이 늘어납니다.
 
@@ -103,7 +111,7 @@ uv run --no-sync uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
 
 ## 채팅 호출
 
-PubMed 없이 가볍게 테스트합니다. 일반 채팅을 외부 MCP 연결 없이 사용하려면 `use_pubmed=false`를 지정합니다.
+PubMed 없이 가볍게 테스트합니다. 일반 채팅을 외부 MCP 연결 없이 사용하려면 `use_pubmed=false`를 지정합니다. 아래 예시는 로컬 모드 기준이며, 계정 모드에서는 [로그인 쿠키](#대화-저장-api-api)를 함께 보내야 합니다(없으면 401 `unauthorized`).
 
 ```sh
 curl http://127.0.0.1:8000/v1/chat/completions \
@@ -132,7 +140,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"qwen3.5-2b","messages":[{"role":"user","content":"PubMed에서 A programmable dual-RNA-guided DNA endonuclease in adaptive bacterial immunity 논문을 1건 검색하고, 검색된 PMID로 초록을 조회한 뒤 한국어 두 문장으로 요약해줘."}],"max_tokens":512,"temperature":0,"use_pubmed":true}'
 ```
 
-`model` 생략 시 `qwen3.5-2b`, `max_tokens` 기본 512·범위 1~2048, `temperature` 기본 0.2·범위 0~2, `use_pubmed` 기본 true, `stream`·`truncate_history`·`thinking` 기본 false입니다. `thinking: true`이면 Qwen의 생각 모드를 켜고, 생각 내용은 답변과 분리해 `choices[0].message.reasoning_content`로 반환합니다. 생각이 `max_tokens`의 75%를 넘으면 마무리 문구와 `</think>`를 넣어 생각을 닫고 남은 길이로 답하게 합니다(budget forcing). 작은 모델이 답을 쓰지 못한 채 계속 고민하는 것을 막기 위해서입니다. 메시지는 system/user/assistant 텍스트를 지원하며 최소 한 개의 user 메시지가 필요합니다. system 메시지는 템플릿 호환을 위해 앞쪽에서 병합합니다. 대화는 서버에 저장하지 않으므로 다음 요청에 필요한 기록을 포함하세요.
+`model` 생략 시 `qwen3.5-2b`, `max_tokens` 기본 512·범위 1~2048, `temperature` 기본 0.2·범위 0~2, `use_pubmed` 기본 true, `stream`·`truncate_history`·`thinking` 기본 false입니다. `thinking: true`이면 Qwen의 생각 모드를 켜고, 생각 내용은 답변과 분리해 `choices[0].message.reasoning_content`로 반환합니다. 생각이 `max_tokens`의 75%를 넘으면 마무리 문구와 `</think>`를 넣어 생각을 닫고 남은 길이로 답하게 합니다(budget forcing). 작은 모델이 답을 쓰지 못한 채 계속 고민하는 것을 막기 위해서입니다. 메시지는 system/user/assistant 텍스트를 지원하며 최소 한 개의 user 메시지가 필요합니다. system 메시지는 템플릿 호환을 위해 앞쪽에서 병합합니다. 이 API는 저장된 대화를 읽지 않으므로 다음 요청에 필요한 기록을 모두 포함하세요. 웹 화면의 대화 저장은 `/api/chats`가 따로 맡습니다. 선택 필드 `chat_id`(영문·숫자·`_`·`-`, 64자 이하)를 넣어 스트리밍하면, 응답이 끝날 때까지 그 대화가 같은 계정의 다른 기기에서 답변 중(`live`)으로 보입니다. 한 계정은 답변 요청을 동시에 2개까지 보낼 수 있습니다.
 
 응답의 `choices[0].message.content`에 답변이 있고 `tool_calls`에 실행된 도구와 실제 자료가 있습니다. `sources`에는 도구가 실제로 돌려준 논문의 `pmid`, `url`, `title`, `authors`, `journal`, `year`, `doi`, `abstract_fetched`(초록 조회 여부)를 정리해 담습니다. PubMed 답변에는 실제 결과의 PMID 링크를 덧붙입니다. 검색·조회 출처 목록은 모델의 모든 문장이 검증되었다는 뜻은 아닙니다. 작은 모델의 논문 해석과 도구 선택 정확도는 별도 평가가 필요합니다.
 
@@ -149,7 +157,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 | `done` | 비스트리밍 응답과 같은 최종 본문. 출처 링크가 붙은 최종 답변은 이 이벤트의 내용을 사용하세요 |
 | `error` | `status`(HTTP 상태에 해당), `error`(`code`, `message`, `details`) |
 
-스트림은 항상 `done` 또는 `error` 하나로 끝납니다. 요청 검증 오류(422)는 스트림 시작 전에 일반 JSON 오류로 반환합니다. 클라이언트가 연결을 끊으면 서버는 다음 토큰에서 생성을 중단하므로, 답변 중지는 연결을 끊는 것으로 충분합니다.
+스트림은 항상 `done` 또는 `error` 하나로 끝납니다. 요청 검증 오류(422)는 스트림 시작 전에 일반 JSON 오류로 반환합니다. 클라이언트가 연결을 끊으면 서버는 다음 토큰에서 생성을 중단하므로, 답변 중지는 연결을 끊는 것으로 충분합니다. 15초 동안 보낼 이벤트가 없으면 `: ping` 주석 줄을 보내 Cloudflare 같은 프록시가 조용한 연결을 끊지 않게 합니다. `data:`로 시작하지 않는 줄은 무시하세요.
 
 ```sh
 curl -N http://127.0.0.1:8000/v1/chat/completions \
@@ -159,7 +167,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 
 ### 이미지 입력
 
-`qwen3.5-2b`는 이미지를 이해합니다. user 메시지의 `content`를 OpenAI 형식의 배열로 보내면 됩니다. 이미지는 base64 data URL(PNG, JPEG, WebP, GIF, 8 MB 이하)만 받으며 외부 URL은 가져오지 않습니다. 요청당 최대 4장이고, 이미지마다 약 256토큰 크기로 줄여 모델에 넣습니다. `qwen3-0.6b`에 이미지를 보내면 422 `vision_unsupported`입니다. `/v1/models`의 `vision`으로 지원 여부를 알 수 있습니다.
+`qwen3.5-2b`는 이미지를 이해합니다. user 메시지의 `content`를 OpenAI 형식의 배열로 보내면 됩니다. 이미지는 base64 data URL(PNG, JPEG, WebP, GIF, 8 MB 이하) 또는 `POST /api/files`로 미리 올린 내 파일의 주소(`/api/files/<id>`)만 받으며 외부 URL은 가져오지 않습니다. 다른 계정의 파일이거나 없는 파일이면 422 `invalid_image`입니다. 요청당 최대 4장이고, 이미지마다 약 256토큰 크기로 줄여 모델에 넣습니다. `qwen3-0.6b`에 이미지를 보내면 422 `vision_unsupported`입니다. `/v1/models`의 `vision`으로 지원 여부를 알 수 있습니다.
 
 ```json
 {"model": "qwen3.5-2b", "use_pubmed": false, "messages": [{"role": "user", "content": [
@@ -192,14 +200,56 @@ OpenAI API의 모든 기능을 제공하지 않습니다. Qwen3의 JSON 도구 �
 
 | HTTP | 원인 |
 | --- | --- |
+| 401 | 계정 모드에서 로그인하지 않음(`unauthorized`) |
 | 422 | 잘못된 메시지/숫자/이미지, 알 수 없는 모델, 이미지를 지원하지 않는 모델 |
 | 413 | 입력과 생성 예약 토큰 합이 문맥 한도 초과 |
+| 429 | 한 계정의 답변 요청이 동시에 2개를 넘음(`busy`) |
 | 503 | 모델 파일 또는 지정 장치 없음 |
 | 502 | MCP 오류, 잘못된 도구 호출, 실행 횟수 초과 |
 | 504 | PubMed 연결/호출 30초 시간 제한 |
 | 500 | 모델 로드·생성의 예상 밖 오류 |
 
 오류 응답은 `error.code`, `error.message`, `error.details`를 포함하고, 이미 실행한 도구 기록을 보존합니다. `/health`의 PubMed 상태는 최근 연결/호출에서 확인한 상태이며 최초는 `unknown`입니다. 일반 채팅 준비 상태와 PubMed 준비 상태를 구분합니다.
+
+## 대화 저장 API (`/api`)
+
+웹 화면이 계정·대화·설정·첨부 이미지를 다루는 API입니다. 계정 모드에서는 `POST /api/login`이 주는 `pubmed_session` 쿠키(HttpOnly, `SESSION_DAYS` 동안 유효)가 있어야 하며, 없으면 `/v1/*`를 포함해 401 `unauthorized`입니다. 로컬 모드에서는 쿠키 없이 `local` 사용자로 동작합니다.
+
+| 요청 | 내용 |
+| --- | --- |
+| `GET /api/session` | 로그인 없이 호출할 수 있습니다. `auth_enabled`와 현재 사용자 `user`(`{"name"}` 또는 `null`) |
+| `POST /api/login` | `{"name", "password"}`로 로그인하고 쿠키를 받습니다. 틀리면 401 `invalid_login`, 15분 안에 같은 IP나 이름으로 10번 틀리면 429 `too_many_attempts`(`Retry-After` 헤더) |
+| `POST /api/logout` | 로그아웃(204) |
+| `GET /api/chats?since=<seq>` | `since` 이후 바뀐 대화 `chats`, 삭제된 대화 id `deleted`, 지금 답변 중인 대화 id `live`, 다음 요청에 넘길 `seq` |
+| `PUT /api/chats/{id}` | 대화 JSON 저장. 본문의 `rev`가 서버보다 높을 때만 바뀝니다. 낮으면 409 `stale_chat`(서버 사본 `chat` 포함), 삭제된 대화는 410 `chat_deleted`, 4 MB 초과는 413 `chat_too_large` |
+| `DELETE /api/chats/{id}` | 삭제(204). 삭제 기록이 남아 다른 기기에서도 지워집니다 |
+| `GET`·`PUT /api/settings` | 화면 설정(32 KB 이하, 마지막 저장이 이김) |
+| `POST /api/files` | 이미지 원본을 본문 그대로 업로드(PNG·JPEG·WebP·GIF, 8 MB 이하) → 201 `{"id", "url", "mime", "size"}`. 다른 형식은 415, 깨진 이미지는 422 |
+| `GET /api/files/{id}` | 내가 올린 파일만 내려받을 수 있습니다 |
+
+계정의 저장 용량(`USER_STORAGE_MB`)을 넘으면 413 `storage_quota`입니다. 계정 모드에서는 `/docs`, `/redoc`, `/openapi.json`을 제공하지 않고, 로그인하지 않은 `/health` 호출에는 `{"status":"ok"}`만 돌려줍니다.
+
+curl로 계정 모드 API를 부를 때는 먼저 로그인해 쿠키를 저장합니다. `cookies.txt`에는 로그인 토큰이 들어 있으니 다 쓰면 지우세요.
+
+```sh
+curl -c cookies.txt http://127.0.0.1:8000/api/login \
+  -H 'Content-Type: application/json' -d '{"name":"민수","password":"비밀번호"}'
+curl -b cookies.txt http://127.0.0.1:8000/v1/models
+```
+
+## 서버 PC로 배포하기
+
+이 PC를 서버로 두고 친구 몇 명이 각자 계정으로 인터넷에서 접속하게 할 수 있습니다. 첫 단계는 계정 만들기입니다.
+
+```sh
+uv run python scripts/users.py add <이름>      # 1. 사람마다 계정 만들기 (비밀번호를 두 번 묻습니다)
+uv run python scripts/serve.py                # 2. 계정 모드로 실행해 확인 (Ctrl+C로 종료)
+bash deploy/macos/install-launch-agent.sh     # 3. 로그인하면 자동으로 켜지게 등록 (macOS)
+```
+
+마지막 4단계로 Cloudflare Tunnel을 만들어 `https://chat.example.com` 같은 주소를 이 PC의 `http://127.0.0.1:8000`에 연결하면, 친구들은 그 주소에서 로그인해 씁니다.
+
+`scripts/serve.py`는 계정 모드(`AUTH_ENABLED=true`)를 켜고, 로그인할 수 있는 계정이 없으면 시작하지 않으며, `127.0.0.1`에서만 접속을 받고, 서버가 켜져 있는 동안 맥이 잠들지 않게 합니다. 순서별 자세한 설명, 보안 체크리스트, 백업·업데이트·문제 해결, 그리고 저장소로 Redis 대신 SQLite를 쓰는 이유는 [docs/deploy.md](docs/deploy.md)에 있습니다.
 
 ## Docker — CPU 실행
 
@@ -217,6 +267,8 @@ docker compose down
 
 모델은 `./models:/app/models:ro` 볼륨으로 연결합니다. 이미지에는 원본 모델과 호스트 `.venv`를 넣지 않습니다. Docker 기본 모델도 2B이므로 메모리가 작은 Docker VM에서는 요청에 `model=qwen3-0.6b`를 지정하세요. 2B CPU 사용 시 Docker VM에도 충분한 RAM이 필요합니다. NVIDIA GPU 컨테이너 설정은 이 초기 구성에 포함하지 않습니다.
 
+대화·계정·첨부 이미지는 `./data:/app/data` 볼륨(호스트의 `data/`)에 저장되므로 컨테이너를 지워도 남습니다. 계정 모드로 쓰려면 `AUTH_ENABLED=true docker compose up -d`로 실행하고 컨테이너 안에서 계정을 만듭니다: `docker compose exec api python scripts/users.py add <이름>`. 컨테이너가 켜져 있는 동안에는 호스트에서 같은 `data/`로 서버나 `users.py`를 실행하지 마세요. 인터넷에 공개하는 서버는 Docker 대신 `scripts/serve.py`로 실행하세요. 컨테이너 안의 서버는 프록시 헤더를 믿지 않아 로그인 시도 제한이 접속자를 IP로 구분하지 못하고, 맥에서는 GPU도 쓰지 못합니다.
+
 ## 개발·Git
 
 ```sh
@@ -227,7 +279,7 @@ uv lock --check
 git status
 ```
 
-로컬 Git `main`에 초기 설정과 구현 커밋을 저장합니다. ChatGPT형 웹 UI 확장은 `feat/chatgpt-web-ui` 브랜치에 있으며 검토 후 `main`에 병합합니다. 원격 저장소는 아직 설정하지 않았습니다. `.venv/`, `models/`, `.env`, 캐시는 Git에서 제외됩니다.
+로컬 Git `main`에 초기 설정과 구현 커밋을 저장합니다. ChatGPT형 웹 UI 확장은 `feat/chatgpt-web-ui` 브랜치에 있으며 검토 후 `main`에 병합합니다. 원격 저장소는 아직 설정하지 않았습니다. `.venv/`, `models/`, `data/`(대화·계정 데이터베이스, 첨부 이미지, 서버 로그), `.env`, 캐시는 Git에서 제외됩니다.
 
 ## 실제 검증 기록 — 2026-10-09
 
