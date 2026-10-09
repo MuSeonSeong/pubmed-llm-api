@@ -323,3 +323,11 @@ def test_an_answer_in_progress_at_the_budget_continues_without_forcing(monkeypat
     result=asyncio.run(obj.generate('qwen3-0.6b',[],[],100,0,thinking=True))
     assert calls == [(3, 75), (3 + 75, 25)]
     assert result.finish_reason == 'stop'
+
+
+def test_strict_budget_refuses_instead_of_shrinking(monkeypatch):
+    from app.settings import ServiceError
+    obj=manager(monkeypatch,budget=120)
+    with pytest.raises(ServiceError) as e:
+        asyncio.run(obj.generate('qwen3-0.6b',[{'role':'user','content':'hi'}],[],500,0,strict_budget=True))
+    assert e.value.status_code == 413

@@ -39,7 +39,7 @@ def slim_tool_result(name: str, data: dict) -> dict:
         slim = {'pmid': article.get('pmid'), 'title': article.get('title'),
                 'journalInfo': {'isoAbbreviation': journal.get('isoAbbreviation') or journal.get('title'),
                                 'publicationDate': {'year': date.get('year')}},
-                'authors': [{'lastName': a.get('lastName'), 'initials': a.get('initials')}
+                'authors': [{key: a[key] for key in ('lastName', 'initials', 'collectiveName') if a.get(key)}
                             for a in authors[:6] if isinstance(a, dict)],
                 'doi': article.get('doi'), 'publicationTypes': article.get('publicationTypes'),
                 'abstractText': abstract[:ABSTRACT_CHARS] + (' …' if len(abstract) > ABSTRACT_CHARS else '')}
@@ -133,6 +133,11 @@ def split_reasoning(raw_text: str) -> tuple[str, str | None]:
     return text.strip(), None
 
 
+def can_drop_turn(messages: list[dict]) -> bool:
+    start = 1 if messages and messages[0]['role'] == 'system' else 0
+    return start < max(index for index, message in enumerate(messages) if message['role'] == 'user')
+
+
 def drop_oldest_turn(messages: list[dict]) -> int:
     """Remove the oldest question and its replies, never the latest question; return how many went."""
     start = 1 if messages and messages[0]['role'] == 'system' else 0
@@ -187,7 +192,7 @@ def collect_sources(traces: list[ToolTrace]) -> list[Source]:
                 continue
             journal = article.get('journalInfo') if isinstance(article.get('journalInfo'), dict) else {}
             date = journal.get('publicationDate') if isinstance(journal.get('publicationDate'), dict) else {}
-            names = [f"{a.get('lastName', '')} {a.get('initials', '')}".strip()
+            names = [(f"{a.get('lastName') or ''} {a.get('initials') or ''}".strip() or a.get('collectiveName') or '')
                      for a in _items(article, 'authors') if isinstance(a, dict)]
             names = [name for name in names if name]
             authors = ', '.join(names[:3]) + (' et al.' if len(names) > 3 else '')
@@ -283,6 +288,9 @@ class ChatService:
                 continuing = request.continue_final
                 stream = ({'on_text': self._text_relay(emit, request.thinking and not continuing, continuing),
                            'cancel': cancel} if emit else {})
+                if request.truncate_history and can_drop_turn(messages):
+                    # Trim old turns to keep the requested answer length; shrink it only when nothing is left.
+                    stream['strict_budget'] = True
                 if request.thinking and not continuing:
                     stream['thinking'] = True
                 if continuing:

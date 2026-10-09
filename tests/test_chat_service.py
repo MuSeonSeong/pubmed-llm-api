@@ -13,10 +13,11 @@ class Generator:
     def __init__(self,outputs):
         self.outputs=iter(outputs)
         self.messages=[]
-    async def generate(self,model_id,messages,tools,max_tokens,temperature,on_text=None,cancel=None,thinking=False,continue_final=False):
+    async def generate(self,model_id,messages,tools,max_tokens,temperature,on_text=None,cancel=None,thinking=False,continue_final=False,strict_budget=False):
         self.messages.append(list(messages))
         self.thinking=thinking
         self.continue_final=continue_final
+        self.strict=getattr(self,'strict',[])+[strict_budget]
         value=next(self.outputs)
         if isinstance(value,Exception):
             raise value
@@ -398,3 +399,26 @@ def test_fetched_articles_are_slimmed_for_the_model_but_keep_source_fields():
     source,=collect_sources([ToolTrace(name='pubmed_fetch_articles',arguments={},result=slim)])
     assert (source.journal,source.year,source.abstract_fetched) == ('J','2020',True)
     assert slim_tool_result(SEARCH,{'pmids':['1']}) == {'pmids':['1']}
+
+
+def test_history_is_trimmed_before_the_answer_is_shortened():
+    from app.chat_service import ChatService
+    from app.schemas import ChatRequest
+    g=Budget(['ok'],limit=3)
+    request=ChatRequest(messages=history('q1','a1','q2','a2','q3'),use_pubmed=False,truncate_history=True)
+    asyncio.run(ChatService(g,PubMed()).complete(request))
+    assert g.strict == [True]  # older turns remained, so the full answer length was required
+    g=Generator(['ok'])
+    request=ChatRequest(messages=history('only question'),use_pubmed=False,truncate_history=True)
+    asyncio.run(ChatService(g,PubMed()).complete(request))
+    assert g.strict == [False]  # nothing to trim, so the answer may be shortened instead
+
+
+def test_group_authors_and_missing_initials_do_not_become_none():
+    from app.chat_service import slim_tool_result, collect_sources
+    from app.schemas import ToolTrace
+    raw={'articles':[{'pmid':'1','authors':[{'collectiveName':'COVID Study Group'},{'lastName':'Smith'}]}]}
+    slim=slim_tool_result('pubmed_fetch_articles',raw)
+    assert slim['articles'][0]['authors'] == [{'collectiveName':'COVID Study Group'},{'lastName':'Smith'}]
+    source,=collect_sources([ToolTrace(name='pubmed_fetch_articles',arguments={},result=slim)])
+    assert source.authors == 'COVID Study Group, Smith'

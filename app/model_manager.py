@@ -195,6 +195,10 @@ class ModelManager:
         closed = '</think>' in tokenizer.decode(generated, skip_special_tokens=False)
         close_ids = [] if closed else tokenizer(THINKING_CLOSE, add_special_tokens=False)['input_ids']
         forced = torch.tensor([close_ids], dtype=outputs.dtype, device=outputs.device)
+        # The closing words count against the budget so the total never exceeds max_tokens.
+        remaining = max_tokens - budget - len(close_ids)
+        if remaining < 1:
+            return outputs
         prefix = torch.cat([outputs, forced], dim=1)
         streamer = kwargs.get('streamer')
         if streamer is not None:  # show any closing words, then treat the next prompt as already seen
@@ -212,26 +216,23 @@ class ModelManager:
                 extended[name] = torch.cat([value, pad], dim=1)
             else:
                 extended[name] = value
-        # The closing words count against the budget so the total never exceeds max_tokens.
-        remaining = max_tokens - budget - len(close_ids)
-        if remaining < 1:
-            return outputs
         return model.generate(**extended, **{**kwargs, 'max_new_tokens': remaining})
 
     async def generate(self, model_id: str, messages: list[dict], tools: list[dict],
                        max_tokens: int, temperature: float, *, on_text: Callable[[str], None] | None = None,
                        cancel: threading.Event | None = None, thinking: bool = False,
-                       continue_final: bool = False) -> GenerationResult:
+                       continue_final: bool = False, strict_budget: bool = False) -> GenerationResult:
+        """strict_budget refuses (413) instead of shortening the answer, so callers can trim history first."""
         """on_text runs on the worker thread with the cumulative raw completion text."""
         if model_id not in self.catalog:
             raise ServiceError('unknown_model', f'Unknown model: {model_id}', 422)
         return await anyio.to_thread.run_sync(partial(self._generate_sync, model_id, messages, tools,
                                                      max_tokens, temperature, on_text, cancel, thinking,
-                                                     continue_final),
+                                                     continue_final, strict_budget),
                                               abandon_on_cancel=False)
 
     def _generate_sync(self, model_id, messages, tools, max_tokens, temperature, on_text=None, cancel=None,
-                       thinking=False, continue_final=False):
+                       thinking=False, continue_final=False, strict_budget=False):
         with self._lock:
             if cancel is not None and cancel.is_set():
                 return GenerationResult('', 'cancelled', 0, 0)
@@ -248,7 +249,7 @@ class ModelManager:
                                               thinking, template)
                 count = inputs['input_ids'].shape[-1]
                 room = self.settings.max_context_tokens - count
-                if room < min(max_tokens, MIN_OUTPUT_TOKENS):
+                if room < (max_tokens if strict_budget else min(max_tokens, MIN_OUTPUT_TOKENS)):
                     raise ServiceError('context_overflow', 'Input plus requested output exceeds context budget',
                                        413, {'prompt_tokens': count, 'max_tokens': max_tokens,
                                              'limit': self.settings.max_context_tokens})
