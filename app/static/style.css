@@ -148,13 +148,13 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .code-header { display: flex; align-items: center; justify-content: space-between; padding: 6px 8px 6px 14px; background: var(--code-head); color: var(--muted); font-size: 11px; }
 .code-copy { border: 0; background: transparent; color: var(--muted); font-size: 11px; padding: 3px 8px; border-radius: 5px; }
 .code-copy:hover { background: var(--hover); color: var(--ink); }
-.code-block pre { margin: 0; white-space: pre; overflow-x: auto; padding: 14px 16px; line-height: 1.6; }
+.code-block pre { margin: 0; white-space: pre; overflow-x: auto; overscroll-behavior-x: contain; padding: 14px 16px; line-height: 1.6; }
 .code-block pre code { padding: 0; background: transparent; }
 .tok-keyword { color: var(--tok-keyword); font-weight: 550; }
 .tok-string { color: var(--tok-string); }
 .tok-comment { color: var(--faint); font-style: italic; }
 .tok-number { color: var(--tok-number); }
-.table-wrap { overflow-x: auto; margin: 8px 0 14px; }
+.table-wrap { overflow-x: auto; overscroll-behavior-x: contain; margin: 8px 0 14px; }
 .markdown table { border-collapse: collapse; font-size: 13px; min-width: 50%; }
 .markdown th, .markdown td { border: 1px solid var(--line-2); padding: 7px 11px; text-align: left; vertical-align: top; }
 .markdown th { background: var(--surface-2); font-weight: 600; }
@@ -199,7 +199,7 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .reasoning-panel summary::after { content: '›'; font-size: 15px; transition: transform .15s; }
 .reasoning-panel[open] summary::after { transform: rotate(90deg); }
 .reasoning-panel.active summary { background: linear-gradient(90deg, var(--muted) 0%, var(--ink) 50%, var(--muted) 100%); background-size: 200% 100%; -webkit-background-clip: text; background-clip: text; color: transparent; animation: shimmer 1.6s linear infinite; }
-.reasoning-text { margin-top: 8px; color: var(--muted); font-size: 12.5px; line-height: 1.75; white-space: pre-wrap; max-height: 320px; overflow-y: auto; }
+.reasoning-text { margin-top: 8px; color: var(--muted); font-size: 12.5px; line-height: 1.75; white-space: pre-wrap; max-height: 320px; overflow-y: auto; overscroll-behavior: contain; }
 .sources { margin-top: 16px; }
 .sources-heading { font-size: 12px; font-weight: 600; color: var(--ink-2); margin-bottom: 8px; }
 .source-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }

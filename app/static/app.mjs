@@ -453,6 +453,27 @@ function renderAssistant(message, chat) {
   return article;
 }
 
+/** Scrollable parts of a message; rebuilding a streaming message would otherwise reset them to the start. */
+const SCROLLERS = '.reasoning-text, .code-block pre, .table-wrap';
+
+function captureScroll(node) {
+  return [...node.querySelectorAll(SCROLLERS)].map(element => ({ top: element.scrollTop, left: element.scrollLeft,
+    atBottom: element.scrollHeight - element.scrollTop - element.clientHeight < 8 }));
+}
+
+function restoreScroll(node, saved, streaming) {
+  node.querySelectorAll(SCROLLERS).forEach((element, index) => {
+    const state = saved[index];
+    if (state) element.scrollLeft = state.left;
+    if (!element.classList.contains('reasoning-text')) {
+      if (state) element.scrollTop = state.top;
+      return;
+    }
+    // While reasoning streams, follow the newest lines unless the reader scrolled up to look back.
+    element.scrollTop = streaming && (!state || state.atBottom) ? element.scrollHeight : state?.top ?? 0;
+  });
+}
+
 function renderMessages() {
   const chat = store.current;
   const switched = lastChatId !== chat.id;
@@ -463,6 +484,7 @@ function renderMessages() {
     if (speakingId) { speechSynthesis.cancel(); speakingId = null; }
   }
   const nextCache = new Map();
+  const restores = [];
   const nodes = chat.messages.map((message, index) => {
     // Rebuild a message only when its content or available actions change; streaming touches one node.
     // An open edit form is never rebuilt, so typed text and the caret survive unrelated updates.
@@ -471,6 +493,9 @@ function renderMessages() {
     const cached = nodeCache.get(message.id);
     const node = cached?.key === key ? cached.node
       : message.role === 'user' ? renderUser(message) : renderAssistant(message, chat);
+    if (node !== cached?.node && (cached || message.streaming)) {
+      restores.push([node, cached ? captureScroll(cached.node) : [], Boolean(message.streaming)]);
+    }
     if (!switched && !shownIds.has(message.id)) node.classList.add('is-new');
     nextCache.set(message.id, { key, node });
     return node;
@@ -489,6 +514,7 @@ function renderMessages() {
     cursor.remove();
     cursor = next;
   }
+  for (const [node, saved, streaming] of restores) restoreScroll(node, saved, streaming);  // needs layout, so after insertion
   $('welcome').hidden = chat.messages.length > 0;
   if (switched || followOutput) conversation.scrollTop = conversation.scrollHeight;
   lastChatId = chat.id;
