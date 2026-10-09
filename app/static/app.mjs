@@ -496,11 +496,31 @@ async function readImage(file) {
   return { name: file.name || '붙여넣은 이미지.jpg', kind: 'image', dataUrl: canvas.toDataURL('image/jpeg', 0.85) };
 }
 
+const isPdf = file => file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
+
+/** PDFs are turned into text by the server; the result is attached like a text file. */
+async function readPdf(file) {
+  let response;
+  try {
+    response = await fetch('/v1/documents/extract', { method: 'POST', body: file,
+      headers: { 'Content-Type': 'application/pdf' } });
+  } catch { throw new Error('서버에 연결할 수 없어 PDF를 읽지 못했어요.'); }
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(file.name + ': ' + (response.status === 413 ? 'PDF는 20MB까지 첨부할 수 있어요.'
+      : data.error?.code === 'invalid_document' ? '읽을 수 없는 PDF예요 (암호가 걸렸거나 손상됐을 수 있어요).'
+        : 'PDF를 읽지 못했어요.'));
+  }
+  if (!data.text?.trim()) throw new Error(file.name + '에서 글자를 찾지 못했어요. 스캔한 PDF일 수 있어요.');
+  return { name: file.name, text: async () => data.text };
+}
+
 async function attachFiles(files) {
   files = [...files];
   if (!files.length) return;
   const images = files.filter(file => file.type.startsWith('image/'));
-  const texts = files.filter(file => !file.type.startsWith('image/'));
+  const pdfs = files.filter(isPdf);
+  const texts = files.filter(file => !file.type.startsWith('image/') && !isPdf(file));
   const used = pendingFiles.filter(file => !isImage(file)).reduce((sum, file) => sum + file.text.length, 0);
   try {
     const room = MAX_IMAGES - pendingFiles.filter(isImage).length;
@@ -509,6 +529,10 @@ async function attachFiles(files) {
     if (images.length && !VISION_MODELS.includes(store.current.model)) {
       store.updateChat({ model: VISION_MODELS[0] });
       toast('이미지를 이해할 수 있는 ' + MODEL_LABELS[VISION_MODELS[0]] + ' 모델로 바꿨어요.');
+    }
+    if (pdfs.length) {
+      toast('PDF에서 글자를 읽고 있어요…');
+      for (const file of pdfs) texts.push(await readPdf(file));
     }
     if (texts.length) {
       if (used >= ATTACHMENT_LIMIT) toast('텍스트 첨부는 모두 합쳐 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지예요.');

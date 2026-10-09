@@ -17,6 +17,7 @@ dependencies = [
   "jsonschema>=4.25,<5",
   "anyio>=4.12,<5",
   "pillow>=12.3.0",
+  "pypdf>=6.19.0",
 ]
 [dependency-groups]
 dev = [

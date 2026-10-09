@@ -16,6 +16,7 @@ from app.model_manager import ModelManager
 from app.pubmed import PubMedClient
 from app.schemas import ChatRequest, ChatResponse
 from app.chat_service import ChatService
+from app.documents import MAX_PDF_BYTES, extract_pdf_text
 
 
 class EventStreamResponse(Response):
@@ -107,6 +108,16 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
             {'id': spec.id, 'object': 'model', 'repo_id': spec.repo_id, 'revision': spec.revision,
              'vision': spec.vision}
             for spec in catalog.values()]}
+
+    @application.post('/v1/documents/extract')
+    async def extract_document(request: Request):
+        """Send a PDF as the raw request body (Content-Type: application/pdf) to get its text."""
+        body = bytearray()
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > MAX_PDF_BYTES:  # stop reading instead of buffering an unbounded upload
+                raise ServiceError('document_too_large', 'PDF files must be 20 MB or smaller', 413)
+        return await anyio.to_thread.run_sync(extract_pdf_text, bytes(body))
 
     @application.post('/v1/chat/completions', response_model=ChatResponse)
     async def chat(request: ChatRequest):
