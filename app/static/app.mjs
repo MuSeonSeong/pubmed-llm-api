@@ -780,6 +780,10 @@ async function checkServer() {
     const ready = health.ready_for_chat;
     $('server-status').classList.toggle('offline', !ready);
     $('server-status').lastElementChild.textContent = ready ? '서버 연결됨' : '모델 준비 필요';
+    const loaded = health.inference?.loaded_model;
+    $('server-status').title = '실행 장치: ' + String(health.inference?.device || '?').toUpperCase()
+      + ' · 메모리의 모델: ' + (MODEL_LABELS[loaded] || '없음 (첫 질문 때 불러옵니다)')
+      + ' · PubMed: ' + ({ available: '연결됨', unavailable: '연결 안 됨' }[health.pubmed?.status] || '확인 전');
     const missing = Object.entries(health.inference?.model_files || {}).filter(([, ok]) => !ok).map(([name]) => name);
     setupNotice(missing.length ? ['모델 파일이 준비되지 않았습니다: ' + missing.join(', '),
       '프로젝트 폴더에서 아래 명령을 실행한 뒤 이 페이지를 새로고침하세요.'] : null,
