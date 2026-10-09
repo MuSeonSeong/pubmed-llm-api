@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ATTACHMENT_LIMIT, ChatStore, attachmentTokenBudget, chatMarkdown, estimateTokens, highlight, normalizeSources, readAttachments, readEvents, renderMarkdown,
+import { ATTACHMENT_LIMIT, ChatStore, attachmentTokenBudget, chatMarkdown, cleanTitle, estimateTokens, highlight, normalizeSources, readAttachments, readEvents, renderMarkdown,
   withoutCitationList } from '../app/static/chat.mjs';
 
 const memory = () => {
@@ -919,4 +919,12 @@ test('a title still lands when another tab replaced the chat object meanwhile', 
   }, { autoTitles: true });
   await store.send('질문 하나');
   assert.equal(store.current.title, '새 제목');
+});
+
+
+test('titles are cleaned of list markers, emphasis and quotes, and sentences are rejected', () => {
+  assert.equal(cleanTitle('1. **향신료의 역사** '), '향신료의 역사');
+  assert.equal(cleanTitle('- `파이썬 정렬`'), '파이썬 정렬');
+  assert.equal(cleanTitle('제목: "감기 관리법".'), '감기 관리법');
+  assert.equal(cleanTitle('이 대화는 사용자가 감기에 걸렸을 때 집에서 할 수 있는 관리 방법에 대해 물어본 내용입니다'), '');
 });

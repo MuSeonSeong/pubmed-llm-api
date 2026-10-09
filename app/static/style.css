@@ -1,11 +1,11 @@
 :root {
   color-scheme: light;
   --paper: #faf9f6; --sidebar: #f0f0eb; --surface: #fffefa; --surface-2: #f4f6ef; --raised: #fdfcf9;
-  --ink: #292f2d; --ink-2: #50584e; --muted: #858984; --faint: #a1a69a;
+  --ink: #292f2d; --ink-2: #50584e; --muted: #5c6157; --faint: #61665c;
   --line: #e5e5df; --line-2: #d6d9d0; --hover: #e7e9e1; --active: #e1e5db;
   --bubble: #eeeee7; --code-bg: #eff0e9; --code-head: #e6e8df; --inline-code: #eaece5;
-  --green: #226958; --button: #226958; --button-hover: #185343; --green-soft: #eaf0e4; --accent-text: #487148;
-  --danger: #a25842; --danger-line: #dfc6b9; --warn: #9b8763; --warn-bg: #fff2df;
+  --green: #226958; --button: #226958; --button-hover: #185343; --green-soft: #eaf0e4; --accent-text: #3f6640;
+  --danger: #934b36; --danger-line: #dfc6b9; --warn: #6e5d32; --warn-bg: #fff2df;
   --shadow: #383d2914; --backdrop: #25322544;
   --tok-keyword: #7a3e9d; --tok-string: #2f7a3e; --tok-number: #a35a1f;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif;
@@ -13,7 +13,7 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
   --paper: #1b1d1c; --sidebar: #151716; --surface: #232624; --surface-2: #202421; --raised: #212422;
-  --ink: #e6e8e3; --ink-2: #c9cec5; --muted: #9aa096; --faint: #757b73;
+  --ink: #e6e8e3; --ink-2: #c9cec5; --muted: #a8ada4; --faint: #9aa096;
   --line: #2e322f; --line-2: #3a3f3b; --hover: #262a27; --active: #2d332e;
   --bubble: #2b2f2c; --code-bg: #131514; --code-head: #1d201e; --inline-code: #2c302d;
   --green: #79c4a5; --button: #2f8a71; --button-hover: #37a083; --green-soft: #24302a; --accent-text: #93c99d;
@@ -25,7 +25,7 @@
   :root:not([data-theme="light"]) {
     color-scheme: dark;
     --paper: #1b1d1c; --sidebar: #151716; --surface: #232624; --surface-2: #202421; --raised: #212422;
-    --ink: #e6e8e3; --ink-2: #c9cec5; --muted: #9aa096; --faint: #757b73;
+    --ink: #e6e8e3; --ink-2: #c9cec5; --muted: #a8ada4; --faint: #9aa096;
     --line: #2e322f; --line-2: #3a3f3b; --hover: #262a27; --active: #2d332e;
     --bubble: #2b2f2c; --code-bg: #131514; --code-head: #1d201e; --inline-code: #2c302d;
     --green: #79c4a5; --button: #2f8a71; --button-hover: #37a083; --green-soft: #24302a; --accent-text: #93c99d;
@@ -104,7 +104,7 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .welcome-mark { display: flex; align-items: center; justify-content: center; width: 54px; height: 54px; background: var(--green-soft); border: 1px solid var(--line); color: var(--green); border-radius: 17px; margin: 0 auto 25px; transform: rotate(-6deg); }
 .welcome-mark .icon { width: 29px; height: 29px; transform: rotate(6deg); stroke-width: 1.4; }
 .eyebrow { font-size: 9px; color: var(--faint); letter-spacing: 2.2px; font-weight: 500; }
-.welcome h1 { font-size: clamp(25px, 2.8vw, 35px); font-weight: 550; letter-spacing: -1.4px; margin: 16px 0 15px; }
+.welcome h2 { font-size: clamp(25px, 2.8vw, 35px); font-weight: 550; letter-spacing: -1.4px; margin: 16px 0 15px; }
 .welcome > p { color: var(--muted); font-size: 13px; line-height: 1.9; margin: 0; }
 .suggestions { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 42px auto 0; max-width: 684px; text-align: left; }
 .suggestion { background: var(--raised); border: 1px solid var(--line); border-radius: 13px; padding: 19px 18px 20px; display: flex; flex-direction: column; position: relative; align-items: flex-start; text-align: left; transition: transform .15s, border-color .15s, box-shadow .15s; }
@@ -135,9 +135,9 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .assistant-body { padding-left: 34px; font-size: 14px; line-height: 1.85; overflow-wrap: anywhere; }
 .markdown > :last-child { margin-bottom: 0; }
 .markdown p { margin: 0 0 10px; }
-.markdown h3 { margin: 20px 0 8px; font-size: 16px; font-weight: 650; }
-.markdown h4 { margin: 16px 0 6px; font-size: 14.5px; font-weight: 650; }
-.markdown > h3:first-child, .markdown > h4:first-child { margin-top: 0; }
+.markdown h2 { margin: 20px 0 8px; font-size: 16px; font-weight: 650; }
+.markdown h3 { margin: 16px 0 6px; font-size: 14.5px; font-weight: 650; }
+.markdown > h2:first-child, .markdown > h3:first-child { margin-top: 0; }
 .markdown ul, .markdown ol { margin: 6px 0 14px; padding-left: 23px; }
 .markdown li { padding: 2px 0; }
 .markdown a { color: var(--green); text-underline-offset: 3px; }
@@ -158,7 +158,7 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .markdown table { border-collapse: collapse; font-size: 13px; min-width: 50%; }
 .markdown th, .markdown td { border: 1px solid var(--line-2); padding: 7px 11px; text-align: left; vertical-align: top; }
 .markdown th { background: var(--surface-2); font-weight: 600; }
-.streaming > :is(p, h3, h4, blockquote):last-child::after, .streaming > :is(ul, ol):last-child > li:last-child::after { content: ''; display: inline-block; width: 7px; height: 15px; margin-left: 3px; vertical-align: -2px; background: var(--green); border-radius: 1px; animation: blink 1s steps(2, start) infinite; }
+.streaming > :is(p, h2, h3, blockquote):last-child::after, .streaming > :is(ul, ol):last-child > li:last-child::after { content: ''; display: inline-block; width: 7px; height: 15px; margin-left: 3px; vertical-align: -2px; background: var(--green); border-radius: 1px; animation: blink 1s steps(2, start) infinite; }
 .message-actions { display: flex; gap: 2px; padding-left: 28px; margin-top: 6px; }
 .message-actions .icon { width: 15px; height: 15px; }
 .toggles { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
@@ -299,7 +299,7 @@ kbd { font-family: inherit; font-size: 11px; border: 1px solid var(--line-2); bo
   .topbar-actions { gap: 4px; }
   .conversation { padding: 0 16px; }
   .welcome { padding-top: 7vh; padding-bottom: 26px; }
-  .welcome h1 { font-size: 25px; }
+  .welcome h2 { font-size: 25px; }
   .welcome > p { font-size: 12.5px; }
   .suggestions { grid-template-columns: 1fr; gap: 8px; margin-top: 26px; }
   .suggestion { padding: 13px 14px; border-radius: 12px; flex-direction: row; flex-wrap: wrap; align-items: center; column-gap: 10px; }

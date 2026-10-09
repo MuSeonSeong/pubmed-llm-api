@@ -647,7 +647,7 @@ export class ChatStore {
       if (!response.ok) return;
       const text = (await response.json()).choices?.[0]?.message?.content;
       const title = typeof text === 'string' ? text.split('\n').map(line => line.trim()).find(Boolean) : '';
-      const clean = (title || '').replace(/^(제목\s*[:：]\s*|#+\s*)/, '').replace(/^["'“‘「]+|["'”’」.]+$/g, '').trim().slice(0, 40);
+      const clean = cleanTitle(title || '');
       // Another tab's save may have replaced the object; renamed or deleted chats keep their name.
       const live = this.chats.find(item => item.id === chat.id);
       if (!clean || !live?.autoTitle) return;
@@ -815,6 +815,13 @@ export class ChatStore {
   }
 }
 
+/** Strip the markup small models wrap around a title; '' when the reply is not usable as one. */
+export function cleanTitle(text) {
+  const title = text.replace(/^\s*(?:[-*+]|\d+[.)])\s+/, '').replace(/^(?:제목\s*[:：]\s*|#+\s*)/, '')
+    .replace(/\*\*|__|`/g, '').replace(/^["'“‘「]+|["'”’」.]+$/g, '').replace(/\s+/g, ' ').trim();
+  return title.length > 30 ? '' : title;  // a sentence, not a title: keep the provisional one
+}
+
 /** A user turn for the API: OpenAI-style parts when it carries images the model will see. */
 function userContent(message, sentImages) {
   const images = (message.attachments || []).filter(isImage);
@@ -926,7 +933,7 @@ function renderBlocks(part) {
     const heading = line.match(/^(#{1,6})\s+(.+)/);
     const quote = line.match(/^\s*>\s?(.*)/);
     if (heading) {
-      const tag = heading[1].length <= 2 ? 'h3' : 'h4';
+      const tag = heading[1].length <= 3 ? 'h2' : 'h3';  // the page title is the only h1; models use ### for sections
       output += '<' + tag + '>' + inlineMarkdown(heading[2]) + '</' + tag + '>';
     } else if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) output += '<hr>';
     else if (quote) output += '<blockquote>' + inlineMarkdown(quote[1]) + '</blockquote>';

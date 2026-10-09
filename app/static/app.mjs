@@ -273,7 +273,7 @@ function speechText(message) {
   const holder = element('div');
   holder.innerHTML = renderMarkdown(withoutCitationList(message.content));
   holder.querySelectorAll('.code-block').forEach(block => block.replaceWith('코드는 생략합니다. '));
-  holder.querySelectorAll('p, li, h3, h4, blockquote, tr').forEach(node =>
+  holder.querySelectorAll('p, li, h2, h3, blockquote, tr').forEach(node =>
     node.append(/[.!?。]\s*$/.test(node.textContent) ? ' ' : '. '));  // pause between blocks
   return holder.textContent.replace(/\s+/g, ' ').replace(/(\.\s*){2,}/g, '. ').trim();
 }
