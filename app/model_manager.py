@@ -212,7 +212,11 @@ class ModelManager:
                 extended[name] = torch.cat([value, pad], dim=1)
             else:
                 extended[name] = value
-        return model.generate(**extended, **{**kwargs, 'max_new_tokens': max(1, max_tokens - budget)})
+        # The closing words count against the budget so the total never exceeds max_tokens.
+        remaining = max_tokens - budget - len(close_ids)
+        if remaining < 1:
+            return outputs
+        return model.generate(**extended, **{**kwargs, 'max_new_tokens': remaining})
 
     async def generate(self, model_id: str, messages: list[dict], tools: list[dict],
                        max_tokens: int, temperature: float, *, on_text: Callable[[str], None] | None = None,

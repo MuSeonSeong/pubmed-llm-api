@@ -290,7 +290,7 @@ def test_thinking_budget_closes_runaway_reasoning_and_lets_the_model_answer(monk
     obj=manager(monkeypatch,loader=lambda spec:(Thinker(),Words()))
     result=asyncio.run(obj.generate('qwen3-0.6b',[{'role':'user','content':'hi'}],[],100,0,thinking=True,on_text=seen.append))
     assert calls[0] == (3, 75, 3)            # 75% of the answer budget for reasoning
-    assert calls[1] == (3 + 75 + 2, 25, 80)  # prompt + reasoning + forced close, rest for the answer
+    assert calls[1] == (3 + 75 + 2, 23, 80)  # prompt + reasoning + forced close; the close counts toward 100
     assert result.finish_reason == 'stop' and result.raw_text.endswith('answer')
     assert any('</think>' in text for text in seen)
 
