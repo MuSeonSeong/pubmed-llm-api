@@ -26,14 +26,15 @@ def select_device(requested: str, *, cuda_available: bool, mps_available: bool) 
     return requested
 
 class TextCallbackStreamer:
-    """Report the cumulative decoded completion; generate() first passes the prompt ids."""
+    """Report the cumulative decoded completion, starting with '' once the prompt is accepted."""
     def __init__(self, tokenizer, on_text: Callable[[str], None]):
         self.tokenizer, self.on_text = tokenizer, on_text
         self.ids, self.prompt_seen = [], False
 
     def put(self, value) -> None:
-        if not self.prompt_seen:
+        if not self.prompt_seen:  # generate() first passes the prompt ids
             self.prompt_seen = True
+            self.on_text('')
             return
         self.ids.extend(value.reshape(-1).tolist())
         text = self.tokenizer.decode(self.ids, skip_special_tokens=False)

@@ -23,7 +23,7 @@ class Generator:
         if on_text:
             import anyio
             # Like the real manager, report cumulative text from a worker thread.
-            await anyio.to_thread.run_sync(lambda:[on_text(value[:i]) for i in range(1,len(value)+1)])
+            await anyio.to_thread.run_sync(lambda:[on_text(value[:i]) for i in range(0,len(value)+1)])
         return GenerationResult(value,'stop',10,5)
     def status(self):
         return {'device':'cpu','loaded_model':None,'model_files':{'qwen3-0.6b':True,'qwen3.5-2b':True}}
@@ -177,6 +177,8 @@ def test_stream_emits_text_deltas_tool_progress_and_final_answer():
     assert '31542292' in final['choices'][0]['message']['content']
     assert len(final['tool_calls']) == 1
     assert {'type':'status','stage':'loading_model','model':'qwen3.5-2b'} in events
+    stages=[e['stage'] for e in events if e['type']=='status']
+    assert stages[0] == 'loading_model' and 'generating' in stages
 
 
 def test_stream_failure_ends_with_error_event_and_traces():

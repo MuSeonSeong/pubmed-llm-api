@@ -123,9 +123,15 @@ class ChatService:
                 'code': 'internal_error', 'message': str(exc) or 'Internal error', 'details': {}}})
 
     def _text_relay(self, emit: Callable[[dict], None]) -> Callable[[str], None]:
-        shown = ''
+        shown, started = '', False
         def relay(raw_text: str) -> None:  # runs on the generation worker thread
-            nonlocal shown
+            nonlocal shown, started
+            if not started:  # the model is loaded and generation has begun
+                started = True
+                try:
+                    anyio.from_thread.run_sync(emit, {'type': 'status', 'stage': 'generating'})
+                except Exception:
+                    pass
             text = visible_text(raw_text)
             if len(text) > len(shown) and text.startswith(shown):
                 delta, shown = text[len(shown):], text
@@ -151,7 +157,6 @@ class ChatService:
             while True:
                 if self.manager.status().get('loaded_model') != request.model:
                     notify({'type': 'status', 'stage': 'loading_model', 'model': request.model})
-                notify({'type': 'status', 'stage': 'generating'})
                 stream = {'on_text': self._text_relay(emit), 'cancel': cancel} if emit else {}
                 result = await self.manager.generate(request.model, messages, tools,
                                                      request.max_tokens, request.temperature, **stream)

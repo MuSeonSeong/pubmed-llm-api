@@ -1,8 +1,10 @@
 const STORAGE_KEY = 'pubmed-chat.v1';
 const MODELS = ['qwen3.5-2b', 'qwen3-0.6b'];
+export const DEFAULT_SETTINGS = Object.freeze({ systemPrompt: '', temperature: 0.2, maxTokens: 512 });
 const id = () => globalThis.crypto.randomUUID();
 const freshChat = () => ({ id: id(), title: '새 대화', model: MODELS[0],
   usePubmed: true, messages: [], updatedAt: Date.now() });
+const STOPPED = '답변 생성을 중지했습니다.';
 
 function normalizeTools(calls) {
   return Array.isArray(calls) ? calls.filter(call => call && typeof call.name === 'string')
@@ -11,21 +13,34 @@ function normalizeTools(calls) {
       ...(typeof call.error === 'string' ? { error: call.error } : {}) })) : [];
 }
 
+function restoreSettings(value) {
+  const number = (input, min, max, fallback) =>
+    Number.isFinite(input) && input >= min && input <= max ? input : fallback;
+  return { systemPrompt: typeof value?.systemPrompt === 'string' ? value.systemPrompt.slice(0, 4000) : '',
+    temperature: number(value?.temperature, 0, 2, DEFAULT_SETTINGS.temperature),
+    maxTokens: Number.isInteger(value?.maxTokens)
+      ? number(value.maxTokens, 1, 2048, DEFAULT_SETTINGS.maxTokens) : DEFAULT_SETTINGS.maxTokens };
+}
+
 function restoreChat(chat) {
   if (!chat || typeof chat.id !== 'string' || typeof chat.title !== 'string'
       || !Array.isArray(chat.messages)) return null;
   const messages = chat.messages.filter(message => message && typeof message.id === 'string'
     && ['user', 'assistant'].includes(message.role) && typeof message.content === 'string')
+    // A draft that never received text was interrupted before it said anything.
+    .filter(message => !(message.streaming === true && !message.content.trim()))
     .map(message => ({ id: message.id, role: message.role, content: message.content,
       toolCalls: normalizeTools(message.toolCalls), truncated: message.truncated === true,
+      stopped: message.stopped === true || message.streaming === true,
       ...(typeof message.error === 'string' ? { error: message.error } : {}),
       ...(message.role === 'user' && message.pending === true ? { pending: true } : {}) }));
-  for (const message of messages) {
-    if (message.pending) {
-      delete message.pending;
+  messages.forEach((message, index) => {
+    if (!message.pending) return;
+    delete message.pending;
+    if (messages[index + 1]?.role !== 'assistant') {
       message.error = '페이지가 닫혀 응답을 받지 못했습니다. 다시 시도해 주세요.';
     }
-  }
+  });
   return { id: chat.id, title: chat.title, model: MODELS.includes(chat.model) ? chat.model : MODELS[0],
     usePubmed: chat.usePubmed !== false, messages, updatedAt: Number(chat.updatedAt) || Date.now() };
 }
@@ -36,6 +51,7 @@ function errorMessage(error, status) {
     model_missing: '모델 파일이 없습니다. 서버에서 모델 준비를 완료해 주세요.',
     device_unavailable: '설정된 실행 장치를 사용할 수 없습니다.',
     pubmed_timeout: 'PubMed 연결 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.',
+    pubmed_unavailable: 'PubMed에 연결할 수 없습니다. 잠시 후 다시 시도하거나 PubMed 검색을 꺼 주세요.',
     tool_limit: '논문 검색 단계가 너무 많아 중단됐습니다. 요청을 더 구체적으로 줄여 주세요.',
   };
   if (hints[error?.code]) return hints[error.code];
@@ -45,17 +61,53 @@ function errorMessage(error, status) {
   return typeof error?.message === 'string' ? error.message : '응답을 받지 못했습니다. 다시 시도해 주세요.';
 }
 
+/** Yields the JSON payload of each server-sent event in a fetch response body. */
+export async function* readEvents(body) {
+  const reader = body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += value.replace(/\r\n/g, '\n');
+      let end;
+      while ((end = buffer.indexOf('\n\n')) !== -1) {
+        const data = buffer.slice(0, end).split('\n').filter(line => line.startsWith('data:'))
+          .map(line => line.slice(5).trimStart()).join('\n');
+        buffer = buffer.slice(end + 2);
+        if (data) yield JSON.parse(data);
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+function finish(draft, data) {
+  const choice = data.choices?.[0];
+  const content = choice?.message?.content;
+  if (typeof content !== 'string') throw new Error('빈 응답을 받았습니다. 다시 시도해 주세요.');
+  draft.content = content;
+  draft.toolCalls = normalizeTools(data.tool_calls);
+  draft.truncated = choice.finish_reason === 'length';
+  draft.stopped = choice.finish_reason === 'cancelled';
+  if (!content.trim() && !draft.stopped) throw new Error('빈 응답을 받았습니다. 다시 시도해 주세요.');
+}
+
 export class ChatStore {
   constructor(storage = globalThis.localStorage, fetcher = globalThis.fetch) {
     this.storage = storage;
     this.fetcher = fetcher;
     this.busy = false;
+    this.controller = null;
     this.onChange = () => {};
     this.storageWarning = '';
     this.chats = [];
+    this.settings = { ...DEFAULT_SETTINGS };
     try {
       const saved = JSON.parse(storage.getItem(STORAGE_KEY) || 'null');
       if (Array.isArray(saved?.chats)) this.chats = saved.chats.map(restoreChat).filter(Boolean);
+      this.settings = restoreSettings(saved?.settings);
       this.activeId = this.chats.some(chat => chat.id === saved?.activeId)
         ? saved.activeId : this.chats[0]?.id;
     } catch {
@@ -71,7 +123,8 @@ export class ChatStore {
 
   save() {
     try {
-      this.storage.setItem(STORAGE_KEY, JSON.stringify({ chats: this.chats, activeId: this.activeId }));
+      this.storage.setItem(STORAGE_KEY, JSON.stringify({ chats: this.chats, activeId: this.activeId,
+        settings: this.settings }));
     } catch {
       this.storageWarning = '브라우저에 기록을 저장할 수 없습니다. 페이지를 닫으면 대화가 사라질 수 있습니다.';
     }
@@ -98,11 +151,25 @@ export class ChatStore {
     }
   }
 
+  rename(chatId, title) {
+    const chat = this.chats.find(item => item.id === chatId);
+    const clean = String(title).replace(/\s+/g, ' ').trim().slice(0, 80);
+    if (chat && clean) {
+      chat.title = clean;
+      this.emit();
+    }
+  }
+
   remove(chatId) {
     if (this.busy) return;
     this.chats = this.chats.filter(chat => chat.id !== chatId);
     if (!this.chats.length) this.chats = [freshChat()];
     if (!this.chats.some(chat => chat.id === this.activeId)) this.activeId = this.chats[0].id;
+    this.emit();
+  }
+
+  updateSettings(patch) {
+    this.settings = restoreSettings({ ...this.settings, ...patch });
     this.emit();
   }
 
@@ -115,45 +182,106 @@ export class ChatStore {
     return this.request(chat, message);
   }
 
-  async retry(messageId) {
-    if (this.busy) return;
-    const chat = this.current;
-    const message = chat.messages.at(-1);
-    if (message?.id === messageId && message.role === 'user' && message.error) {
-      return this.request(chat, message);
-    }
+  canRetry(messageId) {
+    const message = this.current.messages.at(-1);
+    return !this.busy && message?.id === messageId && message.role === 'user' && Boolean(message.error);
   }
+
+  async retry(messageId) {
+    if (this.canRetry(messageId)) return this.request(this.current, this.current.messages.at(-1));
+  }
+
+  canRegenerate(messageId) {
+    const messages = this.current.messages;
+    return !this.busy && messages.at(-1)?.id === messageId && messages.at(-1).role === 'assistant'
+      && messages.at(-2)?.role === 'user';
+  }
+
+  async regenerate(messageId) {
+    if (!this.canRegenerate(messageId)) return;
+    const chat = this.current;
+    chat.messages.pop();
+    return this.request(chat, chat.messages.at(-1));
+  }
+
+  /** Replace a question and discard everything after it, as answers to the old wording no longer apply. */
+  async edit(messageId, content) {
+    const chat = this.current;
+    const index = chat.messages.findIndex(message => message.id === messageId);
+    if (this.busy || !content.trim() || chat.messages[index]?.role !== 'user') return;
+    const message = chat.messages[index];
+    chat.messages.splice(index + 1);
+    message.content = content.trim();
+    return this.request(chat, message);
+  }
+
+  stop() { this.controller?.abort(); }
 
   async request(chat, message) {
     this.busy = true;
     delete message.error;
     message.pending = true;
     chat.updatedAt = Date.now();
-    this.emit();
-    const index = chat.messages.indexOf(message);
-    const messages = chat.messages.slice(0, index + 1).filter(item => !item.error)
+    const history = chat.messages.filter(item => !item.error && item.content.trim())
       .map(({ role, content }) => ({ role, content }));
+    if (this.settings.systemPrompt.trim()) {
+      history.unshift({ role: 'system', content: this.settings.systemPrompt.trim() });
+    }
+    const draft = { id: id(), role: 'assistant', content: '', toolCalls: [], streaming: true };
+    chat.messages.push(draft);
+    const controller = new AbortController();
+    this.controller = controller;
+    this.emit();
     try {
       const fetcher = this.fetcher;
       const response = await fetcher('/v1/chat/completions', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: chat.model, messages, max_tokens: 512,
-          temperature: 0.2, use_pubmed: chat.usePubmed }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+        body: JSON.stringify({ model: chat.model, messages: history, max_tokens: this.settings.maxTokens,
+          temperature: this.settings.temperature, use_pubmed: chat.usePubmed, stream: true }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(errorMessage(data.error, response.status));
-      const content = data.choices?.[0]?.message?.content;
-      if (typeof content !== 'string' || !content.trim()) throw new Error('빈 응답을 받았습니다. 다시 시도해 주세요.');
-      chat.messages.splice(index + 1, 0, { id: id(), role: 'assistant', content,
-        toolCalls: normalizeTools(data.tool_calls),
-        truncated: data.choices[0].finish_reason === 'length' });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(errorMessage(data.error, response.status));
+      }
+      if (!(response.headers?.get('content-type') || '').includes('text/event-stream')) {
+        finish(draft, await response.json());
+      } else {
+        let done = false;
+        for await (const event of readEvents(response.body)) {
+          if (event.type === 'delta') draft.content += event.content;
+          else if (event.type === 'status') draft.stage = event.stage;
+          else if (event.type === 'tool') {
+            if (event.status === 'running') {
+              draft.content = '';  // text before a tool call is superseded by the grounded answer
+              draft.toolCalls.push({ name: event.name, arguments: event.arguments || {}, running: true });
+            } else {
+              const call = draft.toolCalls.findLast(item => item.running && item.name === event.name);
+              if (call) delete call.running;
+              if (call && event.error) call.error = event.error;
+            }
+          } else if (event.type === 'done') {
+            finish(draft, event);
+            done = true;
+          } else if (event.type === 'error') throw new Error(errorMessage(event.error, event.status));
+          this.onChange();
+        }
+        if (!done) throw new Error('응답이 중간에 끊겼습니다. 다시 시도해 주세요.');
+      }
     } catch (error) {
-      message.error = error instanceof TypeError
-        ? '서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하고 다시 시도해 주세요.'
-        : error.message || '응답을 받지 못했습니다. 다시 시도해 주세요.';
+      if (controller.signal.aborted && draft.content.trim()) draft.stopped = true;
+      else {
+        chat.messages.splice(chat.messages.indexOf(draft), 1);
+        message.error = controller.signal.aborted ? STOPPED : error instanceof TypeError
+          ? '서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하고 다시 시도해 주세요.'
+          : error.message || '응답을 받지 못했습니다. 다시 시도해 주세요.';
+      }
     } finally {
+      delete draft.streaming;
+      delete draft.stage;
+      draft.toolCalls = normalizeTools(draft.toolCalls.map(({ running, ...call }) => call));
       delete message.pending;
       this.busy = false;
+      this.controller = null;
       chat.updatedAt = Date.now();
       this.emit();
     }
@@ -163,42 +291,80 @@ export class ChatStore {
 export const escapeHtml = value => String(value).replace(/[&<>"']/g,
   char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
 
+const TRAILING = /(?:&quot;|&#39;|&gt;|[.,;:!?)\]])+$/;
+
 function inlineMarkdown(text) {
   // Escape first; only our own tags and validated HTTP(S) links may enter the DOM.
   return escapeHtml(text).replace(
-    /`([^`\n]+)`|\[([^\]\n]+)\]\(([^\s)]+)\)|\*\*([^*\n]+)\*\*|\*(?!\s)([^*\n]+?)(?<!\s)\*/g,
-    (match, code, label, target, bold, italic) => {
+    /`([^`\n]+)`|\[([^\]\n]+)\]\(([^\s)]+)\)|(https?:\/\/[^\s<]+)|\*\*([^*\n]+)\*\*|\*(?!\s)([^*\n]+?)(?<!\s)\*/g,
+    (match, code, label, target, url, bold, italic) => {
       if (code !== undefined) return '<code>' + code + '</code>';
       if (bold !== undefined) return '<strong>' + bold + '</strong>';
       if (italic !== undefined) return '<em>' + italic + '</em>';
+      if (url !== undefined) {
+        const tail = url.match(TRAILING)?.[0] || '';
+        const href = url.slice(0, url.length - tail.length);
+        return '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + href + '</a>' + tail;
+      }
       if (!/^https?:\/\//i.test(target)) return label;
       return '<a href="' + target + '" target="_blank" rel="noopener noreferrer">' + label + '</a>';
     });
 }
 
-export function renderMarkdown(text) {
-  return String(text).split(/(```[\s\S]*?(?:```|$))/g).map(part => {
-    if (part.startsWith('```')) {
-      const code = part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '').replace(/\n$/, '');
-      return '<pre><code>' + escapeHtml(code) + '</code></pre>';
+const tableCells = line => line.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(cell => cell.trim());
+const isTableRule = line => /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/.test(line);
+
+function renderTable(rows) {
+  const [head, , ...body] = rows.map(tableCells);
+  const cells = (row, tag) => row.map(cell => '<' + tag + '>' + inlineMarkdown(cell) + '</' + tag + '>').join('');
+  return '<div class="table-wrap"><table><thead><tr>' + cells(head, 'th') + '</tr></thead><tbody>'
+    + body.map(row => '<tr>' + cells(row, 'td') + '</tr>').join('') + '</tbody></table></div>';
+}
+
+function renderBlocks(part) {
+  const lines = part.split('\n');
+  let list = null;
+  let output = '';
+  const closeList = () => { if (list) output += '</' + list + '>'; list = null; };
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (line.includes('|') && isTableRule(lines[index + 1] || '')) {
+      closeList();
+      const rows = [line, lines[index + 1]];
+      index += 2;
+      while (index < lines.length && lines[index].includes('|') && lines[index].trim()) rows.push(lines[index++]);
+      index--;
+      output += renderTable(rows);
+      continue;
     }
-    let list = null;
-    let output = '';
-    const closeList = () => { if (list) output += '</' + list + '>'; list = null; };
-    for (const line of part.split('\n')) {
-      const bullet = line.match(/^\s*(?:[-*]|\d+\.)\s+(.+)/);
-      if (bullet) {
-        const type = /^\s*\d+\./.test(line) ? 'ol' : 'ul';
-        if (list !== type) { closeList(); output += '<' + type + '>'; list = type; }
-        output += '<li>' + inlineMarkdown(bullet[1]) + '</li>';
-      } else {
-        closeList();
-        const heading = line.match(/^#{1,6}\s+(.+)/);
-        if (heading) output += '<h3>' + inlineMarkdown(heading[1]) + '</h3>';
-        else if (line.trim()) output += '<p>' + inlineMarkdown(line) + '</p>';
-      }
+    const bullet = line.match(/^\s*(?:[-*+]|\d+\.)\s+(.+)/);
+    if (bullet && !/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+      const type = /^\s*\d+\./.test(line) ? 'ol' : 'ul';
+      if (list !== type) { closeList(); output += '<' + type + '>'; list = type; }
+      output += '<li>' + inlineMarkdown(bullet[1]) + '</li>';
+      continue;
     }
     closeList();
-    return output;
+    const heading = line.match(/^(#{1,6})\s+(.+)/);
+    const quote = line.match(/^\s*>\s?(.*)/);
+    if (heading) {
+      const tag = heading[1].length <= 2 ? 'h3' : 'h4';
+      output += '<' + tag + '>' + inlineMarkdown(heading[2]) + '</' + tag + '>';
+    } else if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) output += '<hr>';
+    else if (quote) output += '<blockquote>' + inlineMarkdown(quote[1]) + '</blockquote>';
+    else if (line.trim()) output += '<p>' + inlineMarkdown(line) + '</p>';
+  }
+  closeList();
+  return output;
+}
+
+export function renderMarkdown(text) {
+  return String(text).split(/(```[\s\S]*?(?:```|$))/g).map(part => {
+    if (!part.startsWith('```')) return renderBlocks(part);
+    const language = part.match(/^```([\w+#.-]*)/)?.[1] || '';
+    const code = part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '').replace(/\n$/, '');
+    return '<div class="code-block"><div class="code-header"><span>' + escapeHtml(language || 'code')
+      + '</span><button type="button" class="code-copy">복사</button></div><pre><code>'
+      + escapeHtml(code) + '</code></pre></div>';
   }).join('');
 }

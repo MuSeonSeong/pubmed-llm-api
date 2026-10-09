@@ -188,7 +188,8 @@ def test_streamer_reports_cumulative_completion_text(monkeypatch):
     obj=manager(monkeypatch,loader=lambda spec:(StreamingModel(),Tokenizer()))
     seen=[]
     asyncio.run(obj.generate('qwen3-0.6b',[{'role':'user','content':'hi'}],[],10,0,on_text=seen.append))
-    assert len(seen) == 2
+    assert seen[0] == ''  # generation started
+    assert len(seen) == 3
     assert seen[-1].startswith('<tool_call>')
 
 
@@ -225,4 +226,4 @@ def test_streamer_waits_for_complete_multibyte_characters(monkeypatch):
     streamer.put(torch.ones((1,3)))
     streamer.put(torch.tensor([1]))
     streamer.put(torch.tensor([2]))
-    assert seen == ['안녕']
+    assert seen == ['', '안녕']

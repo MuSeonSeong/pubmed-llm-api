@@ -16,16 +16,31 @@ const element = (tag, className, text) => {
   if (text !== undefined) node.textContent = text;
   return node;
 };
+const iconButton = (name, label, onClick) => {
+  const button = element('button', 'icon-button');
+  button.type = 'button';
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  button.append(icon(name));
+  button.addEventListener('click', onClick);
+  return button;
+};
 
 let storage;
 try { storage = window.localStorage; }
 catch { storage = { getItem: () => null, setItem: () => { throw Error('Storage unavailable'); } }; }
 const store = new ChatStore(storage);
 const prompt = $('prompt');
+const conversation = $('conversation');
+const THEME_KEY = 'pubmed-chat.theme';
 let lastChatId;
-let lastMessageKey;
 let shownIds = new Set();
+let nodeCache = new Map();
+let editingId = null;
+let renamingId = null;
+let followOutput = true;
 let toastTimer;
+let renderQueued = false;
 
 function toast(text) {
   $('toast').textContent = text;
@@ -34,22 +49,76 @@ function toast(text) {
   toastTimer = setTimeout(() => { $('toast').hidden = true; }, 2500);
 }
 
+async function copyText(text, done) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast(done);
+  } catch { toast('복사할 수 없습니다. 내용을 선택해서 복사해 주세요.'); }
+}
+
 function hideSidebar() {
   document.body.classList.remove('sidebar-open');
   $('sidebar-backdrop').hidden = true;
 }
 
+function dateGroup(time) {
+  const day = 24 * 60 * 60 * 1000;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  if (time >= today.getTime()) return '오늘';
+  if (time >= today.getTime() - day) return '어제';
+  if (time >= today.getTime() - 7 * day) return '지난 7일';
+  if (time >= today.getTime() - 30 * day) return '지난 30일';
+  return '이전';
+}
+
+function renameField(chat) {
+  const input = element('input', 'rename-input');
+  input.value = chat.title;
+  input.setAttribute('aria-label', '대화 이름');
+  let finished = false;
+  const finish = save => {
+    if (finished) return;
+    finished = true;
+    renamingId = null;
+    if (save) store.rename(chat.id, input.value);
+    scheduleRender();
+  };
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.isComposing) finish(true);
+    if (event.key === 'Escape') { event.stopPropagation(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+  requestAnimationFrame(() => { input.focus(); input.select(); });
+  return input;
+}
+
 function renderHistory() {
   const history = $('chat-list');
+  if (history.contains(document.activeElement) && renamingId) return;  // keep the rename field alive
   history.replaceChildren();
-  const chats = [...store.chats].filter(chat => chat.messages.length)
+  const query = $('chat-search').value.trim().toLowerCase();
+  const chats = store.chats.filter(chat => chat.messages.length)
+    .filter(chat => !query || chat.title.toLowerCase().includes(query)
+      || chat.messages.some(message => message.content.toLowerCase().includes(query)))
     .sort((a, b) => b.updatedAt - a.updatedAt);
-  if (!chats.length) history.append(element('p', 'history-empty', '첫 대화를 시작해 보세요.'));
+  if (!chats.length) {
+    history.append(element('p', 'history-empty', query ? '검색 결과가 없습니다.' : '첫 대화를 시작해 보세요.'));
+  }
+  let group;
   for (const chat of chats) {
+    if (dateGroup(chat.updatedAt) !== group) {
+      group = dateGroup(chat.updatedAt);
+      history.append(element('div', 'history-heading', group));
+    }
     const row = element('div', 'chat-row' + (chat.id === store.activeId ? ' active' : ''));
+    if (renamingId === chat.id) {
+      row.append(renameField(chat));
+      history.append(row);
+      continue;
+    }
     const select = element('button', 'chat-select');
     select.title = chat.title;
-    select.setAttribute('aria-label', chat.title);
     if (chat.id === store.activeId) select.setAttribute('aria-current', 'true');
     select.append(icon('chat'), element('span', 'chat-title', chat.title));
     select.addEventListener('click', () => {
@@ -57,15 +126,15 @@ function renderHistory() {
       hideSidebar();
       prompt.focus();
     });
-    const remove = element('button', 'chat-delete icon-button');
-    remove.setAttribute('aria-label', chat.title + ' 대화 삭제');
-    remove.title = '대화 삭제';
-    remove.disabled = store.busy;
-    remove.append(icon('trash'));
-    remove.addEventListener('click', () => {
+    select.addEventListener('dblclick', () => { renamingId = chat.id; render(); });
+    const rename = iconButton('edit', chat.title + ' 이름 바꾸기', () => { renamingId = chat.id; render(); });
+    rename.classList.add('chat-action');
+    const remove = iconButton('trash', chat.title + ' 대화 삭제', () => {
       if (confirm('이 대화를 삭제할까요? 브라우저에 저장된 기록이 삭제됩니다.')) store.remove(chat.id);
     });
-    row.append(select, remove);
+    remove.classList.add('chat-action');
+    remove.disabled = store.busy;
+    row.append(select, rename, remove);
     history.append(row);
   }
 }
@@ -78,98 +147,184 @@ function assistantHeading() {
   return heading;
 }
 
-function renderMessage(message) {
-  const article = element('article', 'message message-' + message.role);
-  article.setAttribute('aria-label', message.role === 'user' ? '내 메시지' : '답변');
-  if (message.role === 'user') {
-    article.append(element('div', 'user-content', message.content));
-    if (message.error) {
-      const error = element('div', 'message-error');
-      error.append(element('div', '', message.error));
+function describeCall(call) {
+  const kind = call.name === 'pubmed_search_articles' ? '논문 검색' : '초록 조회';
+  const query = typeof call.arguments?.query === 'string' ? call.arguments.query
+    : Array.isArray(call.arguments?.pmids) ? 'PMID ' + call.arguments.pmids.join(', ') : '';
+  return { kind, query };
+}
+
+function progressLine(message, chat) {
+  const line = element('div', 'loading');
+  const dots = element('span', 'loading-dots');
+  dots.setAttribute('aria-hidden', 'true');
+  dots.append(element('span'), element('span'), element('span'));
+  const running = message.toolCalls.findLast(call => call.running);
+  let text = '답변을 준비하고 있어요';
+  if (running) {
+    const { kind, query } = describeCall(running);
+    text = 'PubMed ' + kind + ' 중' + (query ? ' · ' + query : '');
+  } else if (message.stage === 'loading_model') text = '모델을 불러오는 중이에요. 처음이나 모델을 바꾼 뒤에는 시간이 걸려요';
+  else if (message.toolCalls.length) text = '찾은 논문을 읽고 답변을 쓰고 있어요';
+  else if (!message.stage && chat.usePubmed) text = 'PubMed 연결을 준비하고 있어요';
+  line.append(dots, document.createTextNode(text));
+  return line;
+}
+
+function toolDetails(calls, open) {
+  const details = element('details', 'tool-details');
+  details.open = open;
+  details.append(element('summary', '', 'PubMed 검색·조회 ' + calls.length + '회'));
+  const list = element('ul');
+  for (const call of calls) {
+    const { kind, query } = describeCall(call);
+    const state = call.running ? ' · 진행 중' : call.error ? ' · 실패' : '';
+    list.append(element('li', call.running ? 'running' : '', kind + (query ? ' · ' + query : '') + state));
+  }
+  details.append(list);
+  return details;
+}
+
+function editForm(message) {
+  const form = element('form', 'edit-form');
+  const field = element('textarea', 'edit-input');
+  field.value = message.content;
+  field.setAttribute('aria-label', '질문 수정');
+  const resize = () => { field.style.height = 'auto'; field.style.height = Math.min(field.scrollHeight, 260) + 'px'; };
+  field.addEventListener('input', resize);
+  field.addEventListener('keydown', event => {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+      event.preventDefault();
+      form.requestSubmit();
+    }
+    if (event.key === 'Escape') { event.stopPropagation(); cancel.click(); }
+  });
+  const buttons = element('div', 'edit-buttons');
+  const cancel = element('button', 'text-button', '취소');
+  cancel.type = 'button';
+  cancel.addEventListener('click', () => { editingId = null; render(); prompt.focus(); });
+  const save = element('button', 'primary-button', '보내기');
+  save.type = 'submit';
+  buttons.append(cancel, save);
+  form.append(field, buttons);
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    if (!field.value.trim() || store.busy) return;
+    editingId = null;
+    followOutput = true;
+    store.edit(message.id, field.value);
+  });
+  requestAnimationFrame(() => { field.focus(); field.setSelectionRange(field.value.length, field.value.length); resize(); });
+  return form;
+}
+
+function renderUser(message) {
+  const article = element('article', 'message message-user');
+  article.setAttribute('aria-label', '내 메시지');
+  if (editingId === message.id) {
+    article.append(editForm(message));
+    return article;
+  }
+  article.append(element('div', 'user-content', message.content));
+  const actions = element('div', 'message-actions user-actions');
+  actions.append(iconButton('copy', '질문 복사', () => copyText(message.content, '질문을 복사했습니다.')));
+  const edit = iconButton('edit', '질문 수정', () => { editingId = message.id; render(); });
+  edit.disabled = store.busy;
+  actions.append(edit);
+  article.append(actions);
+  if (message.error) {
+    const error = element('div', 'message-error');
+    error.append(element('div', '', message.error));
+    if (store.canRetry(message.id)) {
       const retry = element('button', 'retry-button');
       retry.append(icon('refresh'), document.createTextNode('다시 시도'));
-      retry.disabled = store.busy;
-      retry.addEventListener('click', () => store.retry(message.id));
-      if (store.current.messages.at(-1).id === message.id) error.append(retry);
-      article.append(error);
+      retry.addEventListener('click', () => { followOutput = true; store.retry(message.id); });
+      error.append(retry);
     }
-  } else {
-    article.append(assistantHeading());
-    const body = element('div', 'assistant-body');
-    body.innerHTML = renderMarkdown(message.content);
-    if (message.truncated) body.append(element('div', 'truncated-note',
-      '답변 길이 한도에 도달했습니다. “이어서 설명해줘”라고 요청할 수 있어요.'));
-    if (Array.isArray(message.toolCalls) && message.toolCalls.length) {
-      const details = element('details', 'tool-details');
-      details.append(element('summary', '', 'PubMed 검색·조회 ' + message.toolCalls.length + '회'));
-      const list = element('ul');
-      for (const call of message.toolCalls) {
-        const kind = call.name === 'pubmed_search_articles' ? '논문 검색' : '초록 조회';
-        const query = typeof call.arguments?.query === 'string' ? call.arguments.query
-          : Array.isArray(call.arguments?.pmids) ? 'PMID ' + call.arguments.pmids.join(', ') : '';
-        list.append(element('li', '', kind + (query ? ' · ' + query : '') + (call.error ? ' · 실패' : '')));
-      }
-      details.append(list);
-      body.append(details);
-    }
+    article.append(error);
+  }
+  return article;
+}
+
+function renderAssistant(message, chat) {
+  const article = element('article', 'message message-assistant');
+  article.setAttribute('aria-label', '답변');
+  article.append(assistantHeading());
+  const body = element('div', 'assistant-body');
+  if (message.streaming && message.toolCalls.length) body.append(toolDetails(message.toolCalls, false));
+  if (message.content) {
+    const text = element('div', 'markdown' + (message.streaming ? ' streaming' : ''));
+    text.innerHTML = renderMarkdown(message.content);
+    body.append(text);
+  }
+  if (message.streaming && !message.content) body.append(progressLine(message, chat));
+  if (message.stopped) body.append(element('div', 'truncated-note', '답변 생성을 중지했습니다.'));
+  if (message.truncated) body.append(element('div', 'truncated-note',
+    '답변 길이 한도에 도달했습니다. “이어서 설명해줘”라고 요청하거나 설정에서 답변 길이를 늘려 보세요.'));
+  if (!message.streaming && message.toolCalls.length) body.append(toolDetails(message.toolCalls, false));
+  article.append(body);
+  if (!message.streaming) {
     const actions = element('div', 'message-actions');
-    const copy = element('button', 'icon-button');
-    copy.title = '답변 복사';
-    copy.setAttribute('aria-label', '답변 복사');
-    copy.append(icon('copy'));
-    copy.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(message.content);
-        toast('답변을 복사했습니다.');
-      } catch { toast('복사할 수 없습니다. 답변을 선택해서 복사해 주세요.'); }
-    });
-    actions.append(copy);
-    article.append(body, actions);
+    actions.append(iconButton('copy', '답변 복사', () => copyText(message.content, '답변을 복사했습니다.')));
+    if (store.canRegenerate(message.id)) {
+      actions.append(iconButton('refresh', '답변 다시 생성', () => { followOutput = true; store.regenerate(message.id); }));
+    }
+    article.append(actions);
   }
   return article;
 }
 
 function renderMessages() {
   const chat = store.current;
-  const messageKey = chat.id + JSON.stringify(chat.messages);
-  if (messageKey === lastMessageKey) return;
-  const conversation = $('conversation');
-  const atBottom = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight < 100;
   const switched = lastChatId !== chat.id;
-  const messages = $('messages');
-  // Only messages that just arrived animate in; rerenders must not flash the whole log.
-  const rendered = chat.messages.map(message => {
-    const node = renderMessage(message);
+  if (switched) { nodeCache = new Map(); editingId = null; followOutput = true; }
+  const nextCache = new Map();
+  const nodes = chat.messages.map((message, index) => {
+    // Rebuild a message only when its content or available actions change; streaming touches one node.
+    const key = JSON.stringify(message) + store.busy + (index === chat.messages.length - 1)
+      + (editingId === message.id) + chat.usePubmed;
+    const cached = nodeCache.get(message.id);
+    const node = cached?.key === key ? cached.node
+      : message.role === 'user' ? renderUser(message) : renderAssistant(message, chat);
     if (!switched && !shownIds.has(message.id)) node.classList.add('is-new');
+    nextCache.set(message.id, { key, node });
     return node;
   });
+  nodeCache = nextCache;
   shownIds = new Set(chat.messages.map(message => message.id));
-  messages.replaceChildren(...rendered);
-  $('welcome').hidden = chat.messages.length > 0;
-  const pending = chat.messages.some(message => message.pending);
-  if (pending) {
-    const loading = element('div', 'message message-assistant is-new');
-    loading.append(assistantHeading());
-    const line = element('div', 'loading');
-    const dots = element('span', 'loading-dots');
-    dots.setAttribute('aria-hidden', 'true');
-    dots.append(element('span'), element('span'), element('span'));
-    line.append(dots, document.createTextNode(chat.usePubmed ? '논문을 살펴보며 답변을 준비하고 있어요' : '답변을 준비하고 있어요'));
-    loading.append(line);
-    messages.append(loading);
+  // Move only what changed: reinserting an unchanged node would replay its entrance animation.
+  const messages = $('messages');
+  let cursor = messages.firstChild;
+  for (const node of nodes) {
+    if (cursor === node) cursor = cursor.nextSibling;
+    else messages.insertBefore(node, cursor);
   }
-  if (atBottom || switched || pending) conversation.scrollTop = conversation.scrollHeight;
-  lastMessageKey = messageKey;
+  while (cursor) {
+    const next = cursor.nextSibling;
+    cursor.remove();
+    cursor = next;
+  }
+  $('welcome').hidden = chat.messages.length > 0;
+  if (switched || followOutput) conversation.scrollTop = conversation.scrollHeight;
   lastChatId = chat.id;
+  updateScrollButton();
 }
 
-function updateSendButton() {
-  $('send').disabled = store.busy || !prompt.value.trim();
+function updateScrollButton() {
+  const distance = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight;
+  $('scroll-bottom').hidden = distance < 120;
+}
+
+function updateComposer() {
+  $('send').hidden = store.busy;
+  $('stop').hidden = !store.busy;
+  $('send').disabled = !prompt.value.trim();
   prompt.style.height = 'auto';
-  prompt.style.height = Math.min(prompt.scrollHeight, 180) + 'px';
+  prompt.style.height = Math.min(prompt.scrollHeight, 220) + 'px';
 }
 
 function render() {
+  renderQueued = false;
   const chat = store.current;
   $('model').value = chat.model;
   $('model').disabled = store.busy;
@@ -178,38 +333,65 @@ function render() {
   $('new-chat').disabled = store.busy;
   $('storage-warning').textContent = store.storageWarning;
   $('storage-warning').hidden = !store.storageWarning;
-  $('request-status').textContent = store.busy
-    ? '응답을 기다리는 중입니다. 처음 실행하거나 모델을 바꾸면 로딩 시간이 필요해요.' : '';
   document.title = chat.messages.length ? chat.title + ' · PubMed Chat' : 'PubMed Chat';
   renderHistory();
   renderMessages();
-  updateSendButton();
+  updateComposer();
 }
 
-store.onChange = render;
+function scheduleRender() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(render);
+}
+
+store.onChange = scheduleRender;
 $('chat-form').addEventListener('submit', event => {
   event.preventDefault();
   if (store.busy || !prompt.value.trim()) return;
   const content = prompt.value;
   prompt.value = '';
-  updateSendButton();
+  followOutput = true;
+  updateComposer();
   store.send(content);
   prompt.focus();
 });
-prompt.addEventListener('input', updateSendButton);
+$('stop').addEventListener('click', () => { store.stop(); prompt.focus(); });
+prompt.addEventListener('input', updateComposer);
 prompt.addEventListener('keydown', event => {
   if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
     $('chat-form').requestSubmit();
   }
+  if (event.key === 'ArrowUp' && !prompt.value && !store.busy) {
+    const last = store.current.messages.findLast(message => message.role === 'user');
+    if (last) { event.preventDefault(); editingId = last.id; render(); }
+  }
+});
+conversation.addEventListener('scroll', () => {
+  const distance = conversation.scrollHeight - conversation.scrollTop - conversation.clientHeight;
+  followOutput = distance < 80;
+  updateScrollButton();
+}, { passive: true });
+$('scroll-bottom').addEventListener('click', () => {
+  followOutput = true;
+  conversation.scrollTo({ top: conversation.scrollHeight, behavior: 'smooth' });
+});
+$('messages').addEventListener('click', event => {
+  const button = event.target.closest('.code-copy');
+  if (!button) return;
+  copyText(button.closest('.code-block').querySelector('code').textContent, '코드를 복사했습니다.');
+  button.textContent = '복사됨';
+  setTimeout(() => { button.textContent = '복사'; }, 1500);
 });
 $('model').addEventListener('change', event => { store.current.model = event.target.value; store.emit(); });
 $('use-pubmed').addEventListener('change', event => { store.current.usePubmed = event.target.checked; store.emit(); });
+$('chat-search').addEventListener('input', renderHistory);
 function newChat() {
   if (store.busy) return;
   store.newChat();
   prompt.value = '';
-  updateSendButton();
+  updateComposer();
   hideSidebar();
   prompt.focus();
 }
@@ -219,7 +401,10 @@ document.addEventListener('keydown', event => {
     event.preventDefault();
     newChat();
   }
-  if (event.key === 'Escape') hideSidebar();
+  if (event.key === 'Escape') {
+    if (store.busy && document.activeElement === prompt) store.stop();
+    hideSidebar();
+  }
 });
 for (const suggestion of document.querySelectorAll('.suggestion')) {
   suggestion.addEventListener('click', () => {
@@ -244,6 +429,47 @@ $('open-sidebar').addEventListener('click', () => {
   }
 });
 $('sidebar-backdrop').addEventListener('click', hideSidebar);
+
+function applyTheme(theme) {
+  if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
+  else delete document.documentElement.dataset.theme;
+  try { storage.setItem(THEME_KEY, theme); } catch { /* the theme just won't persist */ }
+}
+function savedTheme() {
+  try { return storage.getItem(THEME_KEY) || 'system'; } catch { return 'system'; }
+}
+function showTemperature() { $('temperature-value').textContent = Number($('temperature').value).toFixed(1); }
+$('open-settings').addEventListener('click', () => {
+  $('system-prompt').value = store.settings.systemPrompt;
+  $('temperature').value = store.settings.temperature;
+  $('max-tokens').value = String(store.settings.maxTokens);
+  $('theme').value = savedTheme();
+  showTemperature();
+  $('settings-dialog').showModal();
+});
+$('settings-dialog').addEventListener('click', event => {
+  if (event.target === $('settings-dialog')) $('settings-dialog').close();  // backdrop click
+});
+$('system-prompt').addEventListener('input', event => store.updateSettings({ systemPrompt: event.target.value }));
+$('temperature').addEventListener('input', showTemperature);
+$('temperature').addEventListener('change', event => store.updateSettings({ temperature: Number(event.target.value) }));
+$('max-tokens').addEventListener('change', event => store.updateSettings({ maxTokens: Number(event.target.value) }));
+$('theme').addEventListener('change', event => applyTheme(event.target.value));
+$('export-chats').addEventListener('click', () => {
+  const data = JSON.stringify({ exportedAt: new Date().toISOString(),
+    chats: store.chats.filter(chat => chat.messages.length) }, null, 2);
+  const link = element('a');
+  link.href = URL.createObjectURL(new Blob([data], { type: 'application/json' }));
+  link.download = 'pubmed-chat-' + new Date().toISOString().slice(0, 10) + '.json';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+});
+$('clear-chats').addEventListener('click', () => {
+  if (store.busy || !confirm('모든 대화를 삭제할까요? 이 작업은 되돌릴 수 없습니다.')) return;
+  for (const chat of [...store.chats]) store.remove(chat.id);
+  $('settings-dialog').close();
+  toast('모든 대화를 삭제했습니다.');
+});
 
 async function checkServer() {
   try {

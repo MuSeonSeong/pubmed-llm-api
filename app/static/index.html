@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#faf9f6">
   <title>PubMed Chat</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%231c6758'/%3E%3Cpath d='M13 28V12h8a5 5 0 0 1 0 10h-8' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
+  <script>try { const theme = localStorage.getItem('pubmed-chat.theme'); if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme; } catch {}</script>
   <link rel="stylesheet" href="/static/style.css">
   <script type="module" src="/static/app.mjs"></script>
 </head>
@@ -22,6 +23,11 @@
     <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v6M14 10v6"/></symbol>
     <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16Zm9.5-13.5 4 4"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14m-6-6 6 6 6-6"/></symbol>
   </svg>
 
   <div class="app-shell">
@@ -32,7 +38,7 @@
         <button id="close-sidebar" class="icon-button" aria-label="대화 목록 접기"><svg class="icon"><use href="#i-panel"/></svg></button>
       </div>
       <button id="new-chat" class="new-chat"><svg class="icon"><use href="#i-plus"/></svg>새 대화<span class="key-hint">⌘ K</span></button>
-      <div class="history-heading">내 대화</div>
+      <label class="chat-search"><svg class="icon"><use href="#i-search"/></svg><span class="sr-only">대화 검색</span><input id="chat-search" type="search" placeholder="대화 검색" autocomplete="off"></label>
       <nav id="chat-list" class="chat-list" aria-label="저장된 대화"></nav>
       <div class="sidebar-footer">
         <div class="local-label"><span class="local-dot"></span>내 컴퓨터에서 실행 중</div>
@@ -52,7 +58,10 @@
           </select>
           <span class="model-badge">LOCAL</span>
         </div>
-        <div id="server-status" class="server-status"><span class="status-dot"></span><span>서버 확인 중</span></div>
+        <div class="topbar-actions">
+          <div id="server-status" class="server-status"><span class="status-dot"></span><span>서버 확인 중</span></div>
+          <button id="open-settings" class="icon-button" aria-label="설정" title="설정"><svg class="icon"><use href="#i-settings"/></svg></button>
+        </div>
       </header>
 
       <div id="storage-warning" class="storage-warning" role="status" hidden></div>
@@ -68,8 +77,9 @@
             <button class="suggestion" data-prompt="오늘 할 일을 효율적으로 정리하는 방법을 알려줘." data-pubmed="false"><svg class="icon"><use href="#i-chat"/></svg><strong>편하게 대화하기</strong><span>일상 속 궁금한 것 물어보기</span><span class="suggestion-arrow" aria-hidden="true">↗</span></button>
           </div>
         </div>
-        <div id="messages" class="messages" role="log" aria-label="대화 메시지" aria-live="polite" aria-relevant="additions"></div>
+        <div id="messages" class="messages" role="log" aria-label="대화 메시지"></div>
       </section>
+      <button id="scroll-bottom" class="scroll-bottom" aria-label="맨 아래로" hidden><svg class="icon"><use href="#i-down"/></svg></button>
 
       <div class="composer-area">
         <div id="request-status" class="request-status" role="status" aria-live="polite"></div>
@@ -78,13 +88,53 @@
           <textarea id="prompt" placeholder="메시지를 입력하세요" rows="1" aria-label="메시지" required></textarea>
           <div class="composer-bottom">
             <label class="pubmed-toggle" for="use-pubmed"><input id="use-pubmed" type="checkbox" checked><svg class="icon"><use href="#i-search"/></svg><span>PubMed 검색</span><span class="toggle-indicator"></span></label>
-            <div class="send-controls"><span class="input-hint">Shift + Enter로 줄바꿈</span><button id="send" class="send-button" type="submit" aria-label="메시지 보내기" disabled><svg class="icon"><use href="#i-arrow"/></svg></button></div>
+            <div class="send-controls"><span class="input-hint">Shift + Enter로 줄바꿈</span><button id="send" class="send-button" type="submit" aria-label="메시지 보내기" disabled><svg class="icon"><use href="#i-arrow"/></svg></button><button id="stop" class="send-button stop-button" type="button" aria-label="답변 중지" title="답변 중지" hidden><svg class="icon"><use href="#i-stop"/></svg></button></div>
           </div>
         </form>
         <p class="composer-note">작은 로컬 모델의 답변에는 오류가 있을 수 있습니다. 논문 원문과 함께 확인해 주세요.</p>
       </div>
     </main>
   </div>
+  <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title">
+    <form method="dialog" class="settings-form">
+      <div class="settings-header">
+        <h2 id="settings-title">설정</h2>
+        <button class="icon-button" value="close" aria-label="설정 닫기"><svg class="icon"><use href="#i-close"/></svg></button>
+      </div>
+      <label class="field">
+        <span class="field-label">맞춤 지시문</span>
+        <span class="field-help">모든 대화에 적용됩니다. 예: “항상 한국어로, 핵심부터 짧게 답해줘.”</span>
+        <textarea id="system-prompt" rows="4" maxlength="4000" placeholder="답변 방식에 대한 요청을 적어 주세요"></textarea>
+      </label>
+      <label class="field">
+        <span class="field-label">창의성 <output id="temperature-value"></output></span>
+        <span class="field-help">낮을수록 일관되고, 높을수록 다양하게 답합니다.</span>
+        <input id="temperature" type="range" min="0" max="1.5" step="0.1">
+      </label>
+      <label class="field">
+        <span class="field-label">최대 답변 길이</span>
+        <select id="max-tokens">
+          <option value="256">짧게 · 256 토큰</option>
+          <option value="512">보통 · 512 토큰</option>
+          <option value="1024">길게 · 1024 토큰</option>
+          <option value="2048">아주 길게 · 2048 토큰</option>
+        </select>
+        <span class="field-help">길수록 대화에 쓸 수 있는 문맥이 줄어듭니다.</span>
+      </label>
+      <label class="field">
+        <span class="field-label">화면 테마</span>
+        <select id="theme">
+          <option value="system">시스템 설정 따르기</option>
+          <option value="light">밝게</option>
+          <option value="dark">어둡게</option>
+        </select>
+      </label>
+      <div class="settings-data">
+        <button type="button" id="export-chats" class="text-button">대화 내보내기 (JSON)</button>
+        <button type="button" id="clear-chats" class="text-button danger">모든 대화 삭제</button>
+      </div>
+    </form>
+  </dialog>
   <div id="toast" class="toast" role="status" hidden></div>
   <noscript>채팅을 사용하려면 브라우저에서 JavaScript를 켜 주세요.</noscript>
 </body>

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ChatStore, renderMarkdown } from '../app/static/chat.mjs';
+import { ChatStore, readEvents, renderMarkdown } from '../app/static/chat.mjs';
 
 const memory = () => {
   const data = new Map();
@@ -164,4 +164,192 @@ test('single-asterisk emphasis renders as italics without touching arithmetic', 
   assert.ok(rendered.includes('<em>Nonomuraea gerenzanensis</em>'));
   assert.ok(rendered.includes('2 * 3 * 4 = 24'));
   assert.ok(rendered.includes('<strong>굵게</strong>'));
+});
+
+
+const encoder = new TextEncoder();
+const sseText = events => events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join('');
+const done = (content, finish_reason = 'stop', tool_calls = []) =>
+  ({ type: 'done', choices: [{ message: { content }, finish_reason }], tool_calls });
+const sse = events => new Response(sseText(events), { headers: { 'content-type': 'text/event-stream' } });
+
+/** A stream the test feeds event by event; aborting the request errors it like real fetch. */
+function controlledStream(signal) {
+  let controller;
+  const body = new ReadableStream({ start(c) { controller = c; } });
+  signal.addEventListener('abort', () => controller.error(new DOMException('Aborted', 'AbortError')));
+  return { response: new Response(body, { headers: { 'content-type': 'text/event-stream' } }),
+    push: event => controller.enqueue(encoder.encode(sseText([event]))) };
+}
+const tick = () => new Promise(resolve => setTimeout(resolve, 5));
+
+test('streamed deltas render progressively and the final event carries citations and traces', async () => {
+  const bodies = [];
+  const snapshots = [];
+  const store = new ChatStore(memory(), async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return sse([{ type: 'status', stage: 'generating' },
+      { type: 'tool', status: 'running', name: 'pubmed_search_articles', arguments: { query: 'CRISPR' } },
+      { type: 'tool', status: 'done', name: 'pubmed_search_articles', arguments: { query: 'CRISPR' } },
+      { type: 'delta', content: '요약' }, { type: 'delta', content: '입니다' },
+      done('요약입니다\n\n출처: PMID 1', 'stop', [{ name: 'pubmed_search_articles', arguments: { query: 'CRISPR' } }])]);
+  });
+  store.onChange = () => snapshots.push(store.current.messages.at(-1).content);
+  await store.send('CRISPR 논문');
+  assert.equal(bodies[0].stream, true);
+  assert.ok(snapshots.includes('요약'));
+  const answer = store.current.messages.at(-1);
+  assert.equal(answer.content, '요약입니다\n\n출처: PMID 1');
+  assert.deepEqual(answer.toolCalls, [{ name: 'pubmed_search_articles', arguments: { query: 'CRISPR' } }]);
+  assert.equal(answer.streaming, undefined);
+  assert.equal(store.busy, false);
+});
+
+test('stopping mid-answer keeps the partial text as a stopped answer', async () => {
+  let stream;
+  const store = new ChatStore(memory(), async (_, init) => (stream = controlledStream(init.signal)).response);
+  const pending = store.send('긴 설명');
+  await tick();
+  stream.push({ type: 'delta', content: '부분 답변' });
+  await tick();
+  assert.equal(store.current.messages.at(-1).content, '부분 답변');
+  store.stop();
+  await pending;
+  const answer = store.current.messages.at(-1);
+  assert.equal(answer.role, 'assistant');
+  assert.equal(answer.stopped, true);
+  assert.equal(answer.content, '부분 답변');
+  assert.equal(store.current.messages[0].error, undefined);
+  assert.equal(store.busy, false);
+});
+
+test('stopping before any text leaves a retryable question', async () => {
+  let attempts = 0;
+  const store = new ChatStore(memory(), async (_, init) => {
+    if (++attempts === 1) return controlledStream(init.signal).response;
+    return sse([done('다시 받은 답')]);
+  });
+  const pending = store.send('질문');
+  await tick();
+  store.stop();
+  await pending;
+  const question = store.current.messages.at(-1);
+  assert.equal(question.role, 'user');
+  assert.ok(question.error.includes('중지'));
+  assert.ok(store.canRetry(question.id));
+  await store.retry(question.id);
+  assert.equal(store.current.messages.at(-1).content, '다시 받은 답');
+});
+
+test('regenerate replaces only the last answer and does not resend it', async () => {
+  const bodies = [];
+  let count = 0;
+  const store = new ChatStore(memory(), async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return sse([done('답 ' + ++count)]);
+  });
+  await store.send('질문');
+  const first = store.current.messages.at(-1);
+  assert.ok(store.canRegenerate(first.id));
+  await store.regenerate(first.id);
+  assert.deepEqual(store.current.messages.map(m => m.content), ['질문', '답 2']);
+  assert.deepEqual(bodies[1].messages, [{ role: 'user', content: '질문' }]);
+});
+
+test('editing a question discards later turns and asks again', async () => {
+  const bodies = [];
+  const store = new ChatStore(memory(), async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return sse([done('답 ' + bodies.length)]);
+  });
+  await store.send('첫 질문');
+  await store.send('둘째 질문');
+  await store.edit(store.current.messages[0].id, '고친 질문');
+  assert.deepEqual(store.current.messages.map(m => m.content), ['고친 질문', '답 3']);
+  assert.deepEqual(bodies[2].messages, [{ role: 'user', content: '고친 질문' }]);
+});
+
+test('stream error events and truncated streams become retryable failures', async () => {
+  for (const events of [[{ type: 'delta', content: '부분' }, { type: 'error', status: 413,
+    error: { code: 'context_overflow', message: 'too long' } }], [{ type: 'delta', content: '부분' }]]) {
+    const store = new ChatStore(memory(), async () => sse(events));
+    await store.send('질문');
+    assert.equal(store.current.messages.length, 1);
+    assert.ok(store.current.messages[0].error);
+    assert.ok(store.canRetry(store.current.messages[0].id));
+  }
+});
+
+test('reload turns interrupted drafts into stopped answers or retryable questions', () => {
+  const saved = { activeId: 'a', chats: [
+    { id: 'a', title: 'with text', messages: [{ id: 'q', role: 'user', content: 'q', pending: true },
+      { id: 'd', role: 'assistant', content: '절반', streaming: true }] },
+    { id: 'b', title: 'empty', messages: [{ id: 'q2', role: 'user', content: 'q', pending: true },
+      { id: 'd2', role: 'assistant', content: '', streaming: true }] }] };
+  const store = new ChatStore({ getItem: () => JSON.stringify(saved), setItem: () => {} });
+  const [withText, empty] = store.chats;
+  assert.equal(withText.messages[1].stopped, true);
+  assert.equal(withText.messages[0].error, undefined);
+  assert.deepEqual(empty.messages.map(m => m.id), ['q2']);
+  assert.ok(empty.messages[0].error);
+});
+
+test('custom instructions and generation settings are sent and persisted', async () => {
+  const storage = memory();
+  const bodies = [];
+  const store = new ChatStore(storage, async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return sse([done('네')]);
+  });
+  store.updateSettings({ systemPrompt: '항상 존댓말로 답해줘.', temperature: 0.7, maxTokens: 1024 });
+  await store.send('안녕');
+  assert.deepEqual(bodies[0].messages[0], { role: 'system', content: '항상 존댓말로 답해줘.' });
+  assert.equal(bodies[0].temperature, 0.7);
+  assert.equal(bodies[0].max_tokens, 1024);
+  store.updateSettings({ temperature: 9, maxTokens: 1.5 });
+  const restored = new ChatStore(storage);
+  assert.equal(restored.settings.systemPrompt, '항상 존댓말로 답해줘.');
+  assert.equal(restored.settings.temperature, 0.2);
+  assert.equal(restored.settings.maxTokens, 512);
+});
+
+test('rename trims titles and ignores blanks', () => {
+  const store = new ChatStore(memory());
+  const chatId = store.current.id;
+  store.rename(chatId, '   ');
+  assert.equal(store.current.title, '새 대화');
+  store.rename(chatId, '  당뇨   연구  ');
+  assert.equal(store.current.title, '당뇨 연구');
+});
+
+test('event reader handles events split across network chunks', async () => {
+  const text = sseText([{ type: 'delta', content: '한글' }, done('끝')]);
+  const bytes = encoder.encode(text);
+  const body = new ReadableStream({ start(controller) {
+    for (let i = 0; i < bytes.length; i += 7) controller.enqueue(bytes.slice(i, i + 7));
+    controller.close();
+  } });
+  const events = [];
+  for await (const event of readEvents(body)) events.push(event);
+  assert.equal(events.length, 2);
+  assert.equal(events[0].content, '한글');
+});
+
+test('markdown renders tables, quotes, rules, labelled code blocks and bare links', () => {
+  const rendered = renderMarkdown('| 약물 | 효과 |\n|---|:---:|\n| A | **좋음** |\n\n> 인용\n\n---\n'
+    + '자세히는 https://pubmed.ncbi.nlm.nih.gov/1/. 참고\n```js\nconst a = 1;\n```');
+  assert.ok(rendered.includes('<table>'));
+  assert.ok(rendered.includes('<th>약물</th>'));
+  assert.ok(rendered.includes('<td><strong>좋음</strong></td>'));
+  assert.ok(rendered.includes('<blockquote>인용</blockquote>'));
+  assert.ok(rendered.includes('<hr>'));
+  assert.ok(rendered.includes('<a href="https://pubmed.ncbi.nlm.nih.gov/1/" target="_blank" rel="noopener noreferrer">https://pubmed.ncbi.nlm.nih.gov/1/</a>. 참고'));
+  assert.ok(rendered.includes('<span>js</span>'));
+  assert.ok(rendered.includes('class="code-copy"'));
+});
+
+test('bare links cannot break out of the href attribute', () => {
+  const rendered = renderMarkdown('https://x.org/"onmouseover="alert(1)');
+  assert.ok(!rendered.includes('"onmouseover'));
+  assert.ok(!/href="[^"]*"[^>]*onmouseover/.test(rendered));
 });
