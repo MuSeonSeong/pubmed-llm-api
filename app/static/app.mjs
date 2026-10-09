@@ -44,6 +44,8 @@ let followOutput = true;
 let toastTimer;
 let renderQueued = false;
 let pendingFiles = [];
+let speakingId = null;
+const canSpeak = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
 const reasoningOpen = new Map();  // message id -> the user's own expand/collapse choice
 
 function toast(text) {
@@ -254,6 +256,35 @@ function sourceCards(sources) {
   return section;
 }
 
+/** Plain text for speech: no code, tables read cell by cell, links read by their label. */
+function speechText(message) {
+  const holder = element('div');
+  holder.innerHTML = renderMarkdown(withoutCitationList(message.content));
+  holder.querySelectorAll('.code-block').forEach(block => block.replaceWith('코드는 생략합니다. '));
+  holder.querySelectorAll('p, li, h3, h4, blockquote, tr').forEach(node =>
+    node.append(/[.!?。]\s*$/.test(node.textContent) ? ' ' : '. '));  // pause between blocks
+  return holder.textContent.replace(/\s+/g, ' ').replace(/(\.\s*){2,}/g, '. ').trim();
+}
+
+function toggleSpeech(message) {
+  speechSynthesis.cancel();
+  if (speakingId === message.id) { speakingId = null; render(); return; }
+  // Chrome stops long utterances after ~15 seconds, so speak sentence-sized pieces in a queue.
+  const pieces = speechText(message).match(/[^.!?。]+[.!?。]*\s*/g)?.map(piece => piece.trim()).filter(Boolean) || [];
+  if (!pieces.length) return;
+  const lang = /[가-힣]/.test(message.content) ? 'ko-KR' : 'en-US';
+  speakingId = message.id;
+  pieces.forEach((piece, index) => {
+    const utterance = new SpeechSynthesisUtterance(piece);
+    utterance.lang = lang;
+    if (index === pieces.length - 1) utterance.onend = utterance.onerror = () => {
+      if (speakingId === message.id) { speakingId = null; scheduleRender(); }
+    };
+    speechSynthesis.speak(utterance);
+  });
+  render();
+}
+
 function editForm(message) {
   const form = element('form', 'edit-form');
   const field = element('textarea', 'edit-input');
@@ -344,6 +375,12 @@ function renderAssistant(message, chat) {
   if (!message.streaming) {
     const actions = element('div', 'message-actions');
     actions.append(iconButton('copy', '답변 복사', () => copyText(message.content, '답변을 복사했습니다.')));
+    if (canSpeak && message.content.trim()) {
+      const speaking = speakingId === message.id;
+      const speak = iconButton(speaking ? 'stop' : 'speaker', speaking ? '읽기 중지' : '소리 내어 읽기', () => toggleSpeech(message));
+      if (speaking) speak.classList.add('speaking');
+      actions.append(speak);
+    }
     if (store.canSelectVersion(message.id)) {
       const pager = element('div', 'version-pager');
       const index = message.version ?? message.versions.length - 1;
@@ -378,13 +415,18 @@ function renderAssistant(message, chat) {
 function renderMessages() {
   const chat = store.current;
   const switched = lastChatId !== chat.id;
-  if (switched) { nodeCache = new Map(); editingId = null; followOutput = true; }
+  if (switched) {
+    nodeCache = new Map();
+    editingId = null;
+    followOutput = true;
+    if (speakingId) { speechSynthesis.cancel(); speakingId = null; }
+  }
   const nextCache = new Map();
   const nodes = chat.messages.map((message, index) => {
     // Rebuild a message only when its content or available actions change; streaming touches one node.
     // An open edit form is never rebuilt, so typed text and the caret survive unrelated updates.
     const key = editingId === message.id ? 'editing' : JSON.stringify(message) + store.canModify()
-      + (index === chat.messages.length - 1) + chat.usePubmed + reasoningOpen.get(message.id);
+      + (index === chat.messages.length - 1) + chat.usePubmed + reasoningOpen.get(message.id) + (speakingId === message.id);
     const cached = nodeCache.get(message.id);
     const node = cached?.key === key ? cached.node
       : message.role === 'user' ? renderUser(message) : renderAssistant(message, chat);
