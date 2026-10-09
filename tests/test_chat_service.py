@@ -84,7 +84,8 @@ def test_malformed_tool_calls_are_errors(text):
 def test_all_calls_validated_before_execution():
     pub=PubMed()
     with pytest.raises(ServiceError):
-        complete([call()+call('unknown')],pub)
+        # the model keeps sending a batch with an unknown tool through every correction round
+        complete([call()+call('unknown')]*3,pub)
     assert pub.executed == []
 
 
