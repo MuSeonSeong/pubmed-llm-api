@@ -120,8 +120,9 @@ class ModelManager:
             self._vision = (spec.id, processor)
         return self._vision[1]
 
-    def _prepare_inputs(self, spec: ModelSpec, tokenizer, messages, tools, thinking, template) -> dict:
-        """Tokenize the conversation; images become placeholder tokens plus pixel tensors."""
+    @staticmethod
+    def _decode_images(spec: ModelSpec, messages) -> tuple[list, list]:
+        """Decode images and swap them for template placeholders; runs before any model is loaded."""
         images, templated = [], []
         for message in messages:
             if not isinstance(message.get('content'), list):
@@ -135,12 +136,16 @@ class ModelManager:
                     images.append(decode_image(part['image_url']['url']))
                     parts.append({'type': 'image'})
             templated.append({**message, 'content': parts})
+        if images and not spec.vision:
+            raise ServiceError('vision_unsupported', f'{spec.id} cannot read images', 422)
+        return images, templated
+
+    def _prepare_inputs(self, spec: ModelSpec, tokenizer, images, templated, tools, thinking, template) -> dict:
+        """Tokenize the conversation; images become placeholder tokens plus pixel tensors."""
         options = dict(tools=tools or None, enable_thinking=thinking, **template)
         if not images:
             return tokenizer.apply_chat_template(templated, tokenize=True, return_dict=True,
                                                  return_tensors='pt', **options)
-        if not spec.vision:
-            raise ServiceError('vision_unsupported', f'{spec.id} cannot read images', 422)
         processor = self._image_processor(spec)
         features = processor(images=images, return_tensors='pt', max_pixels=MODEL_MAX_PIXELS)
         text = tokenizer.apply_chat_template(templated, tokenize=False, **options)
@@ -172,6 +177,7 @@ class ModelManager:
             if cancel is not None and cancel.is_set():
                 return GenerationResult('', 'cancelled', 0, 0)
             try:
+                images, templated = self._decode_images(self.catalog[model_id], messages)
                 if self._loaded_id != model_id:
                     self._release()
                     self._model, self._tokenizer = self._load(self.catalog[model_id])
@@ -179,7 +185,8 @@ class ModelManager:
                 tokenizer, model = self._tokenizer, self._model
                 template = ({'continue_final_message': True, 'add_generation_prompt': False} if continue_final
                             else {'add_generation_prompt': True})
-                inputs = self._prepare_inputs(self.catalog[model_id], tokenizer, messages, tools, thinking, template)
+                inputs = self._prepare_inputs(self.catalog[model_id], tokenizer, images, templated, tools,
+                                              thinking, template)
                 count = inputs['input_ids'].shape[-1]
                 if count + max_tokens > self.settings.max_context_tokens:
                     raise ServiceError('context_overflow', 'Input plus requested output exceeds context budget',

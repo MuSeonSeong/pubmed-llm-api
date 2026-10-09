@@ -92,3 +92,15 @@ def test_images_expand_to_one_placeholder_per_merged_patch(monkeypatch):
     assert tokenizer.text.count('<|image_pad|>') == 6  # 1*4*6 patches / (2*2) merge
     assert 'pixel_values' in seen and seen['image_grid_thw'].tolist() == [[1, 4, 6]]
     assert result.raw_text == '빨간 사각형'
+
+
+def test_bad_images_fail_before_a_model_is_loaded(monkeypatch):
+    from tests.test_model_manager import manager
+    loads = []
+    obj = manager(monkeypatch, loader=lambda spec: loads.append(spec.id))
+    broken = {'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AAAA'}},
+                                          {'type': 'text', 'text': 'q'}]}
+    with pytest.raises(ServiceError) as e:
+        asyncio.run(obj.generate('qwen3.5-2b', [broken], [], 10, 0))
+    assert e.value.code == 'invalid_image'
+    assert loads == []
