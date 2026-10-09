@@ -6,7 +6,7 @@ services:
     environment:
       DEVICE: cpu
       MODELS_DIR: /app/models
-      MAX_CONTEXT_TOKENS: ${MAX_CONTEXT_TOKENS:-4096}
+      MAX_CONTEXT_TOKENS: ${MAX_CONTEXT_TOKENS:-8192}
       PUBMED_MCP_URL: ${PUBMED_MCP_URL:-https://pubmed.caseyjhand.com/mcp}
     volumes:
       - ./models:/app/models:ro

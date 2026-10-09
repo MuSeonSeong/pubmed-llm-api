@@ -258,3 +258,15 @@ def test_continue_final_uses_the_open_assistant_template(monkeypatch):
     asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0))
     asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0,continue_final=True))
     assert seen == [(True, False), (False, True)]
+
+
+def test_answer_length_shrinks_to_the_room_the_prompt_leaves(monkeypatch):
+    seen=[]
+    class Recording(Model):
+        def generate(self, **kw):
+            seen.append(kw['max_new_tokens'])
+            return super().generate(**kw)
+    obj=manager(monkeypatch,budget=120,loader=lambda spec:(Recording(),Tokenizer()))
+    asyncio.run(obj.generate('qwen3-0.6b',[{'role':'user','content':'hi'}],[],500,0))
+    assert seen == [117]  # 120 budget - 3 prompt tokens
+    assert obj.status()['max_context_tokens'] == 120

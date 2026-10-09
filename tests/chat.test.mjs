@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ATTACHMENT_LIMIT, ChatStore, chatMarkdown, highlight, normalizeSources, readAttachments, readEvents, renderMarkdown,
+import { ATTACHMENT_LIMIT, ChatStore, attachmentTokenBudget, chatMarkdown, estimateTokens, highlight, normalizeSources, readAttachments, readEvents, renderMarkdown,
   withoutCitationList } from '../app/static/chat.mjs';
 
 const memory = () => {
@@ -55,7 +55,7 @@ test('failed requests preserve input and retry sends the question exactly once',
   });
   await store.send('질문');
   const question = store.current.messages[0];
-  assert.ok(question.error.includes('새 대화'));
+  assert.ok(question.error.includes('한도'));
   assert.equal(store.busy, false);
   await store.retry(question.id);
   assert.deepEqual(requests[1].messages, [{ role: 'user', content: '질문' }]);
@@ -384,7 +384,7 @@ test('thinking mode streams reasoning separately and raises the token floor', as
   store.current.thinking = true;
   await store.send('2+2?');
   assert.equal(body.thinking, true);
-  assert.equal(body.max_tokens, 1024);
+  assert.equal(body.max_tokens, 2048);
   const answer = store.current.messages.at(-1);
   assert.equal(answer.reasoning, '더해 보면 4');
   assert.ok(Number.isFinite(answer.thinkMs));
@@ -782,4 +782,42 @@ test('code fences named after object properties render as plain code', () => {
   for (const name of ['constructor', '__proto__', 'toString']) {
     assert.ok(renderMarkdown('```' + name + '\nlet x = 1\n```').includes('let x = 1'));
   }
+});
+
+
+test('attachment budgets count estimated tokens, so Korean text is cut sooner than English', async () => {
+  const file = (name, text) => ({ name, text: async () => text });
+  const budget = attachmentTokenBudget(8192);
+  const [english] = await readAttachments([file('en.txt', 'word '.repeat(2000))], 0, budget);
+  const [korean] = await readAttachments([file('ko.txt', '한국어 문장입니다 '.repeat(2000))], 0, budget);
+  assert.equal(english.truncated, false);
+  assert.equal(korean.truncated, true);
+  assert.ok(estimateTokens(korean.text) <= budget);
+  assert.ok(korean.text.length < english.text.length);
+});
+
+test('regenerating without thinking turns reasoning off for the chat', async () => {
+  const bodies = [];
+  const store = new ChatStore(memory(), async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return bodies.length === 1
+      ? sse([{ type: 'done', choices: [{ message: { content: '', reasoning_content: '길게 생각' }, finish_reason: 'length' }] }])
+      : sse([done('바로 답')]);
+  });
+  store.current.thinking = true;
+  await store.send('질문');
+  await store.regenerate(store.current.messages.at(-1).id, { thinking: false });
+  assert.equal(bodies[1].thinking, undefined);
+  assert.equal(store.current.thinking, false);
+  assert.equal(store.current.messages.at(-1).content, '바로 답');
+});
+
+test('a continuation interrupted by a closed tab keeps its citation list when settled', async () => {
+  const saved = { activeId: 'c', chats: [{ id: 'c', title: 't', messages: [
+    { id: 'q', role: 'user', content: 'q', pending: true },
+    { id: 'a', role: 'assistant', content: '봄에는 꽃이', streaming: true, pendingTail: '\n\nPubMed 검색·조회 출처:\n- PMID [1](u)' }] }] };
+  const store = new ChatStore({ getItem: () => JSON.stringify(saved), setItem: () => {} });
+  await store.refreshLive();
+  assert.equal(store.current.messages[1].content, '봄에는 꽃이\n\nPubMed 검색·조회 출처:\n- PMID [1](u)');
+  assert.equal(store.current.messages[1].pendingTail, undefined);
 });

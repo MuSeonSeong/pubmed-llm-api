@@ -15,7 +15,7 @@ const id = () => globalThis.crypto.randomUUID();
 const freshChat = () => ({ id: id(), title: '새 대화', model: MODELS[0],
   usePubmed: true, thinking: false, messages: [], updatedAt: Date.now(), rev: Date.now() });
 /** Reasoning spends tokens before the answer starts, so thinking requests get a larger floor. */
-export const THINKING_MIN_TOKENS = 1024;
+export const THINKING_MIN_TOKENS = 2048;  // the server shortens it if the prompt leaves less room
 const STOPPED = '답변 생성을 중지했습니다.';
 
 function normalizeTools(calls) {
@@ -67,15 +67,29 @@ export function messageText(message) {
 }
 
 /** Read text files for attaching; the total across files stays within ATTACHMENT_LIMIT. */
-export async function readAttachments(files, used = 0) {
+/** Rough token count for Qwen tokenizers: Hangul costs far more per character than Latin text. */
+export function estimateTokens(text) {
+  const hangul = (text.match(/[\u3131-\u318e\uac00-\ud7a3]/g) || []).length;
+  return Math.ceil(hangul * 0.75 + (text.length - hangul) / 3.6);
+}
+
+/** Share of the model's context that attachments may use, leaving room for tools, reasoning and the answer. */
+export const attachmentTokenBudget = contextTokens => Math.round(contextTokens * 0.42);
+
+/** Read text files for attaching within a shared budget of characters and estimated tokens. */
+export async function readAttachments(files, used = 0, tokenBudget = attachmentTokenBudget(8192), usedTokens = 0) {
   const result = [];
-  let budget = ATTACHMENT_LIMIT - used;
+  let chars = ATTACHMENT_LIMIT - used;
+  let tokens = tokenBudget - usedTokens;
   for (const file of files) {
-    if (budget <= 0) break;
+    if (chars <= 0 || tokens <= 0) break;
     const text = (await file.text()).replace(/\r\n/g, '\n');
     if (text.includes('\u0000')) throw new Error(file.name + '은(는) 텍스트 파일이 아닙니다.');
-    result.push({ name: file.name, text: text.slice(0, budget), truncated: text.length > budget });
-    budget -= Math.min(text.length, budget);
+    const perChar = text.length ? estimateTokens(text) / text.length : 0;
+    const keep = Math.min(text.length, chars, perChar ? Math.floor(tokens / perChar) : text.length);
+    result.push({ name: file.name, text: text.slice(0, keep), truncated: text.length > keep });
+    chars -= keep;
+    tokens -= estimateTokens(text.slice(0, keep));
   }
   return result;
 }
@@ -131,6 +145,8 @@ function restoreChat(chat) {
       toolCalls: normalizeTools(message.toolCalls), truncated: message.truncated === true,
       stopped: message.stopped === true,
       ...(message.role === 'assistant' && message.streaming === true ? { streaming: true } : {}),
+      ...(message.streaming === true && typeof message.pendingTail === 'string' && message.pendingTail
+        ? { pendingTail: message.pendingTail } : {}),
       ...(Number.isInteger(message.dropped) && message.dropped > 0 ? { dropped: message.dropped } : {}),
       ...(typeof message.reasoning === 'string' && message.reasoning ? { reasoning: message.reasoning } : {}),
       ...(Number.isFinite(message.thinkMs) && message.thinkMs >= 0 ? { thinkMs: message.thinkMs } : {}),
@@ -164,6 +180,8 @@ function settleInterrupted(chat) {
     if (message.streaming) {
       delete message.streaming;
       message.stopped = true;
+      if (message.pendingTail) message.content += message.pendingTail;
+      delete message.pendingTail;
     }
     if (message.pending) {
       delete message.pending;
@@ -177,7 +195,7 @@ function settleInterrupted(chat) {
 
 function errorMessage(error, status) {
   const hints = {
-    context_overflow: '대화가 모델의 길이 한도를 넘었습니다. 새 대화를 시작하거나 질문을 줄여 주세요.',
+    context_overflow: '질문·첨부·논문 검색 결과를 합친 길이가 모델의 한도를 넘었습니다. 첨부를 줄이거나, PubMed 검색·추론을 끄거나, 설정에서 답변 길이를 줄여 보세요.',
     model_missing: '모델 파일이 없습니다. 서버에서 모델 준비를 완료해 주세요.',
     device_unavailable: '설정된 실행 장치를 사용할 수 없습니다.',
     pubmed_timeout: 'PubMed 연결 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.',
@@ -478,12 +496,13 @@ export class ChatStore {
   }
 
   /** Ask again, keeping earlier answers as versions; if the new attempt fails the old answer returns. */
-  async regenerate(messageId, { model } = {}) {
+  async regenerate(messageId, { model, thinking } = {}) {
     if (!this.canRegenerate(messageId)) return;
     const chat = this.current;
     const release = await this.claim(chat);
     if (!release) return;
     if (MODELS.includes(model)) chat.model = model;  // "try again with another model" switches the chat
+    if (thinking === false) chat.thinking = false;
     const previous = chat.messages.pop();
     const versions = previous.versions?.length ? previous.versions : [snapshot(previous)];
     return this.request(chat, chat.messages.at(-1), { versions, fallback: previous, release });
@@ -573,6 +592,7 @@ export class ChatStore {
     if (continueFrom) {
       draft = continueFrom;  // stream straight into the answer being extended
       draft.content = answerText;
+      draft.pendingTail = citationTail;  // so a tab that settles this interrupted answer can restore it
       delete draft.truncated;
       delete draft.stopped;
       draft.streaming = true;
@@ -670,6 +690,7 @@ export class ChatStore {
       if (draft.thinkStart && draft.thinkMs === undefined) draft.thinkMs = Date.now() - draft.thinkStart;
       if (finished) draft.elapsedMs = Date.now() - started + (base?.elapsedMs || 0);
       delete draft.thinkStart;
+      delete draft.pendingTail;
       delete draft.streaming;
       delete draft.stage;
       draft.toolCalls = normalizeTools(draft.toolCalls.map(({ running, ...call }) => call));

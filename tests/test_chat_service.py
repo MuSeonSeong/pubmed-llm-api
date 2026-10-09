@@ -382,3 +382,19 @@ def test_continue_final_requires_a_trailing_assistant_message():
     from app.schemas import ChatRequest
     with pytest.raises(ValidationError):
         ChatRequest(messages=[{'role':'user','content':'q'}],continue_final=True)
+
+
+def test_fetched_articles_are_slimmed_for_the_model_but_keep_source_fields():
+    from app.chat_service import slim_tool_result, collect_sources
+    from app.schemas import ToolTrace
+    article={'pmid':'1','title':'T','abstractText':'a'*3000,'affiliations':['x'*500],'articleDates':[{'year':'2020'}],
+             'authors':[{'lastName':f'L{i}','initials':'I','affiliationIndices':[0]} for i in range(9)],
+             'journalInfo':{'isoAbbreviation':'J','eIssn':'1','publicationDate':{'year':'2020','month':'Mar'}},
+             'recordType':'journal-article','pubmedUrl':'https://pubmed.ncbi.nlm.nih.gov/1/'}
+    slim=slim_tool_result('pubmed_fetch_articles',{'articles':[article],'totalReturned':1})
+    a=slim['articles'][0]
+    assert 'affiliations' not in a and 'articleDates' not in a and len(a['authors']) == 6
+    assert len(a['abstractText']) < 2600 and slim['totalReturned'] == 1
+    source,=collect_sources([ToolTrace(name='pubmed_fetch_articles',arguments={},result=slim)])
+    assert (source.journal,source.year,source.abstract_fetched) == ('J','2020',True)
+    assert slim_tool_result(SEARCH,{'pmids':['1']}) == {'pmids':['1']}

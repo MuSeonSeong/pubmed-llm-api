@@ -21,6 +21,32 @@ class ToolCall:
     arguments: dict
 
 
+ABSTRACT_CHARS = 2500
+
+
+def slim_tool_result(name: str, data: dict) -> dict:
+    """Keep what the model needs from fetched articles; affiliations and date lists cost tokens for nothing."""
+    if name != 'pubmed_fetch_articles' or not isinstance(data, dict) or not isinstance(data.get('articles'), list):
+        return data
+    articles = []
+    for article in data['articles']:
+        if not isinstance(article, dict):
+            continue
+        journal = article.get('journalInfo') if isinstance(article.get('journalInfo'), dict) else {}
+        date = journal.get('publicationDate') if isinstance(journal.get('publicationDate'), dict) else {}
+        authors = article.get('authors') if isinstance(article.get('authors'), list) else []
+        abstract = article.get('abstractText') if isinstance(article.get('abstractText'), str) else ''
+        slim = {'pmid': article.get('pmid'), 'title': article.get('title'),
+                'journalInfo': {'isoAbbreviation': journal.get('isoAbbreviation') or journal.get('title'),
+                                'publicationDate': {'year': date.get('year')}},
+                'authors': [{'lastName': a.get('lastName'), 'initials': a.get('initials')}
+                            for a in authors[:6] if isinstance(a, dict)],
+                'doi': article.get('doi'), 'publicationTypes': article.get('publicationTypes'),
+                'abstractText': abstract[:ABSTRACT_CHARS] + (' …' if len(abstract) > ABSTRACT_CHARS else '')}
+        articles.append({key: value for key, value in slim.items() if value not in (None, '', [])})
+    return {**{key: value for key, value in data.items() if key != 'articles'}, 'articles': articles}
+
+
 def parse_tool_calls(raw_text: str, tools: list[dict] | None = None) -> list[ToolCall]:
     blocks = re.findall(r'<tool_call>(.*?)</tool_call>', raw_text, re.S)
     if raw_text.count('<tool_call>') != len(blocks) or raw_text.count('</tool_call>') != len(blocks):
@@ -317,7 +343,7 @@ class ChatService:
                         notify({'type': 'tool', 'status': 'error', 'name': call.name, 'arguments': args,
                                 'error': exc.message})
                         raise
-                    content = format_tool_result(data)
+                    content = format_tool_result(slim_tool_result(call.name, data))
                     # Return the same bounded evidence that the model actually saw.
                     traces.append(ToolTrace(name=call.name, arguments=args, result=json.loads(content)))
                     notify({'type': 'tool', 'status': 'done', 'name': call.name, 'arguments': args})

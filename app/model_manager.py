@@ -26,6 +26,9 @@ def select_device(requested: str, *, cuda_available: bool, mps_available: bool) 
         raise ServiceError('device_unavailable', f'Device {requested} is unavailable', 503)
     return requested
 
+MIN_OUTPUT_TOKENS = 64  # below this an answer is not worth starting, so overflow is reported instead
+
+
 class TextCallbackStreamer:
     """Report the cumulative decoded completion, starting with '' once the prompt is accepted."""
     def __init__(self, tokenizer, on_text: Callable[[str], None]):
@@ -66,6 +69,7 @@ class ModelManager:
 
     def status(self) -> dict:
         return {'device': self.device, 'loaded_model': self._loaded_id, 'busy': self._lock.locked(),
+                'max_context_tokens': self.settings.max_context_tokens,
                 'model_files': {name: self._files_available(self.settings.models_dir / spec.directory)
                                 for name, spec in self.catalog.items()}}
 
@@ -201,10 +205,13 @@ class ModelManager:
                 inputs = self._prepare_inputs(self.catalog[model_id], tokenizer, images, templated, tools,
                                               thinking, template)
                 count = inputs['input_ids'].shape[-1]
-                if count + max_tokens > self.settings.max_context_tokens:
+                room = self.settings.max_context_tokens - count
+                if room < min(max_tokens, MIN_OUTPUT_TOKENS):
                     raise ServiceError('context_overflow', 'Input plus requested output exceeds context budget',
                                        413, {'prompt_tokens': count, 'max_tokens': max_tokens,
                                              'limit': self.settings.max_context_tokens})
+                # Shorten the answer rather than refuse it; finish_reason 'length' lets clients continue.
+                max_tokens = min(max_tokens, room)
                 inputs = {name: value.to(self.device) for name, value in inputs.items()}
                 if 'pixel_values' in inputs:
                     inputs['pixel_values'] = inputs['pixel_values'].to(getattr(model, 'dtype', torch.float32))

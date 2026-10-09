@@ -9,7 +9,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ROOT / '.env', extra='ignore')
     device: Literal['auto', 'cuda', 'mps', 'cpu'] = 'auto'
     models_dir: Path = ROOT / 'models'
-    max_context_tokens: int = Field(default=4096, ge=1, le=8192)
+    # Attachments, images, PubMed abstracts and reasoning all share this budget.
+    max_context_tokens: int = Field(default=8192, ge=1, le=8192)
     pubmed_mcp_url: str = 'https://pubmed.caseyjhand.com/mcp'
 
     @field_validator('models_dir')

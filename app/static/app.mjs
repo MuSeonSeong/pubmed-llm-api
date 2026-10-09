@@ -1,5 +1,5 @@
-import { ATTACHMENT_LIMIT, ChatStore, MAX_ATTACHMENTS, MAX_IMAGES, MODEL_LABELS, VISION_MODELS, chatMarkdown, isImage, readAttachments,
-  renderMarkdown, withoutCitationList } from './chat.mjs';
+import { ATTACHMENT_LIMIT, ChatStore, MAX_ATTACHMENTS, MAX_IMAGES, MODEL_LABELS, VISION_MODELS, attachmentTokenBudget,
+  chatMarkdown, estimateTokens, isImage, readAttachments, renderMarkdown, withoutCitationList } from './chat.mjs';
 
 const $ = id => document.getElementById(id);
 const icon = name => {
@@ -44,6 +44,7 @@ let followOutput = true;
 let toastTimer;
 let renderQueued = false;
 let pendingFiles = [];
+let contextTokens = 8192;  // updated from /health
 let speakingId = null;
 const canSpeak = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
 const reasoningOpen = new Map();  // message id -> the user's own expand/collapse choice
@@ -378,8 +379,9 @@ function renderAssistant(message, chat) {
   if (message.stopped) body.append(element('div', 'truncated-note', '답변 생성을 중지했습니다.'));
   if (message.dropped) body.append(element('div', 'truncated-note',
     '대화가 길어 앞부분 메시지 ' + message.dropped + '개는 참고하지 않고 답했어요. 새 주제라면 새 대화를 시작해 보세요.'));
-  if (message.truncated) body.append(element('div', 'truncated-note',
-    '답변 길이 한도에 도달했습니다. 아래 “이어서 생성”을 누르거나 설정에서 답변 길이를 늘려 보세요.'));
+  if (message.truncated) body.append(element('div', 'truncated-note', !message.content.trim() && message.reasoning
+    ? '생각하는 데 답변 길이를 모두 써서 답을 쓰지 못했어요. 추론 없이 다시 생성하거나 설정에서 답변 길이를 늘려 보세요.'
+    : '답변 길이 한도에 도달했습니다. 아래 “이어서 생성”을 누르거나 설정에서 답변 길이를 늘려 보세요.'));
   if (!message.streaming && message.sources?.length) body.append(sourceCards(message.sources));
   if (!message.streaming && message.toolCalls.length) body.append(toolDetails(message.toolCalls, false));
   article.append(body);
@@ -402,6 +404,13 @@ function renderAssistant(message, chat) {
       pager.append(back, element('span', '', (index + 1) + ' / ' + message.versions.length), next);
       actions.append(pager);
     }
+    if (store.canRegenerate(message.id) && message.truncated && !message.content.trim() && message.reasoning) {
+      const plain = element('button', 'continue-button');
+      plain.type = 'button';
+      plain.append(icon('refresh'), document.createTextNode('추론 없이 다시 생성'));
+      plain.addEventListener('click', () => { followOutput = true; store.regenerate(message.id, { thinking: false }); });
+      actions.append(plain);
+    }
     if (store.canContinue(message.id)) {
       const more = element('button', 'continue-button');
       more.type = 'button';
@@ -411,8 +420,10 @@ function renderAssistant(message, chat) {
     }
     if (store.canRegenerate(message.id)) {
       actions.append(iconButton('refresh', '답변 다시 생성', () => { followOutput = true; store.regenerate(message.id); }));
+      const question = store.current.messages.at(-2);
+      const asksAboutImages = question?.attachments?.some(isImage);
       for (const [model, label] of Object.entries(MODEL_LABELS)) {
-        if (model === store.current.model) continue;
+        if (model === store.current.model || (asksAboutImages && !VISION_MODELS.includes(model))) continue;
         const other = element('button', 'other-model-button', label + '로 다시');
         other.type = 'button';
         other.title = label + ' 모델로 같은 질문에 다시 답하게 합니다';
@@ -529,7 +540,10 @@ async function attachFiles(files) {
   const images = files.filter(file => file.type.startsWith('image/'));
   const pdfs = files.filter(isPdf);
   const texts = files.filter(file => !file.type.startsWith('image/') && !isPdf(file));
-  const used = pendingFiles.filter(file => !isImage(file)).reduce((sum, file) => sum + file.text.length, 0);
+  const pendingTexts = pendingFiles.filter(file => !isImage(file));
+  const used = pendingTexts.reduce((sum, file) => sum + file.text.length, 0);
+  const usedTokens = pendingTexts.reduce((sum, file) => sum + estimateTokens(file.text), 0);
+  const tokenBudget = attachmentTokenBudget(contextTokens);
   try {
     const slots = () => MAX_ATTACHMENTS - pendingFiles.length;
     const room = Math.min(MAX_IMAGES - pendingFiles.filter(isImage).length, slots());
@@ -545,11 +559,11 @@ async function attachFiles(files) {
       for (const file of pdfs.slice(0, Math.max(0, slots() - texts.length))) texts.push(await readPdf(file));
     }
     if (texts.length) {
-      if (used >= ATTACHMENT_LIMIT) toast('텍스트 첨부는 모두 합쳐 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지예요.');
+      if (used >= ATTACHMENT_LIMIT || usedTokens >= tokenBudget) toast('텍스트 첨부가 모델이 읽을 수 있는 길이를 다 채웠어요.');
       else {
-        const added = await readAttachments(texts.slice(0, Math.max(0, slots())), used);
+        const added = await readAttachments(texts.slice(0, Math.max(0, slots())), used, tokenBudget, usedTokens);
         pendingFiles.push(...added);
-        if (added.some(file => file.truncated)) toast('파일이 길어 앞부분 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지만 첨부했어요.');
+        if (added.some(file => file.truncated)) toast('파일이 길어 모델이 읽을 수 있는 앞부분(약 ' + tokenBudget.toLocaleString() + '토큰)만 첨부했어요.');
       }
     }
   } catch (error) { toast(error.message || '파일을 읽을 수 없습니다.'); }
@@ -611,6 +625,10 @@ window.addEventListener('storage', event => { if (event.key === 'pubmed-chat.v1'
 $('chat-form').addEventListener('submit', event => {
   event.preventDefault();
   if (!store.canModify() || (!prompt.value.trim() && !pendingFiles.length)) return;
+  if (pendingFiles.some(isImage) && !VISION_MODELS.includes(store.current.model)) {
+    store.updateChat({ model: VISION_MODELS[0] });  // never send a picture to a model that cannot see it
+    toast('이미지를 이해할 수 있는 ' + MODEL_LABELS[VISION_MODELS[0]] + ' 모델로 바꿨어요.');
+  }
   const content = prompt.value;
   const files = pendingFiles;
   prompt.value = '';
@@ -675,7 +693,13 @@ $('messages').addEventListener('click', event => {
   button.textContent = '복사됨';
   setTimeout(() => { button.textContent = '복사'; }, 1500);
 });
-$('model').addEventListener('change', event => store.updateChat({ model: event.target.value }));
+$('model').addEventListener('change', event => {
+  store.updateChat({ model: event.target.value });
+  const hasImages = store.current.messages.some(message => message.attachments?.some(isImage));
+  if (hasImages && !VISION_MODELS.includes(event.target.value)) {
+    toast(MODEL_LABELS[event.target.value] + '은(는) 이미지를 볼 수 없어 이 대화의 이미지는 빼고 보내요.');
+  }
+});
 $('use-pubmed').addEventListener('change', event => store.updateChat({ usePubmed: event.target.checked }));
 $('use-thinking').addEventListener('change', event => store.updateChat({ thinking: event.target.checked }));
 $('chat-search').addEventListener('input', renderHistory);
@@ -782,6 +806,7 @@ async function checkServer() {
     const ready = health.ready_for_chat;
     $('server-status').classList.toggle('offline', !ready);
     $('server-status').lastElementChild.textContent = ready ? '서버 연결됨' : '모델 준비 필요';
+    if (Number.isInteger(health.inference?.max_context_tokens)) contextTokens = health.inference.max_context_tokens;
     const loaded = health.inference?.loaded_model;
     $('server-status').title = '실행 장치: ' + String(health.inference?.device || '?').toUpperCase()
       + ' · 메모리의 모델: ' + (MODEL_LABELS[loaded] || '없음 (첫 질문 때 불러옵니다)')
