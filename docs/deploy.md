@@ -20,14 +20,21 @@ Cloudflare       HTTPS 인증서, 공격 차단
 cloudflared      이 PC에서 실행되는 터널 프로그램
       │          http://127.0.0.1:8000 (이 PC 안에서만 오가는 연결)
       ▼
-앱               scripts/serve.py가 실행하는 FastAPI 서버와 Qwen 모델 (프로세스 1개)
+앱               scripts/serve.py가 실행하는 FastAPI 서버 (프로세스 1개)
+      │          이 사용자 전용 폴더의 Unix 소켓 (포트 없음, 앱만 아는 키가 있어야 응답)
+      ▼
+모델 서버        앱이 모델마다 띄우는 MLX 사이드카: Qwen3.5 9B는 늘, 4B는 쓸 때만 (맥 기본값)
       │
       ▼
 data/chat.db     SQLite: 계정, 로그인 세션, 대화, 설정
 data/files/      첨부한 이미지
+data/kv-cache/   모델 서버의 캐시 폴더 (KV_CACHE_GB를 켰을 때만 대화에서 만든 캐시가 쌓임)
+data/logs/       서버 로그와 모델 서버 로그(mlx-<모델>.log)
 ```
 
 - 앱은 `127.0.0.1`, 즉 이 PC 자신에게서 오는 접속만 받습니다. 바깥 요청은 모두 Cloudflare와 cloudflared를 거쳐 들어오므로 공유기 설정을 바꿀 필요가 없습니다.
+- 모델 서버(사이드카)는 TCP 포트를 열지 않고 Unix 소켓에서만 듣습니다. 소켓은 앱이 실행될 때마다 새로 만드는 폴더(`$TMPDIR/pubmed-mlx-XXXXXXXX/`, 권한 700)에 있어 서버를 실행한 사용자만 열 수 있고, 앱이 끝나면 지워집니다. 그래서 바깥에서는 물론 이 PC의 다른 사용자나 브라우저의 웹 페이지도 모델에 닿지 못하며, 다른 프로그램과 포트가 겹칠 일도 없습니다. 앱이 시작할 때마다 새로 만들어 환경 변수로만 넘기는 키가 없는 요청도 거절합니다. 앱이 꺼지거나 죽으면 모델 서버도 함께 끝납니다.
+- 계정 모드에서는 모델 서버의 캐시를 계정마다 나눠, 응답 시간으로 다른 계정의 프롬프트나 이미지를 알아낼 수 없게 합니다. 접두 캐시는 계정 ID와 계정을 만든 시각으로 나누므로, 지운 계정의 ID를 새 계정이 다시 받아도 캐시를 함께 쓰지 않습니다. 이미지 특징 캐시는 이미지 내용으로만 찾기 때문에 계정 모드에서는 끕니다.
 - 대화의 원본은 서버의 `data/chat.db`에 계정별로 저장됩니다. 브라우저는 화면을 빨리 띄우려고 사본(캐시)만 가지고 있으므로, 다른 기기에서 같은 계정으로 로그인해도 같은 대화가 보입니다.
 - `data/`는 `.gitignore`에 들어 있어 Git에 올라가지 않습니다. 비밀번호 해시와 대화가 들어 있으니 다른 곳에 올리지 마세요.
 
@@ -69,7 +76,9 @@ uv run python scripts/prepare_models.py
 
 - 서버 PC는 전원에 연결해 두고, 맥북이라면 덮개를 연 채로 둡니다.
 - 프로젝트 폴더를 `문서`, `데스크톱`, `다운로드` 폴더 안에 두지 마세요. macOS 개인정보 보호 때문에 자동으로 켜진 서버가 그 폴더의 파일을 읽지 못하거나 허용을 묻는 창이 뜰 수 있습니다.
-- 맥에서는 Docker 대신 이 문서처럼 직접 실행하세요. 맥의 Docker는 Linux CPU로 돌아 GPU(MPS)를 쓰지 못하므로 훨씬 느립니다.
+- 맥에서는 MLX 모델 두 개(Qwen3.5 9B·4B, 합쳐 약 9 GB)를 받습니다. 하나만 쓰려면 `.env`에 `MODELS=qwen3.5-9b`처럼 적은 뒤 준비하세요(README의 "모델 고르기").
+- 메모리: 기본 모델인 9B(약 6.2 GB, 여기에 대화 길이만큼의 캐시)만 서버가 켜져 있는 동안 계속 메모리에 있습니다. 4B(가중치 약 3 GB)는 누군가 4B로 질문할 때 불러오고(약 6~7초) 10분 동안 질문이 없으면 다시 끕니다(`PRELOAD_MODELS`, `MLX_IDLE_MINUTES`). 두 모델을 함께 두면 16 GB 맥에서는 쉬는 동안 macOS가 9B를 스왑으로 내보내, 이 맥북 에어(평소 앱을 띄운 채)에서 150초 쉰 뒤 9B의 첫 토큰이 22.7초 걸렸습니다(9B만 두면 0.19초·0.54초). 두 모델을 늘 올려 두려면 `.env`에 `PRELOAD_MODELS=all`을 적습니다. 모델을 바꿀 때 기다리지 않는 대신 메모리를 4B만큼 더 쓰고, 쉬고 난 뒤의 첫 답변이 크게 늦을 수 있습니다(README의 "MLX 런타임"). 16 GB 맥이면 서버로 쓰는 동안 큰 프로그램을 함께 띄우지 마세요. 메모리가 더 적다면 `MODELS=qwen3.5-4b`로 하나만 씁니다.
+- 맥에서는 Docker 대신 이 문서처럼 직접 실행하세요. 맥의 Docker는 Linux라 MLX와 GPU를 쓰지 못하므로 Transformers 모델을 CPU로 돌려 훨씬 느립니다.
 
 ## 1. 계정 만들기
 
@@ -114,7 +123,7 @@ uv run python scripts/serve.py
 2. 로그인할 수 있는 계정이 하나도 없으면 실행하지 않고 계정 만드는 방법을 알려 줍니다.
 3. `127.0.0.1:8000`에서만 접속을 받습니다. 인터넷에서 오는 요청은 cloudflared가 이 주소로 전달합니다.
 4. 서버가 켜져 있는 동안 맥이 저절로 잠들지 않게 합니다(`caffeinate -i`).
-5. 서버 프로세스(워커)는 하나만 띄웁니다. 프로세스마다 모델을 따로 메모리에 올리기 때문입니다.
+5. 서버 프로세스(워커)는 하나만 띄웁니다. 워커마다 모델을 따로 메모리에 올리기 때문입니다. 서버가 켜지면 모델 서버가 기본 모델을 불러오며(약 6~9초), 그동안 화면의 모델 메뉴에는 "준비 중…"으로 보입니다. 다른 모델은 메뉴에 "첫 질문 때 불러와요"로 보이고, 그 모델로 처음 질문할 때 불러옵니다.
 6. `127.0.0.1`에서 온 `X-Forwarded-For`·`X-Forwarded-Proto` 헤더만 믿습니다. 그래서 로그인 시도 제한이 실제 접속자 IP를 기준으로 동작하고, https로 접속하면 로그인 쿠키에 `Secure`가 붙습니다.
 
 브라우저로 <http://127.0.0.1:8000>을 열면 로그인 화면이 나옵니다. 만든 계정으로 로그인해 보세요. 끝내려면 터미널에서 Ctrl+C를 누릅니다.
@@ -139,7 +148,7 @@ bash deploy/macos/install-launch-agent.sh --dry-run   # 만들 설정 파일을 
 bash deploy/macos/install-launch-agent.sh             # 등록하고 바로 시작합니다
 ```
 
-설치 스크립트는 먼저 계정이 있는지 확인하고, 없으면 등록하지 않습니다. 그다음 로그인할 때 이 프로젝트 폴더에서 `uv run python scripts/serve.py`를 실행하라는 설정 파일을 만들고(launchd는 PATH가 짧아 uv를 절대 경로로 적습니다), `launchctl bootstrap`으로 등록한 뒤 `launchctl kickstart`로 바로 시작합니다. 서버 로그는 `data/logs/`에 쌓입니다. sudo 없이 실행하세요. 등록하면 macOS가 "백그라운드 항목이 추가됨" 알림을 띄울 수 있습니다. 시스템 설정 › 일반 › 로그인 항목(및 확장 프로그램)에서 이 항목(이름이 uv로 보일 수 있습니다)의 백그라운드 실행을 끄면 서버가 켜지지 않습니다.
+설치 스크립트는 먼저 계정이 있는지 확인하고, 없으면 등록하지 않습니다. 그다음 로그인할 때 이 프로젝트 폴더에서 `uv run python scripts/serve.py`를 실행하라는 설정 파일을 만들고(launchd는 PATH가 짧아 uv를 절대 경로로 적습니다), `launchctl bootstrap`으로 등록한 뒤 `launchctl kickstart`로 바로 시작합니다. 서버 로그는 `data/logs/`에 쌓이고, 모델 서버의 로그는 같은 곳의 `mlx-<모델>.log`입니다(시작할 때 20 MB를 넘었으면 비웁니다). sudo 없이 실행하세요. 등록하면 macOS가 "백그라운드 항목이 추가됨" 알림을 띄울 수 있습니다. 시스템 설정 › 일반 › 로그인 항목(및 확장 프로그램)에서 이 항목(이름이 uv로 보일 수 있습니다)의 백그라운드 실행을 끄면 서버가 켜지지 않습니다.
 
 **이렇게 동작합니다**
 
@@ -157,8 +166,11 @@ launchctl print gui/$(id -u)/com.pubmedchat.server | grep -E 'state =|pid =|last
 curl http://127.0.0.1:8000/health      # {"status":"ok"}가 나오면 정상
 tail -n 50 data/logs/server.log        # 서버 시작·종료·오류 메시지
 tail -f data/logs/access.log           # 접속 기록을 실시간으로 (그만 보려면 Ctrl+C)
+tail -n 20 data/logs/mlx-qwen3.5-9b.log  # 모델 서버(사이드카)의 시작·오류
 pmset -g assertions | grep caffeinate  # 잠자기 방지가 걸려 있는지
 ```
+
+`/health`에 로그인한 채로 접속하면(브라우저에서 `https://chat.example.com/health`) `inference.models`에서 모델마다 상태(`starting`, `ready`, `failed`, 아직 띄우지 않았거나 쉬어서 끈 `stopped` 등)와 실패 이유를 볼 수 있습니다. 쉬어서 끈 모델은 `data/logs/server.log`에 `stopped <모델> after N min idle`로 남습니다.
 
 `state = running`이면 실행 중입니다. 로그 파일은 계속 커지므로 가끔 `du -h data/logs`로 크기를 확인하고, 크면 `: > data/logs/access.log`로 비우세요. 서버가 켜져 있어도 비울 수 있습니다.
 
@@ -270,6 +282,8 @@ Cloudflare Tunnel과 Tailscale은 이 PC에서 바깥으로 나가는 연결만 
 - [ ] 친구마다 계정을 따로 만들고, 계정을 함께 쓰지 않습니다.
 - [ ] 비밀번호는 12자 이상, 다른 사이트에서 쓰지 않는 것으로 정합니다. 비밀번호 관리자가 만들어 주는 무작위 비밀번호가 좋습니다.
 - [ ] 앱은 `127.0.0.1`에만 엽니다(기본값). 공개 서버에서는 `--allow-lan`과 공유기 포트포워딩을 쓰지 않습니다.
+- [ ] 모델 서버는 포트 없이 이 사용자 전용 폴더의 Unix 소켓에서만 듣습니다. 이 PC를 다른 사람과 같은 macOS 사용자로 함께 쓰지 마세요. 같은 사용자의 프로그램은 그 폴더를 열 수 있습니다(요청에는 여전히 키가 필요합니다).
+- [ ] 접두 캐시의 디스크 계층(`KV_CACHE_GB`)은 기본으로 꺼져 있어 캐시가 메모리에만 있습니다. 켜면 mlx-vlm이 프롬프트의 토큰 ID(그대로 글로 되돌릴 수 있음)를 `data/kv-cache/`에 평문으로 저장하고, 대화나 계정을 지워도 그 캐시는 용량 한도에 밀려날 때까지 남습니다. 켰다면 `data/kv-cache/`를 `chat.db`처럼 다루고, 계정을 지운 뒤에는 서버를 멈추고 `data/kv-cache/`를 지우세요.
 - [ ] 터널 토큰과 `~/.cloudflared/`의 인증 파일은 비밀번호처럼 다룹니다.
 - [ ] 쓰지 않는 계정은 `users.py remove`로 지우고, 비밀번호가 새었다고 의심되면 `users.py passwd`로 바꿉니다.
 - [ ] macOS, cloudflared(`brew upgrade cloudflared`), 이 프로젝트를 최신으로 유지합니다(아래 "업데이트").
@@ -280,7 +294,7 @@ Cloudflare Tunnel과 Tailscale은 이 PC에서 바깥으로 나가는 연결만 
 
 ## 6. 백업과 복원
 
-백업할 것은 `data/chat.db`(계정·대화·설정)와 `data/files/`(첨부 이미지)입니다. `data/logs/`는 없어도 됩니다. 이미지를 한 번도 올리지 않았다면 `data/files/`가 없을 수 있습니다.
+백업할 것은 `data/chat.db`(계정·대화·설정)와 `data/files/`(첨부 이미지)입니다. `data/logs/`와 `data/kv-cache/`(모델 서버의 캐시, 지우면 다시 쌓임)는 없어도 되고, 백업에 넣지 않는 편이 좋습니다. 캐시를 비우려면 서버를 멈춘 뒤 `data/kv-cache/`를 지우세요. 이미지를 한 번도 올리지 않았다면 `data/files/`가 없을 수 있습니다.
 
 **서버가 켜져 있을 때**: sqlite3의 `.backup` 명령은 서버가 쓰는 중에도 온전한 사본을 만듭니다. 데이터베이스를 먼저, 이미지를 나중에 복사하세요.
 
@@ -330,7 +344,7 @@ curl http://127.0.0.1:8000/health
 ```
 
 - `models.json`이 바뀌었다면 다시 시작하기 전에 `uv run python scripts/prepare_models.py`로 새 모델을 받습니다.
-- 다시 시작하면 진행 중이던 답변은 끊깁니다. 친구들이 쓰지 않는 시간에 하세요.
+- 다시 시작하면 진행 중이던 답변은 끊기고, 모델 서버도 다시 모델을 불러오므로 잠시 "준비 중"입니다. 친구들이 쓰지 않는 시간에 하세요.
 - 앱은 화면 파일(`/static/`)에 `Cache-Control: no-cache`를 붙여 보내므로 Cloudflare와 브라우저가 매번 새 버전이 있는지 확인합니다. 그래도 업데이트 뒤 화면이 깨져 보이면 강력 새로고침(⌘⇧R, Ctrl+Shift+R)을 하세요. Cloudflare에 캐시 규칙(Cache Rules)을 따로 만들어 원래 서버의 캐시 설정을 무시하게 했다면, 대시보드의 Caching › Configuration에서 **Purge Everything**으로 비운 뒤 새로고침하세요.
 - cloudflared는 `brew upgrade cloudflared`로 올린 뒤 다시 시작합니다. 대시보드 방식(sudo)이면 `sudo launchctl kickstart -k system/com.cloudflare.cloudflared`, 직접 관리 방식이면 `launchctl kickstart -k gui/$(id -u)/com.cloudflare.cloudflared`입니다.
 
@@ -360,6 +374,14 @@ lsof -nP -iTCP:8000 -sTCP:LISTEN     # 포트를 쓰는 프로그램과 PID
 ```
 
 **서버가 켜졌다 꺼지기를 반복함**: `data/logs/server.log`의 마지막 부분에 이유가 있습니다. "로그인할 수 있는 계정이 없습니다"라면 계정을 만든 뒤 `launchctl kickstart -k gui/$(id -u)/com.pubmedchat.server`로 다시 시작하세요.
+
+**모델이 계속 "준비 중"이거나 오류 `model_unavailable`(503)**: 모델 서버가 아직 모델을 불러오는 중이거나 시작하지 못했습니다. `/health`의 `inference.models`에서 상태와 이유를 보고, `data/logs/mlx-<모델>.log`의 마지막 줄을 확인하세요. `missing`이면 `uv run python scripts/prepare_models.py`로 모델을 받습니다. 시작에 실패한 모델은 다음 질문 때 다시 시작을 시도합니다. 모델 서버는 포트를 쓰지 않으므로 다른 프로그램과 포트가 겹쳐 실패하는 일은 없습니다. 메모리가 모자라 죽는다면(로그의 `out of memory`) 다른 프로그램을 닫거나 `MODELS`로 모델을 하나만 쓰세요.
+
+```sh
+ls -ld "$TMPDIR"/pubmed-mlx-* /tmp/pubmed-mlx-* 2>/dev/null   # 실행 중인 앱의 소켓 폴더 (권한 drwx------)
+```
+
+**4B로 한 첫 질문이 몇 초 늦음**: 정상입니다. 4B는 처음 쓸 때 불러오고(약 6~7초, 화면에 "모델을 준비하고 있어요") 10분 동안 질문이 없으면 다시 끄므로, 오래 쉰 뒤의 첫 질문도 그만큼 기다립니다. 늘 올려 두려면 `.env`에 `PRELOAD_MODELS=all`을 적고 다시 시작하세요(메모리를 더 쓰고, 16 GB 맥에서는 쉬고 난 뒤 9B의 첫 답변이 크게 늦을 수 있습니다). 끄기까지의 시간은 `MLX_IDLE_MINUTES`로 바꿉니다.
 
 **로그인할 때 429**: 15분 안에 10번 이상 틀렸습니다. 잠시 기다리거나 `users.py passwd`로 비밀번호를 새로 정하세요.
 
