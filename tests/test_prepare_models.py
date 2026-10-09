@@ -55,3 +55,42 @@ def test_existing_complete_model_skips_download(tmp_path, monkeypatch):
         raise AssertionError("complete model must stay offline")
     monkeypatch.setattr(mod, "snapshot_download", unexpected)
     assert mod.prepare_model(spec, dst) == dst
+
+
+def test_missing_shard_index_triggers_online_completion(tmp_path,monkeypatch):
+    from app.catalog import load_catalog
+    from scripts import prepare_models as mod
+    import shutil
+    partial=snapshot(tmp_path)
+    shard='model.safetensors-00001-of-00001.safetensors'
+    (partial/'model.safetensors').rename(partial/shard)
+    full=tmp_path/'complete'
+    shutil.copytree(partial,full)
+    (full/'model.safetensors.index.json').write_text(json.dumps({'weight_map':{'weight':shard}}))
+    calls=[]
+    def download(**kw):
+        calls.append(kw.get('local_files_only',False))
+        return str(partial if kw.get('local_files_only') else full)
+    monkeypatch.setattr(mod,'snapshot_download',download)
+    dst=tmp_path/'destination'
+    mod.prepare_model(load_catalog()['qwen3.5-2b'],dst)
+    assert calls == [True,False]
+    assert (dst/'model.safetensors.index.json').is_file()
+    assert (dst/'.model-ready.json').is_file()
+
+
+def test_stale_ready_marker_missing_index_is_repaired(tmp_path,monkeypatch):
+    from app.catalog import load_catalog
+    from scripts import prepare_models as mod
+    import shutil
+    src=snapshot(tmp_path)
+    shard='model.safetensors-00001-of-00001.safetensors'
+    (src/'model.safetensors').rename(src/shard)
+    dst=tmp_path/'destination'
+    shutil.copytree(src,dst)
+    spec=load_catalog()['qwen3.5-2b']
+    (dst/'.model-ready.json').write_text(json.dumps({'repo_id':spec.repo_id,'revision':spec.revision,'files':{p.name:p.stat().st_size for p in dst.iterdir()}}))
+    (src/'model.safetensors.index.json').write_text(json.dumps({'weight_map':{'weight':shard}}))
+    monkeypatch.setattr(mod,'snapshot_download',lambda **kw:str(src))
+    mod.prepare_model(spec,dst)
+    assert (dst/'model.safetensors.index.json').exists()

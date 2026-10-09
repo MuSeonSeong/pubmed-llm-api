@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import LocalEntryNotFoundError
 from safetensors import safe_open
-from app.catalog import ModelSpec, load_catalog
+from app.catalog import ModelSpec, load_catalog, model_weight_files
 from app.settings import Settings
 
 PATTERNS = ['*.json', '*.safetensors', '*.jinja', 'merges.txt', 'vocab.txt', 'tokenizer.model', 'README.md', 'LICENSE*']
@@ -19,14 +19,7 @@ def validate_files(path: Path) -> None:
     for name in ['config.json', 'tokenizer_config.json', 'tokenizer.json']:
         if not (path / name).is_file():
             raise ValueError(f'Missing {name} in {path}')
-    index = path / 'model.safetensors.index.json'
-    weights = sorted(path.glob('*.safetensors'))
-    if index.exists():
-        names = set(json.loads(index.read_text())['weight_map'].values())
-        if not all((path / name).is_file() for name in names):
-            raise ValueError(f'Missing weight shards in {path}')
-    if not weights:
-        raise ValueError(f'Missing model weights in {path}')
+    weights = model_weight_files(path)
     for file in weights:
         with safe_open(file, framework='numpy') as data:
             if not list(data.keys()):
@@ -36,12 +29,16 @@ def validate_files(path: Path) -> None:
 def prepare_model(spec: ModelSpec, destination: Path) -> Path:
     marker = destination / '.model-ready.json'
     if marker.exists():
-        info = json.loads(marker.read_text())
-        if info.get('revision') == spec.revision and info.get('repo_id') == spec.repo_id:
-            if all((destination / name).is_file() and (destination / name).stat().st_size == size
-                   for name, size in info.get('files', {}).items()):
-                validate_files(destination)
-                return destination
+        try:
+            info = json.loads(marker.read_text())
+            if info.get('revision') == spec.revision and info.get('repo_id') == spec.repo_id:
+                if info.get('files') and all((destination / name).is_file() and (destination / name).stat().st_size == size
+                       for name, size in info['files'].items()):
+                    validate_files(destination)
+                    return destination
+        except (ValueError, OSError, TypeError, AttributeError):
+            pass
+        marker.unlink(missing_ok=True)
     options = dict(repo_id=spec.repo_id, revision=spec.revision, allow_patterns=PATTERNS)
     try:
         source = Path(snapshot_download(**options, local_files_only=True))
@@ -60,7 +57,9 @@ def prepare_model(spec: ModelSpec, destination: Path) -> Path:
     validate_files(destination)
     files = {str(file.relative_to(destination)): file.stat().st_size for file in destination.rglob('*')
              if file.is_file() and file != marker and not file.name.endswith('.partial')}
-    marker.write_text(json.dumps({'repo_id': spec.repo_id, 'revision': spec.revision, 'files': files}, indent=2))
+    pending = marker.with_name(marker.name + '.partial')
+    pending.write_text(json.dumps({'repo_id': spec.repo_id, 'revision': spec.revision, 'files': files}, indent=2))
+    pending.replace(marker)
     return destination
 
 

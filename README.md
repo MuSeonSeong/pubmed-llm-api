@@ -166,9 +166,9 @@ git status
 | HTTP 두 모델 일반 채팅 | 각각 `2+2=4` 응답, HTTP 200 |
 | 실제 PubMed 검색·초록 조회 | 성공, PMID 31542292 |
 | 2B 실제 도구 채팅 | 검색→초록 조회→한국어 요약·PMID 링크, PMID 22745249, 약 29.3초 |
-| 단위·HTTP 계약 테스트 | 56개 통과 |
+| 단위·HTTP 계약 테스트 | 62개 통과, 샤드 인덱스 누락·불완전 완료 표시 복구 포함 |
 | Docker Linux ARM64 CPU 이미지 빌드·기동 | 성공 |
-| Docker Qwen3-0.6B CPU HTTP 채팅 | HTTP 200, `2+2=4`, 첫 로드 포함 약 11.61초 |
+| Docker Qwen3-0.6B CPU HTTP 채팅 | HTTP 200, `2+2=4`, 최종 수정 이미지에서 첫 로드 포함 약 9.4초 |
 | Windows/Linux 네이티브, NVIDIA CUDA | 실장비 미검증 |
 
 Qwen3.5는 플랫폼 전용 최적화 커널 없이 PyTorch 기본 구현을 사용합니다. 최초 실행 시 커널 대체 경로 안내가 표시될 수 있으며 GPU·CPU별 속도 차이가 있습니다.

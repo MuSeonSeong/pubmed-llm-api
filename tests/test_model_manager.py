@@ -108,10 +108,16 @@ def test_cancelled_request_keeps_generation_serialized(monkeypatch):
     assert order.index('first-end') < order.index('qwen3.5-2b')
 
 
-def test_mps_load_stages_weights_on_cpu_before_move(monkeypatch):
+def test_mps_load_stages_weights_on_cpu_before_move(monkeypatch, tmp_path):
     from transformers import AutoTokenizer, AutoModelForCausalLM
     obj=manager(monkeypatch)
     obj.device='mps'
+    obj.settings.models_dir = tmp_path
+    folder = tmp_path / 'qwen3-0.6b'
+    folder.mkdir()
+    for name in ['config.json', 'tokenizer_config.json', 'tokenizer.json']:
+        (folder / name).write_text('{}')
+    (folder / 'model.safetensors').write_bytes(b'test fixture')
     calls=[]
     class Loaded:
         def to(self,device):
@@ -139,3 +145,30 @@ def test_config_without_weights_is_not_ready(tmp_path):
     (path/'config.json').write_text('{}')
     m=ModelManager(Settings(device='cpu',models_dir=tmp_path),load_catalog())
     assert m.status()['model_files']['qwen3-0.6b'] is False
+
+
+def test_sharded_weights_without_index_are_not_ready(tmp_path):
+    from app.model_manager import ModelManager
+    from app.catalog import load_catalog
+    from app.settings import Settings
+    p=tmp_path/'qwen3.5-2b'
+    p.mkdir()
+    for name in ['config.json','tokenizer_config.json','tokenizer.json']:
+        (p/name).write_text('{}')
+    (p/'model.safetensors-00001-of-00001.safetensors').write_bytes(b'weight')
+    manager=ModelManager(Settings(device='cpu',models_dir=tmp_path),load_catalog())
+    assert manager.status()['model_files']['qwen3.5-2b'] is False
+
+@pytest.mark.parametrize('index',[[],{'weight_map':{}},{'weight_map':{'w':{'invalid':1}}}])
+def test_invalid_shard_index_is_not_ready(tmp_path,index):
+    import json
+    from app.model_manager import ModelManager
+    from app.catalog import load_catalog
+    from app.settings import Settings
+    p=tmp_path/'qwen3.5-2b'
+    p.mkdir()
+    for name in ['config.json','tokenizer_config.json','tokenizer.json']:
+        (p/name).write_text('{}')
+    (p/'model.safetensors.index.json').write_text(json.dumps(index))
+    manager=ModelManager(Settings(device='cpu',models_dir=tmp_path),load_catalog())
+    assert manager.status()['model_files']['qwen3.5-2b'] is False

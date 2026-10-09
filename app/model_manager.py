@@ -2,11 +2,10 @@
 from dataclasses import dataclass
 from functools import partial
 import gc
-import json
 import threading
 import anyio
 import torch
-from app.catalog import ModelSpec
+from app.catalog import ModelSpec, model_weight_files
 from app.settings import Settings, ServiceError
 
 @dataclass(frozen=True)
@@ -44,9 +43,8 @@ class ModelManager:
         if not all((path / name).is_file() for name in ['config.json', 'tokenizer_config.json', 'tokenizer.json']):
             return False
         try:
-            index = path / 'model.safetensors.index.json'
-            weights = [path / name for name in set(json.loads(index.read_text())['weight_map'].values())] if index.exists() else list(path.glob('*.safetensors'))
-            return bool(weights) and all(file.is_file() and file.stat().st_size > 0 for file in weights)
+            model_weight_files(path)
+            return True
         except (OSError, ValueError, KeyError):
             return False
 
