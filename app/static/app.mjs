@@ -109,10 +109,12 @@ function renderHistory() {
   if (!chats.length) {
     history.append(element('p', 'history-empty', query ? '검색 결과가 없습니다.' : '첫 대화를 시작해 보세요.'));
   }
+  chats.sort((a, b) => Number(b.pinned === true) - Number(a.pinned === true));  // stable: keeps recency within groups
   let group;
   for (const chat of chats) {
-    if (dateGroup(chat.updatedAt) !== group) {
-      group = dateGroup(chat.updatedAt);
+    const heading = chat.pinned ? '고정됨' : dateGroup(chat.updatedAt);
+    if (heading !== group) {
+      group = heading;
       history.append(element('div', 'history-heading', group));
     }
     const row = element('div', 'chat-row' + (chat.id === store.activeId ? ' active' : ''));
@@ -134,12 +136,15 @@ function renderHistory() {
     select.addEventListener('dblclick', () => { renamingId = chat.id; render(); });
     const rename = iconButton('edit', chat.title + ' 이름 바꾸기', () => { renamingId = chat.id; render(); });
     rename.classList.add('chat-action');
+    const pin = iconButton('pin', chat.pinned ? chat.title + ' 고정 해제' : chat.title + ' 고정', () => store.togglePin(chat.id));
+    pin.classList.add('chat-action');
+    if (chat.pinned) pin.classList.add('pinned');
     const remove = iconButton('trash', chat.title + ' 대화 삭제', () => {
       if (confirm('이 대화를 삭제할까요? 브라우저에 저장된 기록이 삭제됩니다.')) store.remove(chat.id);
     });
     remove.classList.add('chat-action');
     remove.disabled = store.busy;
-    row.append(select, rename, remove);
+    row.append(select, pin, rename, remove);
     history.append(row);
   }
 }

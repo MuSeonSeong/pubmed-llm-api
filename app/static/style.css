@@ -73,6 +73,8 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .chat-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .chat-action { width: 26px; height: 28px; opacity: 0; }
 .chat-action:last-child { margin-right: 4px; }
+.chat-action.pinned { color: var(--green); opacity: 1; }
+.chat-action { width: 24px; }
 .chat-action .icon { width: 14px; height: 14px; }
 .chat-row:hover .chat-action, .chat-row:focus-within .chat-action, .chat-row.active .chat-action { opacity: 1; }
 .rename-input { flex: 1; min-width: 0; margin: 3px; padding: 7px 8px; border: 1px solid var(--green); border-radius: 6px; background: var(--surface); font-size: 12.5px; outline: 0; }

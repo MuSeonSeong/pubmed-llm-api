@@ -138,7 +138,7 @@ function restoreChat(chat, live = false) {
     }
   });
   return { id: chat.id, title: chat.title, model: MODELS.includes(chat.model) ? chat.model : MODELS[0],
-    usePubmed: chat.usePubmed !== false, thinking: chat.thinking === true, messages,
+    usePubmed: chat.usePubmed !== false, thinking: chat.thinking === true, pinned: chat.pinned === true, messages,
     updatedAt: Number(chat.updatedAt) || Date.now() };
 }
 
@@ -296,6 +296,14 @@ export class ChatStore {
       chat.updatedAt = Date.now();
       this.emit();
     }
+  }
+
+  togglePin(chatId) {
+    const chat = this.chats.find(item => item.id === chatId);
+    if (!chat) return;
+    chat.pinned = !chat.pinned;
+    chat.updatedAt = Date.now();
+    this.emit();
   }
 
   remove(chatId) {

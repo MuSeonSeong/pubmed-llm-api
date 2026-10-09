@@ -542,3 +542,14 @@ test('lists nest by indentation, keep numbering across blank lines and absorb co
   assert.equal(renderMarkdown('3. 셋째\n4. 넷째'), '<ol start="3"><li>셋째</li><li>넷째</li></ol>');
   assert.equal(renderMarkdown('- a\n1. b'), '<ul><li>a</li></ul><ol><li>b</li></ol>');
 });
+
+
+test('pinning toggles, persists and survives reload', () => {
+  const storage = memory();
+  const store = new ChatStore(storage);
+  const chatId = store.current.id;
+  store.togglePin(chatId);
+  assert.equal(new ChatStore(storage).chats.find(c => c.id === chatId).pinned, true);
+  store.togglePin(chatId);
+  assert.equal(new ChatStore(storage).chats.find(c => c.id === chatId).pinned, false);
+});
