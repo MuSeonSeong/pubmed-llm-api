@@ -7,6 +7,7 @@ import threading
 import anyio
 import torch
 from app.catalog import ModelSpec, model_weight_files
+from app.images import IMAGE_TOKEN, MODEL_MAX_PIXELS, decode_image
 from app.settings import Settings, ServiceError
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class ModelManager:
         self._lock = threading.Lock()
         self._model = self._tokenizer = None
         self._loaded_id = None
+        self._vision = None  # (model id, image processor), loaded on the first image
 
     def status(self) -> dict:
         return {'device': self.device, 'loaded_model': self._loaded_id, 'busy': self._lock.locked(),
@@ -80,6 +82,7 @@ class ModelManager:
     def _release(self) -> None:
         self._model = self._tokenizer = None
         self._loaded_id = None
+        self._vision = None
         gc.collect()
         if self.device == 'cuda':
             torch.cuda.empty_cache()
@@ -108,6 +111,49 @@ class ModelManager:
         model.eval()
         return model, tokenizer
 
+    def _image_processor(self, spec: ModelSpec):
+        if self._vision is None or self._vision[0] != spec.id:
+            # The PIL variant avoids the torchvision dependency of the default (fast) processor.
+            from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil
+            processor = Qwen2VLImageProcessorPil.from_pretrained(self.settings.models_dir / spec.directory,
+                                                                local_files_only=True)
+            self._vision = (spec.id, processor)
+        return self._vision[1]
+
+    def _prepare_inputs(self, spec: ModelSpec, tokenizer, messages, tools, thinking, template) -> dict:
+        """Tokenize the conversation; images become placeholder tokens plus pixel tensors."""
+        images, templated = [], []
+        for message in messages:
+            if not isinstance(message.get('content'), list):
+                templated.append(message)
+                continue
+            parts = []
+            for part in message['content']:
+                if part['type'] == 'text':
+                    parts.append({'type': 'text', 'text': part['text']})
+                else:
+                    images.append(decode_image(part['image_url']['url']))
+                    parts.append({'type': 'image'})
+            templated.append({**message, 'content': parts})
+        options = dict(tools=tools or None, enable_thinking=thinking, **template)
+        if not images:
+            return tokenizer.apply_chat_template(templated, tokenize=True, return_dict=True,
+                                                 return_tensors='pt', **options)
+        if not spec.vision:
+            raise ServiceError('vision_unsupported', f'{spec.id} cannot read images', 422)
+        processor = self._image_processor(spec)
+        features = processor(images=images, return_tensors='pt', max_pixels=MODEL_MAX_PIXELS)
+        text = tokenizer.apply_chat_template(templated, tokenize=False, **options)
+        pieces = text.split(IMAGE_TOKEN)
+        if len(pieces) - 1 != len(images):
+            raise ServiceError('invalid_image', 'Image placeholders do not match the images', 422)
+        merge = processor.merge_size ** 2
+        text = pieces[0] + ''.join(IMAGE_TOKEN * (int(grid.prod()) // merge) + piece
+                                   for grid, piece in zip(features['image_grid_thw'], pieces[1:]))
+        encoded = tokenizer([text], return_tensors='pt', add_special_tokens=False)
+        return {'input_ids': encoded['input_ids'], 'attention_mask': encoded['attention_mask'],
+                'pixel_values': features['pixel_values'], 'image_grid_thw': features['image_grid_thw']}
+
     async def generate(self, model_id: str, messages: list[dict], tools: list[dict],
                        max_tokens: int, temperature: float, *, on_text: Callable[[str], None] | None = None,
                        cancel: threading.Event | None = None, thinking: bool = False,
@@ -133,14 +179,15 @@ class ModelManager:
                 tokenizer, model = self._tokenizer, self._model
                 template = ({'continue_final_message': True, 'add_generation_prompt': False} if continue_final
                             else {'add_generation_prompt': True})
-                inputs = tokenizer.apply_chat_template(messages, tools=tools or None, tokenize=True,
-                    return_dict=True, return_tensors='pt', enable_thinking=thinking, **template)
+                inputs = self._prepare_inputs(self.catalog[model_id], tokenizer, messages, tools, thinking, template)
                 count = inputs['input_ids'].shape[-1]
                 if count + max_tokens > self.settings.max_context_tokens:
                     raise ServiceError('context_overflow', 'Input plus requested output exceeds context budget',
                                        413, {'prompt_tokens': count, 'max_tokens': max_tokens,
                                              'limit': self.settings.max_context_tokens})
                 inputs = {name: value.to(self.device) for name, value in inputs.items()}
+                if 'pixel_values' in inputs:
+                    inputs['pixel_values'] = inputs['pixel_values'].to(getattr(model, 'dtype', torch.float32))
                 kwargs = dict(max_new_tokens=max_tokens, do_sample=temperature > 0,
                               pad_token_id=tokenizer.eos_token_id)
                 if temperature > 0:

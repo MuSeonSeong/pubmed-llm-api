@@ -16,6 +16,7 @@ dependencies = [
   "huggingface-hub>=1.0,<2",
   "jsonschema>=4.25,<5",
   "anyio>=4.12,<5",
+  "pillow>=12.3.0",
 ]
 [dependency-groups]
 dev = [

@@ -1,12 +1,44 @@
 """Public chat contract; stream=true switches the response to server-sent events."""
 import time
-from typing import Literal
+from typing import Annotated, Literal
 from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, FiniteFloat, model_validator
 
+MAX_IMAGES = 4
+
+class TextPart(BaseModel):
+    type: Literal['text']
+    text: str
+
+class ImageURL(BaseModel):
+    url: str = Field(max_length=12_000_000)
+    detail: str | None = None  # sent by OpenAI clients; images are always resized for the model
+
+class ImagePart(BaseModel):
+    type: Literal['image_url']
+    image_url: ImageURL
+
+ContentPart = Annotated[TextPart | ImagePart, Field(discriminator='type')]
+
 class ChatMessage(BaseModel):
     role: Literal['system', 'user', 'assistant']
-    content: str = Field(min_length=1)
+    # Plain text, or OpenAI-style parts so a user message can carry images.
+    content: str | list[ContentPart]
+
+    @model_validator(mode='after')
+    def check_content(self):
+        if isinstance(self.content, str):
+            if not self.content:
+                raise ValueError('Message content must not be empty')
+        elif self.role != 'user':
+            raise ValueError('Only user messages may use content parts')
+        elif not any(part.type == 'image_url' or part.text.strip() for part in self.content):
+            raise ValueError('Message content must not be empty')
+        return self
+
+    @property
+    def image_count(self) -> int:
+        return 0 if isinstance(self.content, str) else sum(part.type == 'image_url' for part in self.content)
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
@@ -29,7 +61,13 @@ class ChatRequest(BaseModel):
             raise ValueError('At least one user message is required')
         if self.continue_final and self.messages[-1].role != 'assistant':
             raise ValueError('continue_final requires the last message to be from the assistant')
+        if sum(message.image_count for message in self.messages) > MAX_IMAGES:
+            raise ValueError(f'At most {MAX_IMAGES} images per request')
         return self
+
+    @property
+    def has_images(self) -> bool:
+        return any(message.image_count for message in self.messages)
 
 class ToolTrace(BaseModel):
     name: str

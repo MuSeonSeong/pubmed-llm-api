@@ -104,13 +104,16 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
     @application.get('/v1/models')
     async def models():
         return {'object': 'list', 'default': 'qwen3.5-2b', 'data': [
-            {'id': spec.id, 'object': 'model', 'repo_id': spec.repo_id, 'revision': spec.revision}
+            {'id': spec.id, 'object': 'model', 'repo_id': spec.repo_id, 'revision': spec.revision,
+             'vision': spec.vision}
             for spec in catalog.values()]}
 
     @application.post('/v1/chat/completions', response_model=ChatResponse)
     async def chat(request: ChatRequest):
         if request.model not in catalog:
             raise ServiceError('unknown_model', f'Unknown model: {request.model}', 422)
+        if request.has_images and not catalog[request.model].vision:
+            raise ServiceError('vision_unsupported', f'{request.model} cannot read images; use qwen3.5-2b', 422)
         if request.stream:
             return EventStreamResponse(lambda emit, cancel: service.stream(request, emit, cancel))
         return await service.complete(request)

@@ -13,6 +13,11 @@ class ModelSpec:
     directory: str
     loader: str
 
+    @property
+    def vision(self) -> bool:
+        """Qwen3.5 checkpoints include a vision encoder; Qwen3 is text only."""
+        return self.loader == 'qwen3_5'
+
 
 def load_catalog() -> dict[str, ModelSpec]:
     entries = json.loads((ROOT / "models.json").read_text())
