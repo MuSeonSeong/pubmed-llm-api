@@ -103,18 +103,16 @@ function restoreSettings(value) {
       ? number(value.maxTokens, 1, 2048, DEFAULT_SETTINGS.maxTokens) : DEFAULT_SETTINGS.maxTokens };
 }
 
-/** live: the chat comes from another open tab, so an in-progress request there is still running. */
-function restoreChat(chat, live = false) {
+/** Validate a stored chat. In-progress requests are kept as-is; settleInterrupted() decides if they died. */
+function restoreChat(chat) {
   if (!chat || typeof chat.id !== 'string' || typeof chat.title !== 'string'
       || !Array.isArray(chat.messages)) return null;
   const messages = chat.messages.filter(message => message && typeof message.id === 'string'
     && ['user', 'assistant'].includes(message.role) && typeof message.content === 'string')
-    // A draft that never received text was interrupted before it said anything.
-    .filter(message => live || !(message.streaming === true && !message.content.trim()))
     .map(message => ({ id: message.id, role: message.role, content: message.content,
       toolCalls: normalizeTools(message.toolCalls), truncated: message.truncated === true,
-      stopped: message.stopped === true || (!live && message.streaming === true),
-      ...(live && message.streaming === true ? { streaming: true } : {}),
+      stopped: message.stopped === true,
+      ...(message.role === 'assistant' && message.streaming === true ? { streaming: true } : {}),
       ...(Number.isInteger(message.dropped) && message.dropped > 0 ? { dropped: message.dropped } : {}),
       ...(typeof message.reasoning === 'string' && message.reasoning ? { reasoning: message.reasoning } : {}),
       ...(Number.isFinite(message.thinkMs) && message.thinkMs >= 0 ? { thinkMs: message.thinkMs } : {}),
@@ -130,16 +128,33 @@ function restoreChat(chat, live = false) {
         ? { attachments: restoreAttachments(message.attachments) } : {}),
       ...(typeof message.error === 'string' ? { error: message.error } : {}),
       ...(message.role === 'user' && message.pending === true ? { pending: true } : {}) }));
-  messages.forEach((message, index) => {
-    if (!message.pending || live) return;
-    delete message.pending;
-    if (messages[index + 1]?.role !== 'assistant') {
-      message.error = '페이지가 닫혀 응답을 받지 못했습니다. 다시 시도해 주세요.';
-    }
-  });
   return { id: chat.id, title: chat.title, model: MODELS.includes(chat.model) ? chat.model : MODELS[0],
     usePubmed: chat.usePubmed !== false, thinking: chat.thinking === true, pinned: chat.pinned === true, messages,
-    updatedAt: Number(chat.updatedAt) || Date.now() };
+    updatedAt: Number(chat.updatedAt) || Date.now(),
+    rev: Number.isFinite(chat.rev) ? chat.rev : Number(chat.updatedAt) || 0 };
+}
+
+const inProgress = chat => chat.messages.some(message => message.pending || message.streaming);
+const LOCK_PREFIX = 'pubmed-chat:';
+
+/** Turn a request whose tab is gone into a stopped answer or a retryable question; true if changed. */
+function settleInterrupted(chat) {
+  if (!inProgress(chat)) return false;
+  // A draft that never received text was interrupted before it said anything.
+  chat.messages = chat.messages.filter(message => !(message.streaming && !message.content.trim()));
+  chat.messages.forEach((message, index) => {
+    if (message.streaming) {
+      delete message.streaming;
+      message.stopped = true;
+    }
+    if (message.pending) {
+      delete message.pending;
+      if (chat.messages[index + 1]?.role !== 'assistant') {
+        message.error = '페이지가 닫혀 응답을 받지 못했습니다. 다시 시도해 주세요.';
+      }
+    }
+  });
+  return true;
 }
 
 function errorMessage(error, status) {
@@ -198,9 +213,16 @@ function finish(draft, data) {
 }
 
 export class ChatStore {
-  constructor(storage = globalThis.localStorage, fetcher = globalThis.fetch) {
+  /**
+   * locks: the Web Locks API. The answering tab holds a lock per chat, so other tabs can tell a request
+   * that is still running elsewhere from one whose tab was closed. Without it, requests found in storage
+   * are treated as interrupted.
+   */
+  constructor(storage = globalThis.localStorage, fetcher = globalThis.fetch, { locks = globalThis.navigator?.locks } = {}) {
     this.storage = storage;
     this.fetcher = fetcher;
+    this.locks = locks || null;
+    this.liveChats = new Set();  // chats another tab is answering right now
     this.busy = false;
     this.controller = null;
     this.notice = '';
@@ -212,7 +234,7 @@ export class ChatStore {
     this.settings = { ...DEFAULT_SETTINGS };
     try {
       const saved = JSON.parse(storage.getItem(STORAGE_KEY) || 'null');
-      if (Array.isArray(saved?.chats)) this.chats = saved.chats.map(chat => restoreChat(chat)).filter(Boolean);
+      if (Array.isArray(saved?.chats)) this.chats = saved.chats.map(restoreChat).filter(Boolean);
       if (Array.isArray(saved?.deleted)) this.deleted = new Set(saved.deleted.filter(item => typeof item === 'string'));
       this.settings = restoreSettings(saved?.settings);
       this.activeId = this.chats.some(chat => chat.id === saved?.activeId)
@@ -224,9 +246,40 @@ export class ChatStore {
       this.chats = [freshChat()];
       this.activeId = this.chats[0].id;
     }
+    if (this.locks) this.chats.filter(inProgress).forEach(chat => this.liveChats.add(chat.id));  // until checked
+    else this.chats.forEach(settleInterrupted);
   }
 
   get current() { return this.chats.find(chat => chat.id === this.activeId); }
+
+  /** Whether this tab may change a chat: not while it is answering, nor while another tab answers it. */
+  canModify(chat = this.current) {
+    return Boolean(chat) && !this.busy && !this.liveChats.has(chat.id);
+  }
+
+  touch(chat) {
+    chat.rev = Math.max(Date.now(), (chat.rev || 0) + 1);
+  }
+
+  /** Ask the browser which chats another tab is still answering; settle the rest. */
+  async refreshLive() {
+    if (!this.locks) return;
+    let held;
+    try { held = new Set((await this.locks.query()).held.map(lock => lock.name)); } catch { return; }
+    let changed = false;
+    const live = new Set();
+    for (const chat of this.chats) {
+      if (chat === this.requestChat || !inProgress(chat)) continue;
+      if (held.has(LOCK_PREFIX + chat.id)) live.add(chat.id);
+      else if (settleInterrupted(chat)) {
+        this.touch(chat);
+        changed = true;
+      }
+    }
+    changed ||= live.size !== this.liveChats.size || [...live].some(chatId => !this.liveChats.has(chatId));
+    this.liveChats = live;
+    if (changed) this.emit();
+  }
 
   /**
    * Fold in what other tabs saved: their new chats, newer versions of idle chats and deletions.
@@ -235,14 +288,19 @@ export class ChatStore {
   merge(saved, { adoptSettings = false } = {}) {
     if (!saved || !Array.isArray(saved.chats)) return;
     if (Array.isArray(saved.deleted)) saved.deleted.forEach(item => typeof item === 'string' && this.deleted.add(item));
-    for (const stored of saved.chats.map(chat => restoreChat(chat, true)).filter(Boolean)) {
+    for (const stored of saved.chats.map(restoreChat).filter(Boolean)) {
       if (this.deleted.has(stored.id)) continue;
       const index = this.chats.findIndex(chat => chat.id === stored.id);
-      if (index === -1) this.chats.push(stored);
-      else if (stored.updatedAt > this.chats[index].updatedAt && this.chats[index] !== this.requestChat) {
+      if (index === -1) {
+        this.chats.push(stored);
+        if (inProgress(stored)) this.liveChats.add(stored.id);  // refreshLive() confirms or settles it
+      } else if (stored.rev > this.chats[index].rev && this.chats[index] !== this.requestChat) {
         this.chats[index] = stored;
+        if (inProgress(stored)) this.liveChats.add(stored.id);
+        else this.liveChats.delete(stored.id);
       }
     }
+    if (this.requestChat && this.deleted.has(this.requestChat.id)) this.deleted.delete(this.requestChat.id);
     this.chats = this.chats.filter(chat => !this.deleted.has(chat.id));
     if (!this.chats.length) this.chats = [freshChat()];
     if (!this.current) this.activeId = this.chats[0].id;
@@ -255,6 +313,7 @@ export class ChatStore {
       this.merge(JSON.parse(this.storage.getItem(STORAGE_KEY) || 'null'), { adoptSettings: true });
     } catch { return; }
     this.onChange();
+    return this.refreshLive();
   }
 
   save() {
@@ -291,23 +350,37 @@ export class ChatStore {
   rename(chatId, title) {
     const chat = this.chats.find(item => item.id === chatId);
     const clean = String(title).replace(/\s+/g, ' ').trim().slice(0, 80);
-    if (chat && clean) {
+    if (chat && clean && this.canModify(chat)) {
       chat.title = clean;
-      chat.updatedAt = Date.now();
+      this.touch(chat);
       this.emit();
     }
   }
 
   togglePin(chatId) {
     const chat = this.chats.find(item => item.id === chatId);
-    if (!chat) return;
+    if (!chat || !this.canModify(chat)) return;
     chat.pinned = !chat.pinned;
-    chat.updatedAt = Date.now();
+    this.touch(chat);
+    this.emit();
+  }
+
+  /** Per-chat options set from the UI: model, usePubmed, thinking. */
+  updateChat(patch) {
+    const chat = this.current;
+    if (!this.canModify(chat)) return;
+    for (const key of ['model', 'usePubmed', 'thinking']) {
+      if (!(key in patch)) continue;
+      if (key === 'model' && !MODELS.includes(patch.model)) continue;
+      chat[key] = key === 'model' ? patch.model : patch[key] === true;
+    }
+    this.touch(chat);
     this.emit();
   }
 
   remove(chatId) {
-    if (this.busy) return;
+    const chat = this.chats.find(item => item.id === chatId);
+    if (this.busy || (chat && !this.canModify(chat))) return;
     this.deleted.add(chatId);
     this.chats = this.chats.filter(chat => chat.id !== chatId);
     if (!this.chats.length) this.chats = [freshChat()];
@@ -322,8 +395,8 @@ export class ChatStore {
 
   async send(content, attachments = []) {
     const files = restoreAttachments(attachments);
-    if (this.busy || (!content.trim() && !files.length)) return;
     const chat = this.current;
+    if (!this.canModify(chat) || (!content.trim() && !files.length)) return;
     const message = { id: id(), role: 'user', content: content.trim() || DEFAULT_FILE_PROMPT,
       ...(files.length ? { attachments: files } : {}) };
     chat.messages.push(message);
@@ -333,7 +406,7 @@ export class ChatStore {
 
   canRetry(messageId) {
     const message = this.current.messages.at(-1);
-    return !this.busy && message?.id === messageId && message.role === 'user' && Boolean(message.error);
+    return this.canModify() && message?.id === messageId && message.role === 'user' && Boolean(message.error);
   }
 
   async retry(messageId) {
@@ -342,7 +415,7 @@ export class ChatStore {
 
   canRegenerate(messageId) {
     const messages = this.current.messages;
-    return !this.busy && messages.at(-1)?.id === messageId && messages.at(-1).role === 'assistant'
+    return this.canModify() && messages.at(-1)?.id === messageId && messages.at(-1).role === 'assistant'
       && messages.at(-2)?.role === 'user';
   }
 
@@ -357,7 +430,7 @@ export class ChatStore {
 
   canSelectVersion(messageId) {
     const message = this.current.messages.at(-1);
-    return !this.busy && message?.id === messageId && (message.versions?.length || 0) > 1;
+    return this.canModify() && message?.id === messageId && (message.versions?.length || 0) > 1;
   }
 
   selectVersion(messageId, index) {
@@ -368,6 +441,7 @@ export class ChatStore {
     for (const key of VERSION_FIELDS) delete message[key];
     Object.assign(message, { toolCalls: [], truncated: false, stopped: false }, structuredClone(chosen));
     message.version = index;
+    this.touch(this.current);
     this.emit();
   }
 
@@ -375,7 +449,7 @@ export class ChatStore {
   async edit(messageId, content) {
     const chat = this.current;
     const index = chat.messages.findIndex(message => message.id === messageId);
-    if (this.busy || !content.trim() || chat.messages[index]?.role !== 'user') return;
+    if (!this.canModify(chat) || !content.trim() || chat.messages[index]?.role !== 'user') return;
     const message = chat.messages[index];
     chat.messages.splice(index + 1);
     message.content = content.trim();
@@ -387,9 +461,28 @@ export class ChatStore {
   async request(chat, message, { versions = null, fallback = null } = {}) {
     this.busy = true;
     this.requestChat = chat;
+    let releaseLock = () => {};
+    if (this.locks) {
+      // Hold the chat's lock before announcing the request, so no tab can mistake it for a dead one.
+      const granted = await new Promise(resolve => {
+        this.locks.request(LOCK_PREFIX + chat.id, { ifAvailable: true }, lock => {
+          if (!lock) return resolve(false);
+          return new Promise(release => { releaseLock = release; resolve(true); });
+        }).catch(() => resolve(true));
+      });
+      if (!granted) {
+        this.busy = false;
+        this.requestChat = null;
+        this.notice = '다른 탭에서 이 대화의 답변을 만들고 있어요.';
+        if (fallback) chat.messages.push(fallback);
+        this.onChange();
+        return;
+      }
+    }
     delete message.error;
     message.pending = true;
     chat.updatedAt = Date.now();
+    this.touch(chat);
     const history = chat.messages.filter(item => !item.error && item.content.trim())
       .map(item => ({ role: item.role, content: item.role === 'user' ? messageText(item) : item.content }));
     if (this.settings.systemPrompt.trim()) {
@@ -401,6 +494,7 @@ export class ChatStore {
     this.controller = controller;
     let finished = false;
     const started = Date.now();
+    let shared = started;
     this.emit();
     try {
       const fetcher = this.fetcher;
@@ -442,6 +536,11 @@ export class ChatStore {
             finish(draft, event);
             finished = true;
           } else if (event.type === 'error') throw new Error(errorMessage(event.error, event.status));
+          if (Date.now() - shared > 1500) {  // let other tabs follow the answer as it grows
+            shared = Date.now();
+            this.touch(chat);
+            this.save();
+          }
           this.onChange();
         }
         if (!finished) throw new Error('응답이 중간에 끊겼습니다. 다시 시도해 주세요.');
@@ -475,7 +574,9 @@ export class ChatStore {
       this.requestChat = null;
       this.controller = null;
       chat.updatedAt = Date.now();
+      this.touch(chat);
       this.emit();
+      releaseLock();
     }
   }
 }

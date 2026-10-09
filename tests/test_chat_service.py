@@ -349,3 +349,12 @@ def test_response_has_openai_style_metadata_and_usage_over_all_rounds():
     r,_,_=complete([call(),'Answer'])
     assert r.id.startswith('chatcmpl-') and r.object == 'chat.completion' and r.created > 0
     assert (r.usage.prompt_tokens,r.usage.completion_tokens,r.usage.total_tokens) == (20,10,30)
+
+
+def test_null_lists_in_tool_results_do_not_break_the_answer():
+    from app.chat_service import append_citations, collect_sources
+    from app.schemas import ToolTrace
+    traces=[ToolTrace(name=SEARCH,arguments={},result={'pmids':None,'summaries':None,
+            'articles':[{'pmid':'1','authors':None,'journalInfo':None}]})]
+    assert [s.pmid for s in collect_sources(traces)] == ['1']
+    assert 'PMID [1]' in append_citations('answer',traces)

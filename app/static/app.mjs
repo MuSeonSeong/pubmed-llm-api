@@ -143,7 +143,8 @@ function renderHistory() {
       if (confirm('이 대화를 삭제할까요? 브라우저에 저장된 기록이 삭제됩니다.')) store.remove(chat.id);
     });
     remove.classList.add('chat-action');
-    remove.disabled = store.busy;
+    remove.disabled = !store.canModify(chat);
+    rename.disabled = pin.disabled = !store.canModify(chat);
     row.append(select, pin, rename, remove);
     history.append(row);
   }
@@ -279,7 +280,7 @@ function editForm(message) {
   form.addEventListener('submit', event => {
     event.preventDefault();
     if (!field.value.trim()) return;
-    if (store.busy) { toast('지금 답변이 끝난 뒤에 보낼 수 있어요.'); return; }
+    if (!store.canModify()) { toast('지금 답변이 끝난 뒤에 보낼 수 있어요.'); return; }
     editingId = null;
     followOutput = true;
     store.edit(message.id, field.value);
@@ -300,7 +301,7 @@ function renderUser(message) {
   const actions = element('div', 'message-actions user-actions');
   actions.append(iconButton('copy', '질문 복사', () => copyText(message.content, '질문을 복사했습니다.')));
   const edit = iconButton('edit', '질문 수정', () => startEdit(message));
-  edit.disabled = store.busy;
+  edit.disabled = !store.canModify();
   actions.append(edit);
   article.append(actions);
   if (message.error) {
@@ -375,7 +376,7 @@ function renderMessages() {
   const nodes = chat.messages.map((message, index) => {
     // Rebuild a message only when its content or available actions change; streaming touches one node.
     // An open edit form is never rebuilt, so typed text and the caret survive unrelated updates.
-    const key = editingId === message.id ? 'editing' : JSON.stringify(message) + store.busy
+    const key = editingId === message.id ? 'editing' : JSON.stringify(message) + store.canModify()
       + (index === chat.messages.length - 1) + chat.usePubmed + reasoningOpen.get(message.id);
     const cached = nodeCache.get(message.id);
     const node = cached?.key === key ? cached.node
@@ -443,7 +444,7 @@ function announce() {
 function updateComposer() {
   $('send').hidden = store.busy;
   $('stop').hidden = !store.busy;
-  $('send').disabled = !prompt.value.trim() && !pendingFiles.length;
+  $('send').disabled = store.liveChats.has(store.current.id) || (!prompt.value.trim() && !pendingFiles.length);
   prompt.style.height = 'auto';
   prompt.style.height = Math.min(prompt.scrollHeight, 220) + 'px';
 }
@@ -452,18 +453,22 @@ function render() {
   renderQueued = false;
   const chat = store.current;
   $('model').value = chat.model;
-  $('model').disabled = store.busy;
+  const locked = !store.canModify();
+  const elsewhere = store.liveChats.has(chat.id);
+  $('model').disabled = locked;
   $('use-pubmed').checked = chat.usePubmed;
-  $('use-pubmed').disabled = store.busy;
+  $('use-pubmed').disabled = locked;
   $('use-thinking').checked = chat.thinking;
-  $('use-thinking').disabled = store.busy;
+  $('use-thinking').disabled = locked;
   $('new-chat').disabled = store.busy;
   $('storage-warning').textContent = store.storageWarning;
   $('storage-warning').hidden = !store.storageWarning;
   document.title = chat.messages.length ? chat.title + ' · PubMed Chat' : 'PubMed Chat';
   $('export-chat').hidden = !chat.messages.length;
   if (store.notice) { toast(store.notice); store.notice = ''; }
-  $('attach').disabled = store.busy;
+  $('attach').disabled = locked;
+  prompt.placeholder = elsewhere ? '다른 탭에서 이 대화의 답변을 만들고 있어요' : '메시지를 입력하세요';
+  $('chat-form').classList.toggle('locked', elsewhere);
   announce();
   renderHistory();
   renderMessages();
@@ -480,7 +485,7 @@ store.onChange = scheduleRender;
 window.addEventListener('storage', event => { if (event.key === 'pubmed-chat.v1') store.sync(); });
 $('chat-form').addEventListener('submit', event => {
   event.preventDefault();
-  if (store.busy || (!prompt.value.trim() && !pendingFiles.length)) return;
+  if (!store.canModify() || (!prompt.value.trim() && !pendingFiles.length)) return;
   const content = prompt.value;
   const files = pendingFiles;
   prompt.value = '';
@@ -505,7 +510,7 @@ composer.addEventListener('drop', event => {
   composer.classList.remove('dragging');
   if (!event.dataTransfer.files.length) return;
   event.preventDefault();
-  if (!store.busy) attachFiles(event.dataTransfer.files);
+  if (store.canModify()) attachFiles(event.dataTransfer.files);
 });
 $('export-chat').addEventListener('click', () => {
   const chat = store.current;
@@ -518,7 +523,7 @@ prompt.addEventListener('keydown', event => {
     event.preventDefault();
     $('chat-form').requestSubmit();
   }
-  if (event.key === 'ArrowUp' && !prompt.value && !store.busy) {
+  if (event.key === 'ArrowUp' && !prompt.value && store.canModify()) {
     const last = store.current.messages.findLast(message => message.role === 'user');
     if (last) { event.preventDefault(); startEdit(last); }
   }
@@ -539,9 +544,9 @@ $('messages').addEventListener('click', event => {
   button.textContent = '복사됨';
   setTimeout(() => { button.textContent = '복사'; }, 1500);
 });
-$('model').addEventListener('change', event => { store.current.model = event.target.value; store.emit(); });
-$('use-pubmed').addEventListener('change', event => { store.current.usePubmed = event.target.checked; store.emit(); });
-$('use-thinking').addEventListener('change', event => { store.current.thinking = event.target.checked; store.emit(); });
+$('model').addEventListener('change', event => store.updateChat({ model: event.target.value }));
+$('use-pubmed').addEventListener('change', event => store.updateChat({ usePubmed: event.target.checked }));
+$('use-thinking').addEventListener('change', event => store.updateChat({ thinking: event.target.checked }));
 $('chat-search').addEventListener('input', renderHistory);
 function newChat() {
   if (store.busy) return;
@@ -565,10 +570,9 @@ document.addEventListener('keydown', event => {
 });
 for (const suggestion of document.querySelectorAll('.suggestion')) {
   suggestion.addEventListener('click', () => {
-    if (store.busy) return;
+    if (!store.canModify()) return;
     prompt.value = suggestion.dataset.prompt;
-    store.current.usePubmed = suggestion.dataset.pubmed !== 'false';
-    store.emit();
+    store.updateChat({ usePubmed: suggestion.dataset.pubmed !== 'false' });
     prompt.focus();
   });
 }
@@ -661,3 +665,5 @@ async function checkServer() {
 render();
 checkServer();
 setInterval(checkServer, 15000);
+store.refreshLive();
+setInterval(() => store.refreshLive(), 4000);  // notices when another tab answering a chat closes

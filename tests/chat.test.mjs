@@ -93,6 +93,7 @@ test('reload recovers an interrupted request as a retryable failed question', as
     { id: 'q', role: 'user', content: 'question', pending: true },
   ] }] };
   const store = new ChatStore({ getItem: () => JSON.stringify(saved), setItem: () => {} }, async () => reply('recovered'));
+  await store.refreshLive();  // no tab holds the chat's lock, so the request died with its page
   assert.equal(store.busy, false);
   assert.ok(store.current.messages[0].error);
   assert.equal(store.current.messages[0].pending, undefined);
@@ -180,7 +181,7 @@ function controlledStream(signal) {
   const body = new ReadableStream({ start(c) { controller = c; } });
   signal.addEventListener('abort', () => controller.error(new DOMException('Aborted', 'AbortError')));
   return { response: new Response(body, { headers: { 'content-type': 'text/event-stream' } }),
-    push: event => controller.enqueue(encoder.encode(sseText([event]))) };
+    push: event => controller.enqueue(encoder.encode(sseText([event]))), close: () => controller.close() };
 }
 const tick = () => new Promise(resolve => setTimeout(resolve, 5));
 
@@ -281,13 +282,14 @@ test('stream error events and truncated streams become retryable failures', asyn
   }
 });
 
-test('reload turns interrupted drafts into stopped answers or retryable questions', () => {
+test('reload turns interrupted drafts into stopped answers or retryable questions', async () => {
   const saved = { activeId: 'a', chats: [
     { id: 'a', title: 'with text', messages: [{ id: 'q', role: 'user', content: 'q', pending: true },
       { id: 'd', role: 'assistant', content: '절반', streaming: true }] },
     { id: 'b', title: 'empty', messages: [{ id: 'q2', role: 'user', content: 'q', pending: true },
       { id: 'd2', role: 'assistant', content: '', streaming: true }] }] };
   const store = new ChatStore({ getItem: () => JSON.stringify(saved), setItem: () => {} });
+  await store.refreshLive();
   const [withText, empty] = store.chats;
   assert.equal(withText.messages[1].stopped, true);
   assert.equal(withText.messages[0].error, undefined);
@@ -465,17 +467,61 @@ test('two tabs sharing storage keep each other\'s chats and deletions', async ()
   assert.deepEqual(titles(new ChatStore(storage).chats), ['B 질문']);
 });
 
-test('a request running in another tab is shown as in progress, not as failed', () => {
+test('a chat another tab is answering stays live and locked until that tab finishes', async () => {
+  const storage = memory();
+  let stream;
+  const owner = new ChatStore(storage, async (_, init) => (stream = controlledStream(init.signal)).response);
+  const pending = owner.send('질문');
+  await tick();
+  const watcher = new ChatStore(storage, async () => sse([done('중복')]));
+  await watcher.refreshLive();
+  const chatId = owner.current.id;
+  watcher.select(chatId);
+  assert.ok(watcher.liveChats.has(chatId));
+  assert.equal(watcher.current.messages[0].error, undefined);
+  assert.equal(watcher.canModify(), false);
+  await watcher.send('끼어들기');
+  watcher.rename(chatId, '바뀐 제목');
+  assert.equal(watcher.current.messages.length, 2);  // question and live draft only
+  stream.push({ type: 'delta', content: '부분' });
+  await tick();
+  stream.push(done('완성'));
+  stream.close();
+  await pending;
+  await watcher.sync();
+  assert.equal(watcher.liveChats.has(chatId), false);
+  assert.deepEqual(watcher.current.messages.map(m => m.content), ['질문', '완성']);
+  assert.equal(watcher.canModify(), true);
+});
+
+test('a chat whose answering tab vanished is settled by the next check', async () => {
   const storage = memory();
   storage.setItem('pubmed-chat.v1', JSON.stringify({ chats: [] }));
   const tab = new ChatStore(storage);
-  storage.setItem('pubmed-chat.v1', JSON.stringify({ chats: [{ id: 'live', title: 't', updatedAt: Date.now() + 1000,
+  storage.setItem('pubmed-chat.v1', JSON.stringify({ chats: [{ id: 'gone', title: 't', rev: Date.now() + 1000,
     messages: [{ id: 'q', role: 'user', content: 'q', pending: true },
       { id: 'd', role: 'assistant', content: '', streaming: true }] }] }));
-  tab.sync();
-  const live = tab.chats.find(c => c.id === 'live');
-  assert.equal(live.messages[0].error, undefined);
-  assert.equal(live.messages[1].streaming, true);
+  await tab.sync();
+  const chat = tab.chats.find(c => c.id === 'gone');
+  assert.equal(tab.liveChats.has('gone'), false);
+  assert.deepEqual(chat.messages.map(m => m.id), ['q']);
+  assert.ok(chat.messages[0].error);
+});
+
+test('option changes and version switches win over a stale save from another tab', async () => {
+  const storage = memory();
+  let count = 0;
+  const tabA = new ChatStore(storage, async () => sse([done('답 ' + ++count)]));
+  await tabA.send('질문');
+  await tabA.regenerate(tabA.current.messages.at(-1).id);
+  const tabB = new ChatStore(storage);
+  await tick();
+  tabA.selectVersion(tabA.current.messages.at(-1).id, 0);
+  tabA.updateChat({ model: 'qwen3-0.6b' });
+  tabB.newChat();  // B saves its older copy of the chat
+  const chat = new ChatStore(storage).chats.find(c => c.id === tabA.current.id);
+  assert.equal(chat.model, 'qwen3-0.6b');
+  assert.equal(chat.messages.at(-1).content, '답 1');
 });
 
 

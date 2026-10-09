@@ -121,6 +121,12 @@ def error_payload(exc: ServiceError) -> dict:
     return {'code': exc.code, 'message': exc.message, 'details': exc.details}
 
 
+def _items(container: dict, key: str) -> list:
+    """A list field from tool output, treating a missing, null or malformed value as empty."""
+    value = container.get(key) if isinstance(container, dict) else None
+    return value if isinstance(value, list) else []
+
+
 def _text(value, limit: int) -> str | None:
     return value.strip()[:limit] or None if isinstance(value, str) else None
 
@@ -138,22 +144,22 @@ def collect_sources(traces: list[ToolTrace]) -> list[Source]:
                 item[key] = value
     for trace in traces:
         result = trace.result or {}
-        for pmid in result.get('pmids', []):
+        for pmid in _items(result, 'pmids'):
             entry(pmid)
-        for summary in result.get('summaries', []):
+        for summary in _items(result, 'summaries'):
             item = isinstance(summary, dict) and entry(summary.get('pmid'))
             if item:
                 fill(item, title=_text(summary.get('title'), 300), authors=_text(summary.get('authors'), 200),
                      journal=_text(summary.get('source'), 120), year=_text(str(summary.get('pubDate') or '')[:4], 4),
                      doi=_text(summary.get('doi'), 120))
-        for article in result.get('articles', []):
+        for article in _items(result, 'articles'):
             item = isinstance(article, dict) and entry(article.get('pmid'))
             if not item:
                 continue
             journal = article.get('journalInfo') if isinstance(article.get('journalInfo'), dict) else {}
             date = journal.get('publicationDate') if isinstance(journal.get('publicationDate'), dict) else {}
             names = [f"{a.get('lastName', '')} {a.get('initials', '')}".strip()
-                     for a in article.get('authors', []) if isinstance(a, dict)]
+                     for a in _items(article, 'authors') if isinstance(a, dict)]
             names = [name for name in names if name]
             authors = ', '.join(names[:3]) + (' et al.' if len(names) > 3 else '')
             fill(item, title=_text(article.get('title'), 300), authors=_text(authors, 200),
@@ -168,8 +174,8 @@ def append_citations(text: str, traces: list[ToolTrace]) -> str:
     pmids = []
     for trace in traces:
         result = trace.result or {}
-        ids = list(result.get('pmids', []))
-        ids += [article.get('pmid') for article in result.get('articles', []) if isinstance(article, dict)]
+        ids = list(_items(result, 'pmids'))
+        ids += [article.get('pmid') for article in _items(result, 'articles') if isinstance(article, dict)]
         for value in ids:
             if isinstance(value, str) and re.fullmatch(r'[0-9]+', value) and value not in pmids:
                 pmids.append(value)

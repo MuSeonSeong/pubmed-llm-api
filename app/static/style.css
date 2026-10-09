@@ -209,6 +209,7 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .composer-area { flex-shrink: 0; padding: 0 28px 16px; background: var(--paper); }
 .composer { max-width: 756px; margin: 0 auto; padding: 15px 15px 11px 17px; border-radius: 22px; background: var(--surface); border: 1px solid var(--line-2); box-shadow: 0 4px 19px var(--shadow); transition: border-color .15s; }
 .composer:focus-within { border-color: var(--green); }
+.composer.locked { opacity: .7; }
 #prompt { display: block; resize: none; border: 0; outline: 0; background: transparent; width: 100%; min-height: 30px; max-height: 220px; line-height: 1.7; padding: 0 2px; font-size: 14px; }
 #prompt::placeholder { color: var(--faint); }
 .composer-bottom { display: flex; align-items: center; justify-content: space-between; margin-top: 8px; }
