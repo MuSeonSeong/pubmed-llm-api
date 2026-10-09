@@ -714,6 +714,36 @@ function renderBlocks(part) {
   return output;
 }
 
+const KEYWORDS = {
+  python: 'and as assert async await break class continue def del elif else except False finally for from global if import in is lambda None nonlocal not or pass raise return True try while with yield print self',
+  js: 'async await break case catch class const continue default delete do else export extends false finally for from function if import in instanceof let new null of return static super switch this throw true try typeof undefined var void while yield interface type enum implements',
+  r: 'if else repeat while function for in next break TRUE FALSE NULL Inf NaN NA library return',
+  sql: 'select from where and or not insert into values update set delete create table drop alter join left right inner outer on group by order having limit as distinct union null is in like between case when then else end count sum avg min max',
+  bash: 'if then else elif fi for while do done case esac function in return export local echo cd sudo',
+};
+const LANGUAGE = { py: 'python', python: 'python', js: 'js', javascript: 'js', ts: 'js', typescript: 'js', jsx: 'js',
+  tsx: 'js', json: 'js', java: 'js', c: 'js', cpp: 'js', 'c++': 'js', go: 'js', rust: 'js', r: 'r', sql: 'sql',
+  sh: 'bash', bash: 'bash', shell: 'bash', zsh: 'bash', yaml: 'bash', yml: 'bash' };
+
+/** Token-colour code; the raw code is split first and every piece is escaped, so markup cannot leak. */
+export function highlight(code, language) {
+  const family = LANGUAGE[language.toLowerCase()];
+  if (!family) return escapeHtml(code);
+  const comment = { python: '#[^\n]*', r: '#[^\n]*', bash: '#[^\n]*', sql: '--[^\n]*', js: '\\/\\/[^\n]*|\\/\\*[\\s\\S]*?\\*\\/' }[family];
+  const words = KEYWORDS[family].split(' ').map(word => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
+  const pattern = new RegExp('(' + comment + ')|("(?:\\\\.|[^"\\\\\n])*"|\'(?:\\\\.|[^\'\\\\\n])*\'|`(?:\\\\.|[^`\\\\])*`)'
+    + '|\\b(\\d+(?:\\.\\d+)?)\\b|\\b(' + words + ')\\b', family === 'sql' ? 'gi' : 'g');
+  let html = '';
+  let last = 0;
+  for (const match of code.matchAll(pattern)) {
+    html += escapeHtml(code.slice(last, match.index));
+    const kind = match[1] ? 'comment' : match[2] ? 'string' : match[3] ? 'number' : 'keyword';
+    html += '<span class="tok-' + kind + '">' + escapeHtml(match[0]) + '</span>';
+    last = match.index + match[0].length;
+  }
+  return html + escapeHtml(code.slice(last));
+}
+
 export function renderMarkdown(text) {
   return String(text).split(/(```[\s\S]*?(?:```|$))/g).map(part => {
     if (!part.startsWith('```')) return renderBlocks(part);
@@ -721,6 +751,6 @@ export function renderMarkdown(text) {
     const code = part.replace(/^```[^\n]*\n?/, '').replace(/```$/, '').replace(/\n$/, '');
     return '<div class="code-block"><div class="code-header"><span>' + escapeHtml(language || 'code')
       + '</span><button type="button" class="code-copy">복사</button></div><pre><code>'
-      + escapeHtml(code) + '</code></pre></div>';
+      + highlight(code, language) + '</code></pre></div>';
   }).join('');
 }

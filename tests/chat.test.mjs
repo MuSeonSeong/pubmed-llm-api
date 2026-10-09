@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ATTACHMENT_LIMIT, ChatStore, chatMarkdown, normalizeSources, readAttachments, readEvents, renderMarkdown,
+import { ATTACHMENT_LIMIT, ChatStore, chatMarkdown, highlight, normalizeSources, readAttachments, readEvents, renderMarkdown,
   withoutCitationList } from '../app/static/chat.mjs';
 
 const memory = () => {
@@ -636,4 +636,17 @@ test('a failed continuation leaves the answer untouched', async () => {
   assert.equal(answer.truncated, true);
   assert.equal(answer.streaming, undefined);
   assert.ok(store.notice);
+});
+
+
+test('code highlighting colours tokens and escapes everything', () => {
+  const html = highlight('def f(x):  # 주석 <b>\n    return "<script>" + 42', 'python');
+  assert.ok(html.includes('<span class="tok-keyword">def</span>'));
+  assert.ok(html.includes('<span class="tok-comment"># 주석 &lt;b&gt;</span>'));
+  assert.ok(html.includes('<span class="tok-string">&quot;&lt;script&gt;&quot;</span>'));
+  assert.ok(html.includes('<span class="tok-number">42</span>'));
+  assert.ok(!html.includes('<script>') && !html.includes('<b>'));
+  assert.equal(highlight('<x> if', 'unknown'), '&lt;x&gt; if');
+  assert.ok(highlight('SELECT * FROM t', 'sql').includes('<span class="tok-keyword">SELECT</span>'));
+  assert.ok(renderMarkdown('```js\nconst a = `x`;\n```').includes('<span class="tok-string">`x`</span>'));
 });
