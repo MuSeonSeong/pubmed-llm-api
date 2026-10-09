@@ -18,6 +18,8 @@ from app.schemas import ChatRequest, ChatResponse
 from app.chat_service import ChatService
 from app.documents import MAX_PDF_BYTES, extract_pdf_text
 
+MAX_BODY_BYTES = 64 * 1024 * 1024
+
 
 class EventStreamResponse(Response):
     """Server-sent events whose producer is cancelled as soon as the client disconnects."""
@@ -77,6 +79,14 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
             await anyio.to_thread.run_sync(manager.close)
 
     application = FastAPI(title='PubMed Local LLM API', version='0.1.0', lifespan=lifespan)
+
+    @application.middleware('http')
+    async def limit_body(request: Request, call_next):
+        # Four 8 MB images as base64 JSON stay well below this; anything larger is refused unread.
+        if int(request.headers.get('content-length') or 0) > MAX_BODY_BYTES:
+            return JSONResponse(status_code=413, content={'error': {'code': 'request_too_large',
+                                'message': 'Request body is too large', 'details': {}}})
+        return await call_next(request)
     web_dir = Path(__file__).resolve().parent / 'static'
     application.mount('/static', StaticFiles(directory=web_dir), name='static')
 

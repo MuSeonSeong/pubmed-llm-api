@@ -776,3 +776,10 @@ test('regenerating with another model switches the chat and keeps both versions'
   const answer = store.current.messages.at(-1);
   assert.deepEqual(answer.versions.map(v => v.model), ['qwen3.5-2b', 'qwen3-0.6b']);
 });
+
+
+test('code fences named after object properties render as plain code', () => {
+  for (const name of ['constructor', '__proto__', 'toString']) {
+    assert.ok(renderMarkdown('```' + name + '\nlet x = 1\n```').includes('let x = 1'));
+  }
+});

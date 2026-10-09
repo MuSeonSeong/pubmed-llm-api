@@ -1,4 +1,4 @@
-import { ATTACHMENT_LIMIT, ChatStore, MAX_IMAGES, MODEL_LABELS, VISION_MODELS, chatMarkdown, isImage, readAttachments,
+import { ATTACHMENT_LIMIT, ChatStore, MAX_ATTACHMENTS, MAX_IMAGES, MODEL_LABELS, VISION_MODELS, chatMarkdown, isImage, readAttachments,
   renderMarkdown, withoutCitationList } from './chat.mjs';
 
 const $ = id => document.getElementById(id);
@@ -531,8 +531,10 @@ async function attachFiles(files) {
   const texts = files.filter(file => !file.type.startsWith('image/') && !isPdf(file));
   const used = pendingFiles.filter(file => !isImage(file)).reduce((sum, file) => sum + file.text.length, 0);
   try {
-    const room = MAX_IMAGES - pendingFiles.filter(isImage).length;
-    if (images.length > room) toast('이미지는 한 번에 ' + MAX_IMAGES + '장까지 보낼 수 있어요.');
+    const slots = () => MAX_ATTACHMENTS - pendingFiles.length;
+    const room = Math.min(MAX_IMAGES - pendingFiles.filter(isImage).length, slots());
+    if (images.length + texts.length + pdfs.length > slots()) toast('첨부는 한 번에 ' + MAX_ATTACHMENTS + '개까지예요.');
+    else if (images.length > room) toast('이미지는 한 번에 ' + MAX_IMAGES + '장까지 보낼 수 있어요.');
     for (const file of images.slice(0, Math.max(0, room))) pendingFiles.push(await readImage(file));
     if (images.length && !VISION_MODELS.includes(store.current.model)) {
       store.updateChat({ model: VISION_MODELS[0] });
@@ -540,12 +542,12 @@ async function attachFiles(files) {
     }
     if (pdfs.length) {
       toast('PDF에서 글자를 읽고 있어요…');
-      for (const file of pdfs) texts.push(await readPdf(file));
+      for (const file of pdfs.slice(0, Math.max(0, slots() - texts.length))) texts.push(await readPdf(file));
     }
     if (texts.length) {
       if (used >= ATTACHMENT_LIMIT) toast('텍스트 첨부는 모두 합쳐 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지예요.');
       else {
-        const added = await readAttachments(texts.slice(0, 5), used);
+        const added = await readAttachments(texts.slice(0, Math.max(0, slots())), used);
         pendingFiles.push(...added);
         if (added.some(file => file.truncated)) toast('파일이 길어 앞부분 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지만 첨부했어요.');
       }

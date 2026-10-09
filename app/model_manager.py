@@ -7,7 +7,7 @@ import threading
 import anyio
 import torch
 from app.catalog import ModelSpec, model_weight_files
-from app.images import IMAGE_TOKEN, MODEL_MAX_PIXELS, decode_image
+from app.images import IMAGE_TOKEN, MODEL_MAX_PIXELS, VISION_TOKENS, decode_image
 from app.settings import Settings, ServiceError
 
 @dataclass(frozen=True)
@@ -115,8 +115,10 @@ class ModelManager:
         if self._vision is None or self._vision[0] != spec.id:
             # The PIL variant avoids the torchvision dependency of the default (fast) processor.
             from transformers.models.qwen2_vl.image_processing_pil_qwen2_vl import Qwen2VLImageProcessorPil
-            processor = Qwen2VLImageProcessorPil.from_pretrained(self.settings.models_dir / spec.directory,
-                                                                local_files_only=True)
+            # The size bounds are pixel counts: at most MODEL_MAX_PIXELS per image.
+            processor = Qwen2VLImageProcessorPil.from_pretrained(
+                self.settings.models_dir / spec.directory, local_files_only=True,
+                size={'shortest_edge': 56 * 56, 'longest_edge': MODEL_MAX_PIXELS})
             self._vision = (spec.id, processor)
         return self._vision[1]
 
@@ -131,11 +133,18 @@ class ModelManager:
             parts = []
             for part in message['content']:
                 if part['type'] == 'text':
-                    parts.append({'type': 'text', 'text': part['text']})
+                    text = part['text']
+                    for token in VISION_TOKENS:
+                        text = text.replace(token, '')
+                    parts.append({'type': 'text', 'text': text})
                 else:
                     images.append(decode_image(part['image_url']['url']))
                     parts.append({'type': 'image'})
-            templated.append({**message, 'content': parts})
+            if all(part['type'] == 'text' for part in parts):
+                # Text-only templates (Qwen3) render list content as empty, so send plain text.
+                templated.append({**message, 'content': '\n\n'.join(part['text'] for part in parts)})
+            else:
+                templated.append({**message, 'content': parts})
         if images and not spec.vision:
             raise ServiceError('vision_unsupported', f'{spec.id} cannot read images', 422)
         return images, templated
@@ -147,7 +156,7 @@ class ModelManager:
             return tokenizer.apply_chat_template(templated, tokenize=True, return_dict=True,
                                                  return_tensors='pt', **options)
         processor = self._image_processor(spec)
-        features = processor(images=images, return_tensors='pt', max_pixels=MODEL_MAX_PIXELS)
+        features = processor(images=images, return_tensors='pt')
         text = tokenizer.apply_chat_template(templated, tokenize=False, **options)
         pieces = text.split(IMAGE_TOKEN)
         if len(pieces) - 1 != len(images):
@@ -156,7 +165,11 @@ class ModelManager:
         text = pieces[0] + ''.join(IMAGE_TOKEN * (int(grid.prod()) // merge) + piece
                                    for grid, piece in zip(features['image_grid_thw'], pieces[1:]))
         encoded = tokenizer([text], return_tensors='pt', add_special_tokens=False)
+        # Marks image tokens (type 1) so Qwen3.5 gives them 2D rotary positions; without it they
+        # silently get plain text positions and lose their spatial layout.
+        image_mask = encoded['input_ids'] == tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
         return {'input_ids': encoded['input_ids'], 'attention_mask': encoded['attention_mask'],
+                'mm_token_type_ids': image_mask.long(),
                 'pixel_values': features['pixel_values'], 'image_grid_thw': features['image_grid_thw']}
 
     async def generate(self, model_id: str, messages: list[dict], tools: list[dict],

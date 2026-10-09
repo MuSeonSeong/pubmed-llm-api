@@ -7,6 +7,7 @@ const DEFAULT_FILE_PROMPT = '첨부한 파일의 내용을 요약해 줘.';
 const DEFAULT_IMAGE_PROMPT = '이 이미지를 설명해 줘.';
 export const VISION_MODELS = ['qwen3.5-2b'];
 export const MAX_IMAGES = 4;  // per request, matching the server
+export const MAX_ATTACHMENTS = 8;  // per message
 const IMAGE_URL = /^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
 export const isImage = file => file?.kind === 'image';
 export const DEFAULT_SETTINGS = Object.freeze({ systemPrompt: '', temperature: 0.2, maxTokens: 512 });
@@ -55,7 +56,7 @@ function restoreAttachments(files) {
     }
     return typeof file.text === 'string'
       ? { name, text: file.text.slice(0, ATTACHMENT_LIMIT), truncated: file.truncated === true } : null;
-  }).filter(Boolean).slice(0, 8);
+  }).filter(Boolean).slice(0, MAX_ATTACHMENTS);
 }
 
 /** What the model sees for a user turn: the question followed by each attached file. */
@@ -819,7 +820,8 @@ const LANGUAGE = { py: 'python', python: 'python', js: 'js', javascript: 'js', t
 
 /** Token-colour code; the raw code is split first and every piece is escaped, so markup cannot leak. */
 export function highlight(code, language) {
-  const family = LANGUAGE[language.toLowerCase()];
+  const key = language.toLowerCase();
+  const family = Object.hasOwn(LANGUAGE, key) ? LANGUAGE[key] : null;  // fences like "constructor" are not languages
   if (!family) return escapeHtml(code);
   const comment = { python: '#[^\n]*', r: '#[^\n]*', bash: '#[^\n]*', sql: '--[^\n]*', js: '\\/\\/[^\n]*|\\/\\*[\\s\\S]*?\\*\\/' }[family];
   const words = KEYWORDS[family].split(' ').map(word => word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|');
