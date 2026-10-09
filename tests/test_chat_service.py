@@ -317,3 +317,29 @@ def test_stream_reports_queueing_behind_another_request():
     stages=[e['stage'] for e in events if e['type']=='status']
     assert stages[0] == 'queued'
     assert 'loading_model' not in stages
+
+
+def test_sources_merge_search_summaries_and_fetched_articles():
+    from app.chat_service import collect_sources
+    from app.schemas import ToolTrace
+    search=ToolTrace(name=SEARCH,arguments={},result={'pmids':['24393785','37185680','bad id'],'summaries':[
+        {'pmid':'24393785','title':'Metformin mode of action.','authors':'Pernicova I, Korbonits M',
+         'source':'Nat Rev Endocrinol','pubDate':'2014-03-01','doi':'10.1038/x','pubmedUrl':'javascript:alert(1)'}]})
+    fetch=ToolTrace(name='pubmed_fetch_articles',arguments={},result={'articles':[
+        {'pmid':'24393785','abstractText':'Metformin has been...'},
+        {'pmid':'37185680','title':'Metformin and Cancer.','authors':[{'lastName':'Yu','initials':'OHY'},
+         {'lastName':'Suissa','initials':'S'},{'lastName':'A','initials':'B'},{'lastName':'C','initials':'D'}],
+         'journalInfo':{'isoAbbreviation':'Diabetes Care','publicationDate':{'year':'2023'}}}]})
+    first,second=collect_sources([search,fetch])
+    assert first.pmid == '24393785' and first.abstract_fetched
+    assert first.url == 'https://pubmed.ncbi.nlm.nih.gov/24393785/'
+    assert (first.title,first.journal,first.year) == ('Metformin mode of action.','Nat Rev Endocrinol','2014')
+    assert second.authors == 'Yu OHY, Suissa S, A B et al.'
+    assert (second.journal,second.year,second.abstract_fetched) == ('Diabetes Care','2023',False)
+
+
+def test_answers_carry_sources_only_for_tool_results():
+    r,_,_=complete([call(),'Answer'])
+    assert [s.pmid for s in r.sources] == ['31542292']
+    r,_,_=complete(['hello'],use_pubmed=False)
+    assert r.sources == []

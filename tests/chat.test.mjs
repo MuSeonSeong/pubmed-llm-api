@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ATTACHMENT_LIMIT, ChatStore, chatMarkdown, readAttachments, readEvents, renderMarkdown } from '../app/static/chat.mjs';
+import { ATTACHMENT_LIMIT, ChatStore, chatMarkdown, normalizeSources, readAttachments, readEvents, renderMarkdown,
+  withoutCitationList } from '../app/static/chat.mjs';
 
 const memory = () => {
   const data = new Map();
@@ -508,4 +509,18 @@ test('a failed regeneration restores the previous answer and reports why', async
   assert.deepEqual(store.current.messages.map(m => m.content), ['질문', '원래 답']);
   assert.equal(store.current.messages[0].error, undefined);
   assert.ok(store.notice.includes('서버'));
+});
+
+
+test('sources are normalized, rebuilt from the PMID, persisted and kept per version', async () => {
+  const storage = memory();
+  const store = new ChatStore(storage, async () => sse([{ ...done('답\n\nPubMed 검색·조회 출처:\n- PMID [1](x)'),
+    sources: [{ pmid: '1', url: 'javascript:alert(1)', title: '논문', journal: 'J', year: '2020', abstract_fetched: true },
+      { pmid: 'bad' }] }]));
+  await store.send('질문');
+  const answer = new ChatStore(storage).current.messages.at(-1);
+  assert.deepEqual(answer.sources, [{ pmid: '1', url: 'https://pubmed.ncbi.nlm.nih.gov/1/', title: '논문',
+    journal: 'J', year: '2020', abstractFetched: true }]);
+  assert.equal(withoutCitationList(answer.content), '답');
+  assert.equal(normalizeSources('nope').length, 0);
 });

@@ -7,7 +7,7 @@ import threading
 import anyio
 from app.model_manager import ModelManager
 from app.pubmed import PubMedClient, format_tool_result
-from app.schemas import ChatRequest, ChatResponse, Choice, AssistantMessage, ToolTrace
+from app.schemas import ChatRequest, ChatResponse, Choice, AssistantMessage, Source, ToolTrace
 from app.settings import ServiceError
 
 GUIDANCE = ('You can search PubMed and fetch article abstracts. For requests to find papers, use the tools. '
@@ -121,6 +121,49 @@ def error_payload(exc: ServiceError) -> dict:
     return {'code': exc.code, 'message': exc.message, 'details': exc.details}
 
 
+def _text(value, limit: int) -> str | None:
+    return value.strip()[:limit] or None if isinstance(value, str) else None
+
+
+def collect_sources(traces: list[ToolTrace]) -> list[Source]:
+    """Article metadata from search summaries and fetched records, merged per PMID in citation order."""
+    found: dict[str, dict] = {}
+    def entry(pmid) -> dict | None:
+        if not isinstance(pmid, str) or not re.fullmatch(r'[0-9]+', pmid):
+            return None
+        return found.setdefault(pmid, {'pmid': pmid, 'url': f'https://pubmed.ncbi.nlm.nih.gov/{pmid}/'})
+    def fill(item: dict, **values) -> None:
+        for key, value in values.items():
+            if value and not item.get(key):
+                item[key] = value
+    for trace in traces:
+        result = trace.result or {}
+        for pmid in result.get('pmids', []):
+            entry(pmid)
+        for summary in result.get('summaries', []):
+            item = isinstance(summary, dict) and entry(summary.get('pmid'))
+            if item:
+                fill(item, title=_text(summary.get('title'), 300), authors=_text(summary.get('authors'), 200),
+                     journal=_text(summary.get('source'), 120), year=_text(str(summary.get('pubDate') or '')[:4], 4),
+                     doi=_text(summary.get('doi'), 120))
+        for article in result.get('articles', []):
+            item = isinstance(article, dict) and entry(article.get('pmid'))
+            if not item:
+                continue
+            journal = article.get('journalInfo') if isinstance(article.get('journalInfo'), dict) else {}
+            date = journal.get('publicationDate') if isinstance(journal.get('publicationDate'), dict) else {}
+            names = [f"{a.get('lastName', '')} {a.get('initials', '')}".strip()
+                     for a in article.get('authors', []) if isinstance(a, dict)]
+            names = [name for name in names if name]
+            authors = ', '.join(names[:3]) + (' et al.' if len(names) > 3 else '')
+            fill(item, title=_text(article.get('title'), 300), authors=_text(authors, 200),
+                 journal=_text(journal.get('isoAbbreviation') or journal.get('title'), 120),
+                 year=_text(str(date.get('year') or ''), 4), doi=_text(article.get('doi'), 120))
+            if _text(article.get('abstractText'), 1):
+                item['abstract_fetched'] = True
+    return [Source(**item) for item in found.values()]
+
+
 def append_citations(text: str, traces: list[ToolTrace]) -> str:
     pmids = []
     for trace in traces:
@@ -222,13 +265,15 @@ class ChatService:
                     return ChatResponse(model=request.model, choices=[Choice(
                         message=AssistantMessage(content=visible_text(raw).strip(),
                                                  reasoning_content='\n\n'.join(reasonings) or None),
-                        finish_reason='cancelled')], tool_calls=traces, dropped_messages=dropped)
+                        finish_reason='cancelled')], tool_calls=traces, dropped_messages=dropped,
+                        sources=collect_sources(traces))
                 calls = parse_tool_calls(raw, tools)
                 if not calls:
                     return ChatResponse(model=request.model, choices=[Choice(
                         message=AssistantMessage(content=append_citations(clean_text(raw), traces),
                                                  reasoning_content='\n\n'.join(reasonings) or None),
-                        finish_reason=result.finish_reason)], tool_calls=traces, dropped_messages=dropped)
+                        finish_reason=result.finish_reason)], tool_calls=traces, dropped_messages=dropped,
+                        sources=collect_sources(traces))
                 if not tools:
                     raise ServiceError('tools_disabled', 'Model requested tools when PubMed is disabled', 502)
                 if len(traces) + len(calls) > 4:

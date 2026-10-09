@@ -19,6 +19,25 @@ function normalizeTools(calls) {
       ...(typeof call.error === 'string' ? { error: call.error } : {}) })) : [];
 }
 
+const CITATIONS = '\n\nPubMed 검색·조회 출처:\n';
+
+/** Keep only well-formed PubMed sources; links are rebuilt from the PMID rather than trusted. */
+export function normalizeSources(sources) {
+  if (!Array.isArray(sources)) return [];
+  const text = (value, limit) => typeof value === 'string' && value.trim() ? value.trim().slice(0, limit) : undefined;
+  return sources.filter(item => item && /^[0-9]+$/.test(item.pmid)).slice(0, 20).map(item => Object.fromEntries(
+    Object.entries({ pmid: item.pmid, url: 'https://pubmed.ncbi.nlm.nih.gov/' + item.pmid + '/',
+      title: text(item.title, 300), authors: text(item.authors, 200), journal: text(item.journal, 120),
+      year: text(item.year, 4), abstractFetched: item.abstractFetched === true || item.abstract_fetched === true })
+      .filter(([, value]) => value !== undefined)));
+}
+
+/** The answer without the server's plain citation list, for when source cards show the same links. */
+export function withoutCitationList(content) {
+  const index = content.lastIndexOf(CITATIONS);
+  return index === -1 ? content : content.slice(0, index);
+}
+
 function restoreAttachments(files) {
   return Array.isArray(files) ? files.filter(file => file && typeof file.name === 'string'
     && typeof file.text === 'string').slice(0, 5).map(file => ({ name: file.name.slice(0, 200),
@@ -56,7 +75,7 @@ export function chatMarkdown(chat) {
 }
 
 const MAX_VERSIONS = 10;
-const VERSION_FIELDS = ['content', 'toolCalls', 'truncated', 'stopped', 'reasoning', 'thinkMs', 'model', 'dropped'];
+const VERSION_FIELDS = ['content', 'toolCalls', 'truncated', 'stopped', 'reasoning', 'thinkMs', 'model', 'dropped', 'sources'];
 
 /** The parts of an answer that differ between regenerated versions. */
 function snapshot(message) {
@@ -69,7 +88,8 @@ function restoreVersions(versions) {
     .map(item => snapshot({ ...item, toolCalls: normalizeTools(item.toolCalls), truncated: item.truncated === true,
       stopped: item.stopped === true, reasoning: typeof item.reasoning === 'string' && item.reasoning ? item.reasoning : undefined,
       thinkMs: Number.isFinite(item.thinkMs) ? item.thinkMs : undefined, model: MODELS.includes(item.model) ? item.model : undefined,
-      dropped: Number.isInteger(item.dropped) && item.dropped > 0 ? item.dropped : undefined }));
+      dropped: Number.isInteger(item.dropped) && item.dropped > 0 ? item.dropped : undefined,
+      sources: normalizeSources(item.sources).length ? normalizeSources(item.sources) : undefined }));
 }
 
 function restoreSettings(value) {
@@ -97,6 +117,7 @@ function restoreChat(chat, live = false) {
       ...(typeof message.reasoning === 'string' && message.reasoning ? { reasoning: message.reasoning } : {}),
       ...(Number.isFinite(message.thinkMs) && message.thinkMs >= 0 ? { thinkMs: message.thinkMs } : {}),
       ...(MODELS.includes(message.model) ? { model: message.model } : {}),
+      ...(normalizeSources(message.sources).length ? { sources: normalizeSources(message.sources) } : {}),
       ...(message.role === 'assistant' && restoreVersions(message.versions).length > 1 ? {
         versions: restoreVersions(message.versions),
         version: Math.min(Math.max(Number.isInteger(message.version) ? message.version : 0, 0),
@@ -161,6 +182,7 @@ function finish(draft, data) {
   if (typeof content !== 'string') throw new Error('빈 응답을 받았습니다. 다시 시도해 주세요.');
   draft.content = content;
   draft.toolCalls = normalizeTools(data.tool_calls);
+  if (normalizeSources(data.sources).length) draft.sources = normalizeSources(data.sources);
   draft.truncated = choice.finish_reason === 'length';
   draft.stopped = choice.finish_reason === 'cancelled';
   if (typeof choice.message.reasoning_content === 'string' && choice.message.reasoning_content) {

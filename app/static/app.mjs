@@ -1,4 +1,5 @@
-import { ATTACHMENT_LIMIT, ChatStore, MODEL_LABELS, chatMarkdown, readAttachments, renderMarkdown } from './chat.mjs';
+import { ATTACHMENT_LIMIT, ChatStore, MODEL_LABELS, chatMarkdown, readAttachments, renderMarkdown,
+  withoutCitationList } from './chat.mjs';
 
 const $ = id => document.getElementById(id);
 const icon = name => {
@@ -224,6 +225,29 @@ function startEdit(message) {
   render();
 }
 
+function sourceCards(sources) {
+  const section = element('section', 'sources');
+  section.setAttribute('aria-label', '참고한 논문');
+  section.append(element('div', 'sources-heading', '참고한 논문 ' + sources.length + '편'));
+  const list = element('div', 'source-list');
+  for (const source of sources) {
+    const card = element('a', 'source-card');
+    card.href = source.url;
+    card.target = '_blank';
+    card.rel = 'noopener noreferrer';
+    card.append(element('span', 'source-title', source.title || 'PMID ' + source.pmid));
+    const meta = [source.journal, source.year, source.authors].filter(Boolean).join(' · ');
+    if (meta) card.append(element('span', 'source-meta', meta));
+    const foot = element('span', 'source-foot');
+    foot.append(element('span', '', 'PMID ' + source.pmid));
+    if (source.abstractFetched) foot.append(element('span', 'source-badge', '초록 확인'));
+    card.append(foot);
+    list.append(card);
+  }
+  section.append(list);
+  return section;
+}
+
 function editForm(message) {
   const form = element('form', 'edit-form');
   const field = element('textarea', 'edit-input');
@@ -297,7 +321,7 @@ function renderAssistant(message, chat) {
   if (message.streaming && message.toolCalls.length) body.append(toolDetails(message.toolCalls, false));
   if (message.content) {
     const text = element('div', 'markdown' + (message.streaming ? ' streaming' : ''));
-    text.innerHTML = renderMarkdown(message.content);
+    text.innerHTML = renderMarkdown(message.sources?.length ? withoutCitationList(message.content) : message.content);
     body.append(text);
   }
   if (message.streaming && !message.content && !(message.reasoning && !message.toolCalls.some(call => call.running))) {
@@ -308,6 +332,7 @@ function renderAssistant(message, chat) {
     '대화가 길어 앞부분 메시지 ' + message.dropped + '개는 참고하지 않고 답했어요. 새 주제라면 새 대화를 시작해 보세요.'));
   if (message.truncated) body.append(element('div', 'truncated-note',
     '답변 길이 한도에 도달했습니다. “이어서 설명해줘”라고 요청하거나 설정에서 답변 길이를 늘려 보세요.'));
+  if (!message.streaming && message.sources?.length) body.append(sourceCards(message.sources));
   if (!message.streaming && message.toolCalls.length) body.append(toolDetails(message.toolCalls, false));
   article.append(body);
   if (!message.streaming) {

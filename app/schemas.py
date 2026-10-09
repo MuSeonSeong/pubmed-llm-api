@@ -31,6 +31,17 @@ class ToolTrace(BaseModel):
     result: dict | None = None
     error: str | None = None
 
+class Source(BaseModel):
+    """A PubMed article that a tool actually returned during this answer."""
+    pmid: str
+    url: str
+    title: str | None = None
+    authors: str | None = None
+    journal: str | None = None
+    year: str | None = None
+    doi: str | None = None
+    abstract_fetched: bool = False
+
 class AssistantMessage(BaseModel):
     role: Literal['assistant'] = 'assistant'
     content: str
@@ -45,4 +56,5 @@ class ChatResponse(BaseModel):
     model: str
     choices: list[Choice]
     tool_calls: list[ToolTrace] = Field(default_factory=list)
+    sources: list[Source] = Field(default_factory=list)
     dropped_messages: int = 0
