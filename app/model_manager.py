@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from functools import partial
 import gc
+import json
 import threading
 import anyio
 import torch
@@ -35,8 +36,19 @@ class ModelManager:
 
     def status(self) -> dict:
         return {'device': self.device, 'loaded_model': self._loaded_id,
-                'model_files': {name: (self.settings.models_dir / spec.directory / 'config.json').is_file()
+                'model_files': {name: self._files_available(self.settings.models_dir / spec.directory)
                                 for name, spec in self.catalog.items()}}
+
+    @staticmethod
+    def _files_available(path) -> bool:
+        if not all((path / name).is_file() for name in ['config.json', 'tokenizer_config.json', 'tokenizer.json']):
+            return False
+        try:
+            index = path / 'model.safetensors.index.json'
+            weights = [path / name for name in set(json.loads(index.read_text())['weight_map'].values())] if index.exists() else list(path.glob('*.safetensors'))
+            return bool(weights) and all(file.is_file() and file.stat().st_size > 0 for file in weights)
+        except (OSError, ValueError, KeyError):
+            return False
 
     def _release(self) -> None:
         self._model = self._tokenizer = None
@@ -54,7 +66,7 @@ class ModelManager:
     def _load(self, spec: ModelSpec):
         from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3_5ForConditionalGeneration
         path = self.settings.models_dir / spec.directory
-        if not (path / 'config.json').is_file():
+        if not self._files_available(path):
             raise ServiceError('model_missing', 'Run: uv run python scripts/prepare_models.py', 503)
         dtype = torch.float32 if self.device == 'cpu' else torch.float16
         if self.device == 'cuda' and torch.cuda.is_bf16_supported():

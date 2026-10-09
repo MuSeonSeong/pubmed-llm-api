@@ -128,3 +128,14 @@ def test_mps_load_stages_weights_on_cpu_before_move(monkeypatch):
     from app.model_manager import ModelManager
     ModelManager._load(obj,obj.catalog['qwen3-0.6b'])
     assert calls == [('load','cpu'),('move','mps')]
+
+
+def test_config_without_weights_is_not_ready(tmp_path):
+    from app.model_manager import ModelManager
+    from app.catalog import load_catalog
+    from app.settings import Settings
+    path=tmp_path/'qwen3-0.6b'
+    path.mkdir()
+    (path/'config.json').write_text('{}')
+    m=ModelManager(Settings(device='cpu',models_dir=tmp_path),load_catalog())
+    assert m.status()['model_files']['qwen3-0.6b'] is False
