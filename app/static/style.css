@@ -168,6 +168,12 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .message-user .attachment-list { justify-content: flex-end; margin-bottom: 6px; max-width: 85%; }
 .attachment-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 260px; border: 1px solid var(--line-2); background: var(--raised); border-radius: 9px; padding: 5px 4px 5px 9px; font-size: 12px; }
 .message-user .attachment-chip { padding-right: 10px; }
+.image-chip { padding: 0; overflow: hidden; position: relative; border-radius: 10px; }
+.attachment-image { display: block; height: 72px; max-width: 160px; object-fit: cover; }
+.message-user .attachment-image { height: 140px; max-width: 260px; }
+.message-user .image-chip { padding: 0; }
+.image-chip .icon-button { position: absolute; top: 4px; right: 4px; background: #000a; color: white; border-radius: 50%; }
+.image-chip .icon-button:hover:not(:disabled) { background: #000c; color: white; }
 .attachment-chip > .icon { width: 15px; height: 15px; color: var(--green); }
 .attachment-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-size { color: var(--faint); font-size: 11px; flex-shrink: 0; }

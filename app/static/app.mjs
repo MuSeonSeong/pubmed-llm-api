@@ -1,5 +1,5 @@
-import { ATTACHMENT_LIMIT, ChatStore, MODEL_LABELS, chatMarkdown, readAttachments, renderMarkdown,
-  withoutCitationList } from './chat.mjs';
+import { ATTACHMENT_LIMIT, ChatStore, MAX_IMAGES, MODEL_LABELS, VISION_MODELS, chatMarkdown, isImage, readAttachments,
+  renderMarkdown, withoutCitationList } from './chat.mjs';
 
 const $ = id => document.getElementById(id);
 const icon = name => {
@@ -164,10 +164,21 @@ function assistantHeading(message) {
 function fileChips(files, onRemove) {
   const list = element('div', 'attachment-list');
   files.forEach((file, index) => {
-    const chip = element('span', 'attachment-chip');
-    chip.title = file.name + (file.truncated ? ' · 길어서 앞부분만 첨부' : '');
-    chip.append(icon('file'), element('span', 'attachment-name', file.name),
-      element('span', 'attachment-size', file.text.length.toLocaleString() + '자' + (file.truncated ? '+' : '')));
+    const chip = element('span', 'attachment-chip' + (isImage(file) ? ' image-chip' : ''));
+    if (isImage(file) && file.dataUrl) {
+      chip.title = file.name;
+      const picture = element('img', 'attachment-image');
+      picture.src = file.dataUrl;  // restoreAttachments only keeps base64 raster data URLs
+      picture.alt = file.name;
+      chip.append(picture);
+    } else if (isImage(file)) {
+      chip.title = file.name + ' · 저장 공간이 부족해 이미지를 지웠어요';
+      chip.append(icon('file'), element('span', 'attachment-name', file.name), element('span', 'attachment-size', '삭제됨'));
+    } else {
+      chip.title = file.name + (file.truncated ? ' · 길어서 앞부분만 첨부' : '');
+      chip.append(icon('file'), element('span', 'attachment-name', file.name),
+        element('span', 'attachment-size', file.text.length.toLocaleString() + '자' + (file.truncated ? '+' : '')));
+    }
     if (onRemove) chip.append(iconButton('close', file.name + ' 첨부 취소', () => onRemove(index)));
     list.append(chip);
   });
@@ -468,14 +479,45 @@ function renderPendingFiles() {
   }).children);
 }
 
+/** Downscale to at most 1024 px and re-encode as JPEG: the model sees ~512 px anyway, and it saves storage. */
+async function readImage(file) {
+  let bitmap;
+  try { bitmap = await createImageBitmap(file); }
+  catch { throw new Error(file.name + '은(는) 열 수 없는 이미지 형식이에요. PNG·JPEG·WebP·GIF를 사용해 주세요.'); }
+  const scale = Math.min(1, 1024 / Math.max(bitmap.width, bitmap.height));
+  const canvas = element('canvas');
+  canvas.width = Math.max(1, Math.round(bitmap.width * scale));
+  canvas.height = Math.max(1, Math.round(bitmap.height * scale));
+  const context = canvas.getContext('2d');
+  context.fillStyle = '#fff';  // transparent areas would otherwise turn black in JPEG
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  bitmap.close();
+  return { name: file.name || '붙여넣은 이미지.jpg', kind: 'image', dataUrl: canvas.toDataURL('image/jpeg', 0.85) };
+}
+
 async function attachFiles(files) {
+  files = [...files];
   if (!files.length) return;
-  const used = pendingFiles.reduce((sum, file) => sum + file.text.length, 0);
-  if (used >= ATTACHMENT_LIMIT) { toast('첨부는 모두 합쳐 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지예요.'); return; }
+  const images = files.filter(file => file.type.startsWith('image/'));
+  const texts = files.filter(file => !file.type.startsWith('image/'));
+  const used = pendingFiles.filter(file => !isImage(file)).reduce((sum, file) => sum + file.text.length, 0);
   try {
-    const added = await readAttachments([...files].slice(0, 5 - pendingFiles.length), used);
-    pendingFiles.push(...added);
-    if (added.some(file => file.truncated)) toast('파일이 길어 앞부분 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지만 첨부했어요.');
+    const room = MAX_IMAGES - pendingFiles.filter(isImage).length;
+    if (images.length > room) toast('이미지는 한 번에 ' + MAX_IMAGES + '장까지 보낼 수 있어요.');
+    for (const file of images.slice(0, Math.max(0, room))) pendingFiles.push(await readImage(file));
+    if (images.length && !VISION_MODELS.includes(store.current.model)) {
+      store.updateChat({ model: VISION_MODELS[0] });
+      toast('이미지를 이해할 수 있는 ' + MODEL_LABELS[VISION_MODELS[0]] + ' 모델로 바꿨어요.');
+    }
+    if (texts.length) {
+      if (used >= ATTACHMENT_LIMIT) toast('텍스트 첨부는 모두 합쳐 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지예요.');
+      else {
+        const added = await readAttachments(texts.slice(0, 5), used);
+        pendingFiles.push(...added);
+        if (added.some(file => file.truncated)) toast('파일이 길어 앞부분 ' + ATTACHMENT_LIMIT.toLocaleString() + '자까지만 첨부했어요.');
+      }
+    }
   } catch (error) { toast(error.message || '파일을 읽을 수 없습니다.'); }
   renderPendingFiles();
   updateComposer();
@@ -547,6 +589,12 @@ $('chat-form').addEventListener('submit', event => {
 });
 $('stop').addEventListener('click', () => { store.stop(); prompt.focus(); });
 $('attach').addEventListener('click', () => $('file-input').click());
+prompt.addEventListener('paste', event => {
+  const files = [...(event.clipboardData?.files || [])].filter(file => file.type.startsWith('image/'));
+  if (!files.length || !store.canModify()) return;
+  event.preventDefault();  // a pasted screenshot becomes an attachment, not text
+  attachFiles(files);
+});
 $('file-input').addEventListener('change', event => { attachFiles(event.target.files); event.target.value = ''; });
 const composer = $('chat-form');
 composer.addEventListener('dragover', event => {

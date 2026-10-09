@@ -4,6 +4,11 @@ export const MODEL_LABELS = { 'qwen3.5-2b': 'Qwen3.5 · 2B', 'qwen3-0.6b': 'Qwen
 /** Small local models have a few thousand tokens of context, so attachments are capped. */
 export const ATTACHMENT_LIMIT = 12000;
 const DEFAULT_FILE_PROMPT = '첨부한 파일의 내용을 요약해 줘.';
+const DEFAULT_IMAGE_PROMPT = '이 이미지를 설명해 줘.';
+export const VISION_MODELS = ['qwen3.5-2b'];
+export const MAX_IMAGES = 4;  // per request, matching the server
+const IMAGE_URL = /^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
+export const isImage = file => file?.kind === 'image';
 export const DEFAULT_SETTINGS = Object.freeze({ systemPrompt: '', temperature: 0.2, maxTokens: 512 });
 const id = () => globalThis.crypto.randomUUID();
 const freshChat = () => ({ id: id(), title: '새 대화', model: MODELS[0],
@@ -39,14 +44,23 @@ export function withoutCitationList(content) {
 }
 
 function restoreAttachments(files) {
-  return Array.isArray(files) ? files.filter(file => file && typeof file.name === 'string'
-    && typeof file.text === 'string').slice(0, 5).map(file => ({ name: file.name.slice(0, 200),
-    text: file.text.slice(0, ATTACHMENT_LIMIT), truncated: file.truncated === true })) : [];
+  if (!Array.isArray(files)) return [];
+  return files.filter(file => file && typeof file.name === 'string').map(file => {
+    const name = file.name.slice(0, 200);
+    if (isImage(file)) {
+      // removed: the picture was dropped to free browser storage; only its name remains.
+      const dataUrl = typeof file.dataUrl === 'string' && file.dataUrl.length < 4_000_000 && IMAGE_URL.test(file.dataUrl)
+        ? file.dataUrl : undefined;
+      return dataUrl ? { name, kind: 'image', dataUrl } : { name, kind: 'image', removed: true };
+    }
+    return typeof file.text === 'string'
+      ? { name, text: file.text.slice(0, ATTACHMENT_LIMIT), truncated: file.truncated === true } : null;
+  }).filter(Boolean).slice(0, 8);
 }
 
 /** What the model sees for a user turn: the question followed by each attached file. */
 export function messageText(message) {
-  const files = message.attachments || [];
+  const files = (message.attachments || []).filter(file => !isImage(file));
   return [message.content, ...files.map(file => '[첨부 파일: ' + file.name
     + (file.truncated ? ' (앞부분만)' : '') + ']\n```\n' + file.text + '\n```')].join('\n\n');
 }
@@ -68,7 +82,10 @@ export async function readAttachments(files, used = 0) {
 export function chatMarkdown(chat) {
   const lines = ['# ' + chat.title, ''];
   for (const message of chat.messages) {
-    if (message.role === 'user') lines.push('## 나', '', messageText(message), '');
+    if (message.role === 'user') {
+      const images = (message.attachments || []).filter(isImage).map(file => '[이미지: ' + file.name + ']');
+      lines.push('## 나', '', [...images, messageText(message)].join('\n\n'), '');
+    }
     else lines.push('## ' + (MODEL_LABELS[message.model] || 'PubMed Chat'), '', message.content, '');
   }
   return lines.join('\n');
@@ -318,12 +335,21 @@ export class ChatStore {
   }
 
   save() {
-    try {
-      try { this.merge(JSON.parse(this.storage.getItem(STORAGE_KEY) || 'null')); } catch { /* unreadable: overwrite */ }
-      this.storage.setItem(STORAGE_KEY, JSON.stringify({ chats: this.chats, activeId: this.activeId,
-        settings: this.settings, deleted: [...this.deleted].slice(-300) }));
-    } catch {
-      this.storageWarning = '브라우저에 기록을 저장할 수 없습니다. 페이지를 닫으면 대화가 사라질 수 있습니다.';
+    try { this.merge(JSON.parse(this.storage.getItem(STORAGE_KEY) || 'null')); } catch { /* unreadable: overwrite */ }
+    while (true) {
+      try {
+        this.storage.setItem(STORAGE_KEY, JSON.stringify({ chats: this.chats, activeId: this.activeId,
+          settings: this.settings, deleted: [...this.deleted].slice(-300) }));
+        return;
+      } catch {
+        // Pictures are by far the largest data; give up old ones before giving up the history.
+        if (dropOldImages(this.chats, this.activeId)) {
+          this.storageWarning = '브라우저 저장 공간이 부족해 오래된 대화의 이미지를 지웠어요.';
+          continue;
+        }
+        this.storageWarning = '브라우저에 기록을 저장할 수 없습니다. 페이지를 닫으면 대화가 사라질 수 있습니다.';
+        return;
+      }
     }
   }
 
@@ -424,7 +450,8 @@ export class ChatStore {
     if (!this.canModify(chat) || (!content.trim() && !files.length)) return;
     const release = await this.claim(chat);
     if (!release) return;
-    const message = { id: id(), role: 'user', content: content.trim() || DEFAULT_FILE_PROMPT,
+    const fallbackPrompt = files.every(isImage) ? DEFAULT_IMAGE_PROMPT : DEFAULT_FILE_PROMPT;
+    const message = { id: id(), role: 'user', content: content.trim() || fallbackPrompt,
       ...(files.length ? { attachments: files } : {}) };
     chat.messages.push(message);
     if (chat.title === '새 대화') chat.title = message.content.replace(/\s+/g, ' ').slice(0, 36);
@@ -506,6 +533,19 @@ export class ChatStore {
     return this.request(chat, chat.messages.at(-2), { continueFrom: chat.messages.at(-1), release });
   }
 
+  /** The newest images, up to MAX_IMAGES, if the chat's model can see; others are named in text. */
+  imagesToSend(chat) {
+    const chosen = new Set();
+    if (!VISION_MODELS.includes(chat.model)) return chosen;
+    for (const message of [...chat.messages].reverse()) {
+      if (message.error) continue;
+      for (const file of [...(message.attachments || [])].reverse()) {
+        if (isImage(file) && file.dataUrl && chosen.size < MAX_IMAGES) chosen.add(file);
+      }
+    }
+    return chosen;
+  }
+
   stop() { this.controller?.abort(); }
 
   /** Answer `message`; callers claim() the chat first and pass the lock release. */
@@ -519,8 +559,9 @@ export class ChatStore {
     const original = continueFrom ? snapshot(continueFrom) : null;
     const answerText = continueFrom ? withoutCitationList(continueFrom.content) : '';
     const citationTail = continueFrom ? continueFrom.content.slice(answerText.length) : '';
+    const sentImages = this.imagesToSend(chat);
     const history = chat.messages.filter(item => !item.error && item.content.trim())
-      .map(item => ({ role: item.role, content: item.role === 'user' ? messageText(item)
+      .map(item => ({ role: item.role, content: item.role === 'user' ? userContent(item, sentImages)
         : item === continueFrom ? answerText : item.content }));
     if (this.settings.systemPrompt.trim()) {
       history.unshift({ role: 'system', content: this.settings.systemPrompt.trim() });
@@ -645,6 +686,31 @@ export class ChatStore {
       releaseLock();
     }
   }
+}
+
+/** A user turn for the API: OpenAI-style parts when it carries images the model will see. */
+function userContent(message, sentImages) {
+  const images = (message.attachments || []).filter(isImage);
+  const omitted = images.filter(file => !sentImages.has(file)).map(file => '[이미지 생략: ' + file.name + ']');
+  const text = [messageText(message), ...omitted].join('\n\n');
+  const parts = images.filter(file => sentImages.has(file))
+    .map(file => ({ type: 'image_url', image_url: { url: file.dataUrl } }));
+  return parts.length ? [...parts, { type: 'text', text }] : text;
+}
+
+/** Drop picture data, oldest chats first, to fit browser storage; returns whether anything was dropped. */
+function dropOldImages(chats, keepChatId) {
+  for (const chat of [...chats].sort((a, b) => a.updatedAt - b.updatedAt)) {
+    if (chat.id === keepChatId) continue;
+    let dropped = false;
+    for (const message of chat.messages) {
+      for (const file of message.attachments || []) {
+        if (isImage(file) && file.dataUrl) { delete file.dataUrl; file.removed = true; dropped = true; }
+      }
+    }
+    if (dropped) return true;
+  }
+  return false;
 }
 
 export const escapeHtml = value => String(value).replace(/[&<>"']/g,

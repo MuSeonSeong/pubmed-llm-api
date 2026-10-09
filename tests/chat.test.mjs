@@ -712,3 +712,52 @@ test('a question refused because another tab holds the chat is not half-added', 
   assert.ok(store.notice);
   release();
 });
+
+
+const PNG = 'data:image/png;base64,iVBORw0KGgo=';
+const image = name => ({ name, kind: 'image', dataUrl: PNG });
+
+test('images go to vision models as parts, newest first and at most four per request', async () => {
+  const bodies = [];
+  const store = new ChatStore(memory(), async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return sse([done('보여요')]);
+  });
+  await store.send('', [image('a.png'), image('b.png'), image('c.png')]);
+  assert.equal(store.current.messages[0].content, '이 이미지를 설명해 줘.');
+  assert.deepEqual(bodies[0].messages[0].content.map(part => part.type), ['image_url', 'image_url', 'image_url', 'text']);
+  await store.send('이것도', [image('d.png'), image('e.png')]);
+  const [first, , second] = bodies[1].messages;
+  assert.equal(first.content.filter(part => part.type === 'image_url').length, 2);  // only the newest four go
+  assert.ok(first.content.at(-1).text.includes('[이미지 생략: a.png]'));
+  assert.equal(second.content.filter(part => part.type === 'image_url').length, 2);
+  store.updateChat({ model: 'qwen3-0.6b' });
+  await store.send('텍스트 모델');
+  assert.equal(typeof bodies[2].messages[0].content, 'string');
+  assert.ok(bodies[2].messages[0].content.includes('[이미지 생략: c.png]'));
+});
+
+test('stored images must be base64 raster data URLs', () => {
+  const saved = { activeId: 'x', chats: [{ id: 'x', title: 't', messages: [{ id: 'u', role: 'user', content: 'q', attachments: [
+    image('ok.png'), { name: 'svg', kind: 'image', dataUrl: 'data:image/svg+xml;base64,PHN2Zz4=' },
+    { name: 'js', kind: 'image', dataUrl: 'javascript:alert(1)' }] }] }] };
+  const files = new ChatStore({ getItem: () => JSON.stringify(saved), setItem: () => {} }).current.messages[0].attachments;
+  assert.deepEqual(files.map(f => [f.name, Boolean(f.dataUrl), f.removed === true]),
+    [['ok.png', true, false], ['svg', false, true], ['js', false, true]]);
+});
+
+test('when storage is full, old chats lose their pictures before history is lost', async () => {
+  const data = new Map();
+  const storage = { getItem: key => data.get(key) ?? null, setItem: (key, value) => {
+    if (value.length > 600 && value.includes(PNG)) throw new Error('QuotaExceededError');
+    data.set(key, value);
+  } };
+  const store = new ChatStore(storage, async () => sse([done('답')]));
+  store.chats[0].messages.push({ id: 'old', role: 'user', content: '예전', attachments: [image('old.png')] });
+  store.chats[0].updatedAt = 1;
+  store.newChat();
+  store.save();
+  const restored = new ChatStore(storage).chats.find(c => c.messages.length);
+  assert.equal(restored.messages[0].attachments[0].removed, true);
+  assert.ok(store.storageWarning.includes('이미지'));
+});
