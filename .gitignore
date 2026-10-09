@@ -1,0 +1,11 @@
+.venv/
+models/
+.cache/
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.superpowers/
+.DS_Store

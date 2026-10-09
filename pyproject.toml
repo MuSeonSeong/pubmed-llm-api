@@ -1,0 +1,32 @@
+[project]
+name = "pubmed-llm-api"
+version = "0.1.0"
+description = "Portable Transformers chat API with PubMed MCP"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "fastapi>=0.141.1,<0.142",
+  "uvicorn>=0.53.0,<0.54",
+  "pydantic-settings>=2.10,<3",
+  "httpx>=0.28.1,<0.29",
+  "mcp>=1.20,<2",
+  "torch>=2.14,<2.15",
+  "transformers>=5.17,<5.20",
+  "accelerate>=1.15,<2",
+  "safetensors>=0.8,<0.9",
+  "huggingface-hub>=1.0,<2",
+  "jsonschema>=4.25,<5",
+  "anyio>=4.12,<5",
+]
+[dependency-groups]
+dev = ["pytest>=8.4,<10"]
+[tool.uv]
+package = false
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" }]
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
