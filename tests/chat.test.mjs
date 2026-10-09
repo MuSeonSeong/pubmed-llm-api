@@ -524,3 +524,21 @@ test('sources are normalized, rebuilt from the PMID, persisted and kept per vers
   assert.equal(withoutCitationList(answer.content), '답');
   assert.equal(normalizeSources('nope').length, 0);
 });
+
+
+test('answers record token usage and elapsed time', async () => {
+  const store = new ChatStore(memory(), async () => sse([{ ...done('답'), usage: { completion_tokens: 42 } }]));
+  await store.send('질문');
+  const answer = store.current.messages.at(-1);
+  assert.equal(answer.tokens, 42);
+  assert.ok(answer.elapsedMs >= 0);
+});
+
+
+test('lists nest by indentation, keep numbering across blank lines and absorb continuation lines', () => {
+  const html = renderMarkdown('1. 첫째\n   설명 줄\n   - 하위 A\n   - 하위 B\n\n2. 둘째\n\n문단 ~~취소~~');
+  assert.equal(html, '<ol><li>첫째<br>설명 줄<ul><li>하위 A</li><li>하위 B</li></ul></li><li>둘째</li></ol>'
+    + '<p>문단 <del>취소</del></p>');
+  assert.equal(renderMarkdown('3. 셋째\n4. 넷째'), '<ol start="3"><li>셋째</li><li>넷째</li></ol>');
+  assert.equal(renderMarkdown('- a\n1. b'), '<ul><li>a</li></ul><ol><li>b</li></ol>');
+});

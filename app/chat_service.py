@@ -7,7 +7,7 @@ import threading
 import anyio
 from app.model_manager import ModelManager
 from app.pubmed import PubMedClient, format_tool_result
-from app.schemas import ChatRequest, ChatResponse, Choice, AssistantMessage, Source, ToolTrace
+from app.schemas import ChatRequest, ChatResponse, Choice, AssistantMessage, Source, ToolTrace, Usage
 from app.settings import ServiceError
 
 GUIDANCE = ('You can search PubMed and fetch article abstracts. For requests to find papers, use the tools. '
@@ -228,6 +228,7 @@ class ChatService:
         notify = emit or (lambda event: None)
         messages = [message.model_dump() for message in request.messages]
         traces, reasonings, dropped = [], [], 0
+        usage = Usage()
         try:
             tools = await self.pubmed.tool_schemas() if request.use_pubmed else []
             system = [message['content'] for message in messages if message['role'] == 'system']
@@ -255,6 +256,9 @@ class ChatService:
                         raise
                     dropped += removed
                     continue
+                usage.prompt_tokens += result.prompt_tokens
+                usage.completion_tokens += result.completion_tokens
+                usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
                 raw, reasoning = result.raw_text, None
                 if request.thinking:
                     reasoning, rest = split_reasoning(raw)
@@ -266,14 +270,14 @@ class ChatService:
                         message=AssistantMessage(content=visible_text(raw).strip(),
                                                  reasoning_content='\n\n'.join(reasonings) or None),
                         finish_reason='cancelled')], tool_calls=traces, dropped_messages=dropped,
-                        sources=collect_sources(traces))
+                        sources=collect_sources(traces), usage=usage)
                 calls = parse_tool_calls(raw, tools)
                 if not calls:
                     return ChatResponse(model=request.model, choices=[Choice(
                         message=AssistantMessage(content=append_citations(clean_text(raw), traces),
                                                  reasoning_content='\n\n'.join(reasonings) or None),
                         finish_reason=result.finish_reason)], tool_calls=traces, dropped_messages=dropped,
-                        sources=collect_sources(traces))
+                        sources=collect_sources(traces), usage=usage)
                 if not tools:
                     raise ServiceError('tools_disabled', 'Model requested tools when PubMed is disabled', 502)
                 if len(traces) + len(calls) > 4:

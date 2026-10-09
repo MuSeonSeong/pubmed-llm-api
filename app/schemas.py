@@ -1,5 +1,7 @@
 """Public chat contract; stream=true switches the response to server-sent events."""
+import time
 from typing import Literal
+from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, FiniteFloat, model_validator
 
 class ChatMessage(BaseModel):
@@ -52,9 +54,19 @@ class Choice(BaseModel):
     message: AssistantMessage
     finish_reason: str
 
+class Usage(BaseModel):
+    """Tokens summed over every generation step, including tool-calling rounds."""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
 class ChatResponse(BaseModel):
+    id: str = Field(default_factory=lambda: 'chatcmpl-' + uuid4().hex)
+    object: Literal['chat.completion'] = 'chat.completion'
+    created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: list[Choice]
     tool_calls: list[ToolTrace] = Field(default_factory=list)
     sources: list[Source] = Field(default_factory=list)
     dropped_messages: int = 0
+    usage: Usage = Field(default_factory=Usage)

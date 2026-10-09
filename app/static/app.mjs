@@ -351,6 +351,12 @@ function renderAssistant(message, chat) {
     if (store.canRegenerate(message.id)) {
       actions.append(iconButton('refresh', '답변 다시 생성', () => { followOutput = true; store.regenerate(message.id); }));
     }
+    if (message.elapsedMs !== undefined) {
+      const seconds = (message.elapsedMs / 1000).toFixed(1);
+      const stats = element('span', 'answer-stats', (message.tokens !== undefined ? message.tokens + '토큰 · ' : '') + seconds + '초');
+      stats.title = '생성한 토큰 수와 걸린 시간 (모델 로딩·논문 검색 포함)';
+      actions.append(stats);
+    }
     article.append(actions);
   }
   return article;

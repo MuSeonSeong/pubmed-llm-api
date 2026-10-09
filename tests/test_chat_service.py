@@ -343,3 +343,9 @@ def test_answers_carry_sources_only_for_tool_results():
     assert [s.pmid for s in r.sources] == ['31542292']
     r,_,_=complete(['hello'],use_pubmed=False)
     assert r.sources == []
+
+
+def test_response_has_openai_style_metadata_and_usage_over_all_rounds():
+    r,_,_=complete([call(),'Answer'])
+    assert r.id.startswith('chatcmpl-') and r.object == 'chat.completion' and r.created > 0
+    assert (r.usage.prompt_tokens,r.usage.completion_tokens,r.usage.total_tokens) == (20,10,30)

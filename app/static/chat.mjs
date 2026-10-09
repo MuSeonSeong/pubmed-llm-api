@@ -75,7 +75,7 @@ export function chatMarkdown(chat) {
 }
 
 const MAX_VERSIONS = 10;
-const VERSION_FIELDS = ['content', 'toolCalls', 'truncated', 'stopped', 'reasoning', 'thinkMs', 'model', 'dropped', 'sources'];
+const VERSION_FIELDS = ['content', 'toolCalls', 'truncated', 'stopped', 'reasoning', 'thinkMs', 'model', 'dropped', 'sources', 'tokens', 'elapsedMs'];
 
 /** The parts of an answer that differ between regenerated versions. */
 function snapshot(message) {
@@ -89,7 +89,9 @@ function restoreVersions(versions) {
       stopped: item.stopped === true, reasoning: typeof item.reasoning === 'string' && item.reasoning ? item.reasoning : undefined,
       thinkMs: Number.isFinite(item.thinkMs) ? item.thinkMs : undefined, model: MODELS.includes(item.model) ? item.model : undefined,
       dropped: Number.isInteger(item.dropped) && item.dropped > 0 ? item.dropped : undefined,
-      sources: normalizeSources(item.sources).length ? normalizeSources(item.sources) : undefined }));
+      sources: normalizeSources(item.sources).length ? normalizeSources(item.sources) : undefined,
+      tokens: Number.isInteger(item.tokens) && item.tokens >= 0 ? item.tokens : undefined,
+      elapsedMs: Number.isFinite(item.elapsedMs) && item.elapsedMs >= 0 ? item.elapsedMs : undefined }));
 }
 
 function restoreSettings(value) {
@@ -118,6 +120,8 @@ function restoreChat(chat, live = false) {
       ...(Number.isFinite(message.thinkMs) && message.thinkMs >= 0 ? { thinkMs: message.thinkMs } : {}),
       ...(MODELS.includes(message.model) ? { model: message.model } : {}),
       ...(normalizeSources(message.sources).length ? { sources: normalizeSources(message.sources) } : {}),
+      ...(Number.isInteger(message.tokens) && message.tokens >= 0 ? { tokens: message.tokens } : {}),
+      ...(Number.isFinite(message.elapsedMs) && message.elapsedMs >= 0 ? { elapsedMs: message.elapsedMs } : {}),
       ...(message.role === 'assistant' && restoreVersions(message.versions).length > 1 ? {
         versions: restoreVersions(message.versions),
         version: Math.min(Math.max(Number.isInteger(message.version) ? message.version : 0, 0),
@@ -183,6 +187,7 @@ function finish(draft, data) {
   draft.content = content;
   draft.toolCalls = normalizeTools(data.tool_calls);
   if (normalizeSources(data.sources).length) draft.sources = normalizeSources(data.sources);
+  if (Number.isInteger(data.usage?.completion_tokens)) draft.tokens = data.usage.completion_tokens;
   draft.truncated = choice.finish_reason === 'length';
   draft.stopped = choice.finish_reason === 'cancelled';
   if (typeof choice.message.reasoning_content === 'string' && choice.message.reasoning_content) {
@@ -387,6 +392,7 @@ export class ChatStore {
     const controller = new AbortController();
     this.controller = controller;
     let finished = false;
+    const started = Date.now();
     this.emit();
     try {
       const fetcher = this.fetcher;
@@ -447,6 +453,7 @@ export class ChatStore {
       }
     } finally {
       if (draft.thinkStart && draft.thinkMs === undefined) draft.thinkMs = Date.now() - draft.thinkStart;
+      if (finished) draft.elapsedMs = Date.now() - started;
       delete draft.thinkStart;
       delete draft.streaming;
       delete draft.stage;
@@ -473,9 +480,10 @@ const TRAILING = /(?:&quot;|&#39;|&gt;|[.,;:!?)\]])+$/;
 function inlineMarkdown(text) {
   // Escape first; only our own tags and validated HTTP(S) links may enter the DOM.
   return escapeHtml(text).replace(
-    /`([^`\n]+)`|\[([^\]\n]+)\]\(([^\s)]+)\)|(https?:\/\/[^\s<]+)|\*\*([^*\n]+)\*\*|\*(?!\s)([^*\n]+?)(?<!\s)\*/g,
-    (match, code, label, target, url, bold, italic) => {
+    /`([^`\n]+)`|\[([^\]\n]+)\]\(([^\s)]+)\)|(https?:\/\/[^\s<]+)|\*\*([^*\n]+)\*\*|\*(?!\s)([^*\n]+?)(?<!\s)\*|~~([^~\n]+)~~/g,
+    (match, code, label, target, url, bold, italic, strike) => {
       if (code !== undefined) return '<code>' + code + '</code>';
+      if (strike !== undefined) return '<del>' + strike + '</del>';
       if (bold !== undefined) return '<strong>' + bold + '</strong>';
       if (italic !== undefined) return '<em>' + italic + '</em>';
       if (url !== undefined) {
@@ -500,13 +508,15 @@ function renderTable(rows) {
 
 function renderBlocks(part) {
   const lines = part.split('\n');
-  let list = null;
+  const lists = [];  // open lists, innermost last; each leaves its current <li> open for nesting
   let output = '';
-  const closeList = () => { if (list) output += '</' + list + '>'; list = null; };
+  const closeLists = (indent = -1) => {
+    while (lists.length && lists.at(-1).indent > indent) output += '</li></' + lists.pop().type + '>';
+  };
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
     if (line.includes('|') && isTableRule(lines[index + 1] || '')) {
-      closeList();
+      closeLists();
       const rows = [line, lines[index + 1]];
       index += 2;
       while (index < lines.length && lines[index].includes('|') && lines[index].trim()) rows.push(lines[index++]);
@@ -514,14 +524,33 @@ function renderBlocks(part) {
       output += renderTable(rows);
       continue;
     }
-    const bullet = line.match(/^\s*(?:[-*+]|\d+\.)\s+(.+)/);
+    const bullet = line.match(/^(\s*)(?:([-*+])|(\d+)\.)\s+(.+)/);
     if (bullet && !/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
-      const type = /^\s*\d+\./.test(line) ? 'ol' : 'ul';
-      if (list !== type) { closeList(); output += '<' + type + '>'; list = type; }
-      output += '<li>' + inlineMarkdown(bullet[1]) + '</li>';
+      const indent = bullet[1].replace(/\t/g, '    ').length;
+      const type = bullet[3] === undefined ? 'ul' : 'ol';
+      closeLists(indent);
+      const top = lists.at(-1);
+      if (top?.indent === indent && top.type === type) output += '</li>';
+      else {
+        if (top?.indent === indent) output += '</li></' + lists.pop().type + '>';  // list type changed
+        // Numbered items split by blank lines would otherwise restart at 1.
+        const start = type === 'ol' && Number(bullet[3]) > 1 ? ' start="' + Number(bullet[3]) + '"' : '';
+        output += '<' + type + start + '>';
+        lists.push({ type, indent });
+      }
+      output += '<li>' + inlineMarkdown(bullet[4]);
       continue;
     }
-    closeList();
+    if (lists.length && /^\s{2,}\S/.test(line)) {  // an indented continuation of the current item
+      output += '<br>' + inlineMarkdown(line.trim());
+      continue;
+    }
+    if (!line.trim()) {
+      if (lists.length && /^\s*(?:[-*+]|\d+\.)\s+/.test(lines.slice(index + 1).find(next => next.trim()) || '')) continue;
+      closeLists();
+      continue;
+    }
+    closeLists();
     const heading = line.match(/^(#{1,6})\s+(.+)/);
     const quote = line.match(/^\s*>\s?(.*)/);
     if (heading) {
@@ -529,9 +558,9 @@ function renderBlocks(part) {
       output += '<' + tag + '>' + inlineMarkdown(heading[2]) + '</' + tag + '>';
     } else if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) output += '<hr>';
     else if (quote) output += '<blockquote>' + inlineMarkdown(quote[1]) + '</blockquote>';
-    else if (line.trim()) output += '<p>' + inlineMarkdown(line) + '</p>';
+    else output += '<p>' + inlineMarkdown(line) + '</p>';
   }
-  closeList();
+  closeLists();
   return output;
 }
 
