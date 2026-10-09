@@ -761,3 +761,18 @@ test('when storage is full, old chats lose their pictures before history is lost
   assert.equal(restored.messages[0].attachments[0].removed, true);
   assert.ok(store.storageWarning.includes('이미지'));
 });
+
+
+test('regenerating with another model switches the chat and keeps both versions', async () => {
+  const bodies = [];
+  const store = new ChatStore(memory(), async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return sse([done('답 ' + bodies.length)]);
+  });
+  await store.send('질문');
+  await store.regenerate(store.current.messages.at(-1).id, { model: 'qwen3-0.6b' });
+  assert.equal(bodies[1].model, 'qwen3-0.6b');
+  assert.equal(store.current.model, 'qwen3-0.6b');
+  const answer = store.current.messages.at(-1);
+  assert.deepEqual(answer.versions.map(v => v.model), ['qwen3.5-2b', 'qwen3-0.6b']);
+});

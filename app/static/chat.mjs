@@ -477,11 +477,12 @@ export class ChatStore {
   }
 
   /** Ask again, keeping earlier answers as versions; if the new attempt fails the old answer returns. */
-  async regenerate(messageId) {
+  async regenerate(messageId, { model } = {}) {
     if (!this.canRegenerate(messageId)) return;
     const chat = this.current;
     const release = await this.claim(chat);
     if (!release) return;
+    if (MODELS.includes(model)) chat.model = model;  // "try again with another model" switches the chat
     const previous = chat.messages.pop();
     const versions = previous.versions?.length ? previous.versions : [snapshot(previous)];
     return this.request(chat, chat.messages.at(-1), { versions, fallback: previous, release });

@@ -411,6 +411,14 @@ function renderAssistant(message, chat) {
     }
     if (store.canRegenerate(message.id)) {
       actions.append(iconButton('refresh', '답변 다시 생성', () => { followOutput = true; store.regenerate(message.id); }));
+      for (const [model, label] of Object.entries(MODEL_LABELS)) {
+        if (model === store.current.model) continue;
+        const other = element('button', 'other-model-button', label + '로 다시');
+        other.type = 'button';
+        other.title = label + ' 모델로 같은 질문에 다시 답하게 합니다';
+        other.addEventListener('click', () => { followOutput = true; store.regenerate(message.id, { model }); });
+        actions.append(other);
+      }
     }
     if (message.elapsedMs !== undefined) {
       const seconds = (message.elapsedMs / 1000).toFixed(1);
