@@ -6,6 +6,8 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, FiniteFloat, model
 
 MAX_IMAGES = 4
 CHAT_ID = r'^[A-Za-z0-9_-]{1,64}$'
+# How long the model may reason before answering; the token budgets are in app/model_manager.py.
+Effort = Literal['none', 'light', 'medium', 'high', 'max']
 
 class LoginRequest(BaseModel):
     name: str = Field(max_length=64)
@@ -47,15 +49,20 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    model: str = 'qwen3.5-2b'
+    model: str | None = None  # None: the server's default model (the first in /v1/models)
     messages: list[ChatMessage] = Field(min_length=1)
-    max_tokens: StrictInt = Field(default=512, ge=1, le=2048)
-    temperature: FiniteFloat = Field(default=0.2, ge=0, le=2, strict=True)
+    # The answer's length; reasoning gets its own budget on top.
+    max_tokens: StrictInt = Field(default=512, ge=1, le=4096)
+    # None: the model's recommended sampling (0.2 on Transformers models).
+    temperature: FiniteFloat | None = Field(default=None, ge=0, le=2, strict=True)
     use_pubmed: bool = True
     stream: bool = False
     # Drop the oldest turns instead of failing when the conversation exceeds the context budget.
     truncate_history: bool = False
-    # Let the model reason before answering; the reasoning is returned separately.
+    # Let the model reason before answering; the reasoning is returned separately. Ignored by models
+    # without reasoning.
+    reasoning_effort: Effort | None = None
+    # Older clients' switch: true means reasoning_effort medium when reasoning_effort is not given.
     thinking: bool = False
     # Extend the final assistant message instead of starting a new one; only the added text is returned.
     continue_final: bool = False
@@ -75,6 +82,12 @@ class ChatRequest(BaseModel):
     @property
     def has_images(self) -> bool:
         return any(message.image_count for message in self.messages)
+
+    @property
+    def effort(self) -> str:
+        if self.reasoning_effort is not None:
+            return self.reasoning_effort
+        return 'medium' if self.thinking else 'none'
 
 class ToolTrace(BaseModel):
     name: str

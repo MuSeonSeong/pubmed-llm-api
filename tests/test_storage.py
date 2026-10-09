@@ -211,6 +211,19 @@ def test_new_password_and_removal_end_everything_the_user_had(data_dir):
         assert s._db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] == 0
 
 
+def test_an_id_given_again_after_a_removal_comes_with_a_new_creation_time(data_dir):
+    clock = Clock()
+    s = storage(data_dir, clock=clock)
+    s.add_user('alice', 'scrypt$x')
+    newest = s.add_user('bob', 'scrypt$y')
+    assert s.user_created(newest) == clock.now
+    s.remove_user('bob')
+    assert s.user_created(newest) is None
+    clock.now += 1
+    assert s.add_user('carol', 'scrypt$z') == newest  # SQLite reuses the id of a removed newest row
+    assert s.user_created(newest) == clock.now  # so the pair (id, creation time) names one account
+
+
 def test_settings_are_last_write_wins(data_dir):
     s = storage(data_dir)
     user = s.local_user()

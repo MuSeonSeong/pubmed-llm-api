@@ -10,12 +10,14 @@ def call(name=SEARCH,arguments=None):
     return '<tool_call>'+json.dumps({'name':name,'arguments':arguments or {'query':'diabetes'}})+'</tool_call>'
 
 class Generator:
+    default_model='qwen3.5-2b'
     def __init__(self,outputs):
         self.outputs=iter(outputs)
         self.messages=[]
-    async def generate(self,model_id,messages,tools,max_tokens,temperature,on_text=None,cancel=None,thinking=False,continue_final=False,strict_budget=False):
+    async def generate(self,model_id,messages,tools,max_tokens,temperature,on_text=None,cancel=None,effort='none',continue_final=False,strict_budget=False,tenant=None):
         self.messages.append(list(messages))
-        self.thinking=thinking
+        self.model_id,self.effort,self.tenant,self.temperature,self.max_tokens=model_id,effort,tenant,temperature,max_tokens
+        self.thinking=effort!='none'
         self.continue_final=continue_final
         self.strict=getattr(self,'strict',[])+[strict_budget]
         value=next(self.outputs)
@@ -30,6 +32,8 @@ class Generator:
         return GenerationResult(value,'stop',10,5)
     def status(self):
         return {'device':'cpu','loaded_model':None,'model_files':{'qwen3-0.6b':True,'qwen3.5-2b':True}}
+    async def start(self,prefix=None):
+        self.prefix=prefix
     def close(self):
         pass
 
@@ -423,3 +427,76 @@ def test_group_authors_and_missing_initials_do_not_become_none():
     assert slim['articles'][0]['authors'] == [{'collectiveName':'COVID Study Group'},{'lastName':'Smith'}]
     source,=collect_sources([ToolTrace(name='pubmed_fetch_articles',arguments={},result=slim)])
     assert source.authors == 'COVID Study Group, Smith'
+
+
+def test_reasoning_effort_and_the_legacy_thinking_switch():
+    from app.schemas import ChatRequest
+    message=[{'role':'user','content':'q'}]
+    assert ChatRequest(messages=message).effort == 'none'
+    assert ChatRequest(messages=message,thinking=True).effort == 'medium'
+    assert ChatRequest(messages=message,thinking=True,reasoning_effort='light').effort == 'light'
+    assert ChatRequest(messages=message,thinking=True,reasoning_effort='none').effort == 'none'
+    request=ChatRequest(messages=message,max_tokens=4096)
+    assert (request.model,request.temperature,request.max_tokens) == (None,None,4096)
+
+
+def test_effort_reaches_the_model_and_its_reasoning_is_split_off():
+    r,g,_=complete(['<think>plan</think>answer'],use_pubmed=False,reasoning_effort='high')
+    assert g.effort == 'high' and g.thinking is True
+    assert (r.choices[0].message.content,r.choices[0].message.reasoning_content) == ('answer','plan')
+    assert r.model == 'qwen3.5-2b'  # the manager's default model
+
+
+def test_a_continuation_never_reasons():
+    import threading
+    from app.chat_service import ChatService
+    from app.schemas import ChatRequest
+    g=Generator([' more'])
+    request=ChatRequest(messages=[{'role':'user','content':'q'},{'role':'assistant','content':'a'}],
+                        continue_final=True,reasoning_effort='max',stream=True)
+    events=[]
+    asyncio.run(ChatService(g,PubMed()).stream(request,events.append,threading.Event()))
+    assert g.effort == 'none' and g.continue_final is True
+    assert events[-1]['choices'][0]['message']['content'] == ' more'
+
+
+def test_the_tenant_and_temperature_pass_through():
+    import threading
+    from app.chat_service import ChatService
+    from app.schemas import ChatRequest
+    g=Generator(['hi','hi'])
+    request=ChatRequest(messages=[{'role':'user','content':'q'}],use_pubmed=False,temperature=0.9)
+    asyncio.run(ChatService(g,PubMed()).complete(request,tenant='user-4'))
+    assert (g.tenant,g.temperature) == ('user-4',0.9)
+    asyncio.run(ChatService(g,PubMed()).stream(request.model_copy(update={'stream':True}),lambda event:None,
+                                               threading.Event(),'user-5'))
+    assert g.tenant == 'user-5'
+
+
+def mlx_events(state,busy=False):
+    import threading
+    from app.chat_service import ChatService
+    from app.schemas import ChatRequest
+    class Sidecars(Generator):
+        def status(self):
+            return {**super().status(),'busy':busy,'loaded_model':None,'models':{
+                'qwen3.5-9b':{'state':state,'runtime':'mlx','label':'Qwen3.5 9B','error':None}}}
+    events=[]
+    request=ChatRequest(model='qwen3.5-9b',messages=[{'role':'user','content':'q'}],use_pubmed=False,stream=True)
+    asyncio.run(ChatService(Sidecars(['hi']),PubMed()).stream(request,events.append,threading.Event()))
+    return [e['stage'] for e in events if e['type']=='status']
+
+
+def test_mlx_models_report_loading_only_while_their_sidecar_is_not_ready():
+    assert mlx_events('starting') == ['loading_model','generating']
+    assert mlx_events('ready',busy=True) == ['generating']  # the sidecar batches: nothing is queued
+
+
+def test_guidance_asks_for_the_users_language():
+    from app.chat_service import GUIDANCE
+    assert 'language the user wrote in' in GUIDANCE
+
+
+def test_reasoning_skipped_for_lack_of_room_leaves_the_whole_answer():
+    r,_,_=complete(['<think></think>The answer'],use_pubmed=False,reasoning_effort='max')
+    assert (r.choices[0].message.content,r.choices[0].message.reasoning_content) == ('The answer',None)

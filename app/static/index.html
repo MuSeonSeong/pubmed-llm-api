@@ -36,6 +36,7 @@
     <symbol id="i-left" viewBox="0 0 24 24"><path d="m15 6-6 6 6 6"/></symbol>
     <symbol id="i-right" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
     <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 5v14m-6-6 6 6 6-6"/></symbol>
+    <symbol id="i-caret" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></symbol>
   </svg>
 
   <div class="app-shell">
@@ -62,14 +63,9 @@
     <main class="main-panel">
       <h1 class="sr-only">PubMed Chat</h1>
       <header class="topbar">
-        <div class="model-control">
+        <div class="topbar-start">
           <button id="open-sidebar" class="icon-button" aria-label="대화 목록 열기" hidden><svg class="icon"><use href="#i-panel"/></svg></button>
-          <label class="sr-only" for="model">사용할 모델</label>
-          <select id="model" aria-label="사용할 모델">
-            <option value="qwen3.5-2b">Qwen3.5 · 2B</option>
-            <option value="qwen3-0.6b">Qwen3 · 0.6B</option>
-          </select>
-          <span class="model-badge">LOCAL</span>
+          <h2 id="chat-heading" class="chat-heading">새 대화</h2>
         </div>
         <div class="topbar-actions">
           <div id="server-status" class="server-status"><span class="status-dot"></span><span>서버 확인 중</span></div>
@@ -106,13 +102,20 @@
             <div class="toggles">
               <button id="attach" class="icon-button attach-button" type="button" aria-label="파일·이미지 첨부" title="이미지·PDF·텍스트 파일 첨부 (붙여넣기·끌어다 놓기도 가능)"><svg class="icon"><use href="#i-clip"/></svg></button>
               <input id="file-input" type="file" multiple accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,.pdf,.txt,.md,.markdown,.csv,.tsv,.json,.xml,.html,.htm,.log,.py,.js,.ts,.r,.tex,.bib,.ris,.yaml,.yml,text/*" hidden>
+              <div class="picker">
+                <button id="model-button" class="pill-button model-button" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="model-menu"><span class="sr-only">모델: </span><span id="model-label" class="pill-label"></span><svg class="icon caret" aria-hidden="true"><use href="#i-caret"/></svg></button>
+                <div id="model-menu" class="picker-menu" role="menu" aria-label="모델" tabindex="-1" hidden></div>
+              </div>
               <label class="pubmed-toggle" for="use-pubmed" title="논문이 필요할 때 PubMed를 검색합니다"><input id="use-pubmed" type="checkbox" checked><svg class="icon"><use href="#i-search"/></svg><span>PubMed 검색</span><span class="toggle-indicator"></span></label>
-              <label class="pubmed-toggle" for="use-thinking" title="답하기 전에 생각합니다. 더 정확할 수 있지만 느립니다"><input id="use-thinking" type="checkbox"><svg class="icon"><use href="#i-bulb"/></svg><span>추론</span><span class="toggle-indicator"></span></label>
+              <div class="picker">
+                <button id="effort-button" class="pill-button" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="effort-menu"><svg class="icon" aria-hidden="true"><use href="#i-bulb"/></svg><span id="effort-label" class="pill-label">추론: 끔</span><svg class="icon caret" aria-hidden="true"><use href="#i-caret"/></svg></button>
+                <div id="effort-menu" class="picker-menu" role="menu" aria-label="추론 수준" tabindex="-1" hidden></div>
+              </div>
             </div>
             <div class="send-controls"><span class="input-hint">Shift + Enter로 줄바꿈</span><button id="send" class="send-button" type="submit" aria-label="메시지 보내기" disabled><svg class="icon"><use href="#i-arrow"/></svg></button><button id="stop" class="send-button stop-button" type="button" aria-label="답변 중지" title="답변 중지" hidden><svg class="icon"><use href="#i-stop"/></svg></button></div>
           </div>
         </form>
-        <p class="composer-note">작은 로컬 모델의 답변에는 오류가 있을 수 있습니다. 논문 원문과 함께 확인해 주세요.</p>
+        <p class="composer-note">로컬 모델의 답변에는 오류가 있을 수 있습니다. 논문 원문과 함께 확인해 주세요.</p>
       </div>
     </main>
   </div>
@@ -127,20 +130,21 @@
         <span class="field-help">모든 대화에 적용됩니다. 예: “항상 한국어로, 핵심부터 짧게 답해줘.”</span>
         <textarea id="system-prompt" rows="4" maxlength="4000" placeholder="답변 방식에 대한 요청을 적어 주세요"></textarea>
       </label>
-      <label class="field">
-        <span class="field-label">창의성 <output id="temperature-value"></output></span>
-        <span class="field-help">낮을수록 일관되고, 높을수록 다양하게 답합니다.</span>
-        <input id="temperature" type="range" min="0" max="1.5" step="0.1">
-      </label>
+      <div class="field">
+        <div class="field-label"><label for="temperature">창의성</label><span class="field-value"><output id="temperature-value" for="temperature"></output><button type="button" id="temperature-reset" class="link-button" hidden>기본값으로</button></span></div>
+        <span id="temperature-help" class="field-help">낮을수록 일관되고, 높을수록 다양하게 답합니다. 기본값은 모델이 권장하는 설정이에요.</span>
+        <input id="temperature" type="range" min="0" max="1.5" step="0.1" aria-describedby="temperature-help">
+      </div>
       <label class="field">
         <span class="field-label">최대 답변 길이</span>
         <select id="max-tokens">
-          <option value="256">짧게 · 256 토큰</option>
-          <option value="512">보통 · 512 토큰</option>
-          <option value="1024">길게 · 1024 토큰</option>
-          <option value="2048">아주 길게 · 2048 토큰</option>
+          <option value="256">아주 짧게 · 256 토큰</option>
+          <option value="512">짧게 · 512 토큰</option>
+          <option value="1024">보통 · 1024 토큰 (기본값)</option>
+          <option value="2048">길게 · 2048 토큰</option>
+          <option value="4096">아주 길게 · 4096 토큰</option>
         </select>
-        <span class="field-help">길수록 대화에 쓸 수 있는 문맥이 줄어듭니다.</span>
+        <span class="field-help">길수록 대화에 쓸 수 있는 문맥이 줄어듭니다. 추론에 쓰는 토큰은 따로 더해져요.</span>
       </label>
       <label class="field">
         <span class="field-label">화면 테마</span>

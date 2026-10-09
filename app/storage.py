@@ -188,6 +188,13 @@ class Storage:
                        (LOCAL_USER, LOCAL_HASH, self.now()))
             return db.execute('SELECT id FROM users WHERE name = ?', (LOCAL_USER,)).fetchone()[0]
 
+    def user_created(self, user_id: int) -> int | None:
+        """When the user was created. With the id it tells accounts apart even after SQLite gives a removed
+        newest user's id to the next user, unless both were created within the same second."""
+        with self._transaction() as db:
+            row = db.execute('SELECT created_at FROM users WHERE id = ?', (user_id,)).fetchone()
+        return row[0] if row else None
+
     def find_user(self, name: str) -> tuple[int, str, str] | None:
         """(id, name as stored, password hash); names compare without regard to ASCII case."""
         with self._transaction() as db:

@@ -18,6 +18,7 @@ dependencies = [
   "anyio>=4.12,<5",
   "pillow>=12.3.0",
   "pypdf>=6.19.0",
+  "mlx-vlm==0.7.6 ; platform_machine == 'arm64' and sys_platform == 'darwin'",
 ]
 [dependency-groups]
 dev = [

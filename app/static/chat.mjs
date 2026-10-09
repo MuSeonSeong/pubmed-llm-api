@@ -1,11 +1,20 @@
 const STORAGE_KEY = 'pubmed-chat.v1';  // the browser-only history from before chats lived on the server
-const MODELS = ['qwen3.5-2b', 'qwen3-0.6b'];
-export const MODEL_LABELS = { 'qwen3.5-2b': 'Qwen3.5 · 2B', 'qwen3-0.6b': 'Qwen3 · 0.6B' };
-/** Small local models have a few thousand tokens of context, so attachments are capped. */
+/** Reasoning levels the server accepts, from answering at once to the largest thinking budget. */
+export const EFFORTS = ['none', 'light', 'medium', 'high', 'max'];
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const MODEL_STATES = ['ready', 'starting', 'stopped', 'failed', 'missing'];
+/** The models this server usually offers; they stand in for tests and until /v1/models answers. */
+const BUILT_IN_MODELS = [
+  { id: 'qwen3.5-9b', label: 'Qwen3.5 9B', summary: '더 정확함', vision: true, reasoning: true, context_tokens: 32768 },
+  { id: 'qwen3.5-4b', label: 'Qwen3.5 4B', summary: '더 빠름', vision: true, reasoning: true, context_tokens: 32768 },
+];
+/** Names of models that wrote answers in older chats, for when the server no longer offers them. */
+const KNOWN_LABELS = { 'qwen3.5-9b': 'Qwen3.5 9B', 'qwen3.5-4b': 'Qwen3.5 4B', 'qwen3.5-2b': 'Qwen3.5 2B',
+  'qwen3-0.6b': 'Qwen3 0.6B' };
+/** Local models have limited context, so attachments are capped. */
 export const ATTACHMENT_LIMIT = 12000;
 const DEFAULT_FILE_PROMPT = '첨부한 파일의 내용을 요약해 줘.';
 const DEFAULT_IMAGE_PROMPT = '이 이미지를 설명해 줘.';
-export const VISION_MODELS = ['qwen3.5-2b'];
 export const MAX_IMAGES = 4;  // per request, matching the server
 export const MAX_ATTACHMENTS = 8;  // per message
 const IMAGE_URL = /^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
@@ -15,13 +24,149 @@ export const FILE_URL = /^\/api\/files\/([A-Za-z0-9_-]{8,64})$/;
 export const CHAT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 export const isImage = file => file?.kind === 'image';
 export const imageSource = file => file.url || file.dataUrl;
-export const DEFAULT_SETTINGS = Object.freeze({ systemPrompt: '', temperature: 0.2, maxTokens: 512 });
+/**
+ * temperature null: the model's recommended sampling. maxTokens is the answer's length; the server adds the
+ * reasoning budget. model and effort: what new chats start with (null model: the server's default).
+ */
+export const DEFAULT_SETTINGS = Object.freeze({ systemPrompt: '', temperature: null, maxTokens: 1024, model: null,
+  effort: 'none' });
 const id = () => globalThis.crypto.randomUUID();
-const freshChat = () => ({ id: id(), title: '새 대화', model: MODELS[0],
-  usePubmed: true, thinking: false, messages: [], updatedAt: Date.now(), rev: Date.now() });
-/** Reasoning spends tokens before the answer starts, so thinking requests get a larger floor. */
-export const THINKING_MIN_TOKENS = 2048;  // the server shortens it if the prompt leaves less room
+const modelId = value => (typeof value === 'string' && MODEL_ID.test(value) ? value : undefined);
+const knownLabel = model => (Object.hasOwn(KNOWN_LABELS, model) ? KNOWN_LABELS[model] : model);
+const freshChat = settings => ({ id: id(), title: '새 대화', model: preferredModel(settings),
+  usePubmed: true, effort: settings.effort, messages: [], updatedAt: Date.now(), rev: Date.now() });
 const STOPPED = '답변 생성을 중지했습니다.';
+
+function normalizeModel(item) {
+  const model = modelId(item?.id);
+  if (!model) return null;
+  const text = (value, limit) => (typeof value === 'string' ? value.trim().slice(0, limit) : '');
+  // No list from the server means every level; 'none' is always possible and not listed here.
+  const efforts = item.reasoning === false ? [] : Array.isArray(item.efforts)
+    ? EFFORTS.filter(level => level !== 'none' && item.efforts.includes(level)) : EFFORTS.slice(1);
+  return { id: model, label: text(item.label, 60) || knownLabel(model), summary: text(item.summary, 60),
+    vision: item.vision === true, efforts,
+    contextTokens: Number.isInteger(item.context_tokens) && item.context_tokens > 0 ? item.context_tokens : null,
+    state: MODEL_STATES.includes(item.state) ? item.state : undefined };
+}
+
+function buildCatalog(payload) {
+  const list = [];
+  for (const item of Array.isArray(payload?.data) ? payload.data : []) {
+    const model = normalizeModel(item);
+    if (model && !list.some(other => other.id === model.id)) list.push(model);
+  }
+  if (!list.length) return null;
+  return { list, default: list.some(model => model.id === payload.default) ? payload.default : list[0].id };
+}
+
+let catalog = buildCatalog({ data: BUILT_IN_MODELS });
+
+/**
+ * Use the models the server offers (the body of GET /v1/models); returns whether the list changed.
+ * A body without usable models keeps the current list; setModels(null) goes back to the built-in one.
+ */
+export function setModels(payload) {
+  const next = buildCatalog(payload || { data: BUILT_IN_MODELS });
+  if (!next) return false;
+  const changed = JSON.stringify(next) !== JSON.stringify(catalog);
+  catalog = next;
+  return changed;
+}
+
+/** Fold in /health's per-model { state, runtime, error }; returns whether anything shown changed. */
+export function updateModelStates(states) {
+  if (!states || typeof states !== 'object') return false;
+  let changed = false;
+  for (const model of catalog.list) {
+    const report = Object.hasOwn(states, model.id) ? states[model.id] : null;
+    if (!report || typeof report !== 'object') continue;
+    const next = { state: MODEL_STATES.includes(report.state) ? report.state : undefined,
+      runtime: typeof report.runtime === 'string' ? report.runtime.slice(0, 40) : undefined,
+      error: report.state === 'failed' && typeof report.error === 'string' ? report.error.slice(0, 200) : undefined };
+    for (const [key, value] of Object.entries(next)) {
+      if (model[key] !== value) { model[key] = value; changed = true; }
+    }
+  }
+  return changed;
+}
+
+export const modelList = () => catalog.list;
+export const modelInfo = model => catalog.list.find(item => item.id === model);
+export const defaultModel = () => catalog.default;
+/** A model's name for display; older answers keep the name of a model the server no longer offers. */
+export const modelLabel = model => modelInfo(model)?.label || (modelId(model) ? knownLabel(model) : '');
+/** The model new chats start with: the last one chosen while the server offers it, else the server's default. */
+const preferredModel = settings => (modelInfo(settings?.model) ? settings.model : defaultModel());
+
+/**
+ * The reasoning level a model uses when asked for `effort`: that level if it has it, else its nearest lower
+ * one (or its lowest); 'none' for a model without reasoning.
+ */
+export function supportedEffort(model, effort) {
+  const levels = modelInfo(model)?.efforts || [];
+  if (!levels.length || !EFFORTS.includes(effort) || effort === 'none') return 'none';
+  return levels.includes(effort) ? effort
+    : levels.filter(level => EFFORTS.indexOf(level) < EFFORTS.indexOf(effort)).at(-1) || levels[0];
+}
+
+/**
+ * The server's model list, fetched through fetcher: load() once at start, then follow(states) with each /health
+ * report, which fetches the list again when the server's models or their order changed (a restart with other
+ * MODELS, or the same ones with another default first) and folds in the states. load() resolves to whether the
+ * list changed, or null when it could not be fetched; follow() resolves to whether anything shown changed.
+ */
+export function serverModels(fetcher) {
+  let loaded = false;  // whether the list came from this server; until then the built-in one stands in
+  let reported = '';  // the model ids /health listed when the list was last fetched for them or matched them
+  async function load() {
+    try {
+      const response = await fetcher('/v1/models', { cache: 'no-store', signal: AbortSignal.timeout(5000) });
+      if (!response.ok) return null;
+      const changed = setModels(await response.json());
+      loaded = true;
+      return changed;
+    } catch { return null; }
+  }
+  async function follow(states) {
+    // In the server's order, the default model first, so a new default is noticed like a new model.
+    const ids = states && typeof states === 'object' ? Object.keys(states).join(' ') : '';
+    let changed = false;
+    if (!loaded || ids !== reported) {
+      const stale = !loaded || ids !== catalog.list.map(model => model.id).join(' ');
+      const result = stale ? await load() : false;
+      if (result !== null) reported = ids;  // a failed fetch is tried again with the next report
+      changed = result === true;
+    }
+    return updateModelStates(states) || changed;
+  }
+  return { load, follow };
+}
+
+/**
+ * The server pill, from a /health body whose states follow() took in: 'starting' while a model starts,
+ * 'unavailable' when the default model's files are missing or it failed to start (a notice says which), else
+ * 'ready'. A stopped default model counts as ready: the first question starts it.
+ */
+export function serverState(health) {
+  if (catalog.list.some(model => model.state === 'starting')) return 'starting';
+  const stopped = modelInfo(defaultModel())?.state === 'stopped';
+  return health?.ready_for_chat === false && !stopped ? 'unavailable' : 'ready';
+}
+
+/**
+ * Scroll a menu just enough to show list[index], one of its items, whose offsetParent it is. Unlike focus() or
+ * scrollIntoView(), this leaves the page and every other scrolling box still. The first and last items bring the
+ * menu's own edges along, so its heading and padding show with them.
+ */
+export function revealItem(menu, list, index) {
+  const item = list[index];
+  if (!item) return;
+  const top = index === 0 ? 0 : item.offsetTop;
+  const bottom = index === list.length - 1 ? menu.scrollHeight : item.offsetTop + item.offsetHeight;
+  if (top < menu.scrollTop) menu.scrollTop = top;
+  else if (bottom > menu.scrollTop + menu.clientHeight) menu.scrollTop = bottom - menu.clientHeight;
+}
 
 function normalizeTools(calls) {
   return Array.isArray(calls) ? calls.filter(call => call && typeof call.name === 'string')
@@ -108,7 +253,7 @@ export function chatMarkdown(chat) {
       const images = (message.attachments || []).filter(isImage).map(file => '[이미지: ' + file.name + ']');
       lines.push('## 나', '', [...images, messageText(message)].join('\n\n'), '');
     }
-    else lines.push('## ' + (MODEL_LABELS[message.model] || 'PubMed Chat'), '', message.content, '');
+    else lines.push('## ' + (modelLabel(message.model) || 'PubMed Chat'), '', message.content, '');
   }
   return lines.join('\n');
 }
@@ -126,7 +271,7 @@ function restoreVersions(versions) {
   return versions.filter(item => item && typeof item.content === 'string').slice(-MAX_VERSIONS)
     .map(item => snapshot({ ...item, toolCalls: normalizeTools(item.toolCalls), truncated: item.truncated === true,
       stopped: item.stopped === true, reasoning: typeof item.reasoning === 'string' && item.reasoning ? item.reasoning : undefined,
-      thinkMs: Number.isFinite(item.thinkMs) ? item.thinkMs : undefined, model: MODELS.includes(item.model) ? item.model : undefined,
+      thinkMs: Number.isFinite(item.thinkMs) ? item.thinkMs : undefined, model: modelId(item.model),
       dropped: Number.isInteger(item.dropped) && item.dropped > 0 ? item.dropped : undefined,
       sources: normalizeSources(item.sources).length ? normalizeSources(item.sources) : undefined,
       tokens: Number.isInteger(item.tokens) && item.tokens >= 0 ? item.tokens : undefined,
@@ -134,12 +279,17 @@ function restoreVersions(versions) {
 }
 
 function restoreSettings(value) {
-  const number = (input, min, max, fallback) =>
-    Number.isFinite(input) && input >= min && input <= max ? input : fallback;
+  const number = (input, min, max) => (Number.isFinite(input) && input >= min && input <= max ? input : null);
+  // Settings saved before reasoning levels existed have no effort. Their temperature 0.2 and 512 tokens were
+  // the old defaults rather than choices, so they give way to the model's sampling and the new length.
+  const legacy = Boolean(value) && typeof value === 'object' && !Object.hasOwn(value, 'effort');
+  const temperature = number(value?.temperature, 0, 2);
+  const maxTokens = Number.isInteger(value?.maxTokens) ? number(value.maxTokens, 1, 4096) : null;
   return { systemPrompt: typeof value?.systemPrompt === 'string' ? value.systemPrompt.slice(0, 4000) : '',
-    temperature: number(value?.temperature, 0, 2, DEFAULT_SETTINGS.temperature),
-    maxTokens: Number.isInteger(value?.maxTokens)
-      ? number(value.maxTokens, 1, 2048, DEFAULT_SETTINGS.maxTokens) : DEFAULT_SETTINGS.maxTokens };
+    temperature: legacy && temperature === 0.2 ? null : temperature,
+    maxTokens: maxTokens === null || (legacy && maxTokens === 512) ? DEFAULT_SETTINGS.maxTokens : maxTokens,
+    model: modelId(value?.model) ?? null,
+    effort: EFFORTS.includes(value?.effort) ? value.effort : DEFAULT_SETTINGS.effort };
 }
 
 /** Take settings saved elsewhere (the server), checked like stored ones; true if anything changed. */
@@ -147,6 +297,7 @@ export function adoptSettings(store, value) {
   const settings = restoreSettings(value);
   if (JSON.stringify(settings) === JSON.stringify(store.settings)) return false;
   store.settings = settings;
+  store.followDefaults();
   store.emit();
   return true;
 }
@@ -184,7 +335,8 @@ function restoreMessages(list, depth = 0) {
       ...(Number.isInteger(message.dropped) && message.dropped > 0 ? { dropped: message.dropped } : {}),
       ...(typeof message.reasoning === 'string' && message.reasoning ? { reasoning: message.reasoning } : {}),
       ...(Number.isFinite(message.thinkMs) && message.thinkMs >= 0 ? { thinkMs: message.thinkMs } : {}),
-      ...(MODELS.includes(message.model) ? { model: message.model } : {}),
+      // Kept even when the server no longer offers that model: it still says who wrote the answer.
+      ...(modelId(message.model) ? { model: message.model } : {}),
       ...(normalizeSources(message.sources).length ? { sources: normalizeSources(message.sources) } : {}),
       ...(Number.isInteger(message.tokens) && message.tokens >= 0 ? { tokens: message.tokens } : {}),
       ...(Number.isFinite(message.elapsedMs) && message.elapsedMs >= 0 ? { elapsedMs: message.elapsedMs } : {}),
@@ -204,8 +356,12 @@ export function restoreChat(chat) {
       || !Array.isArray(chat.messages)) return null;
   const messages = restoreMessages(chat.messages);
   const rev = Number.isFinite(chat.rev) ? chat.rev : Number(chat.updatedAt) || 0;
-  return { id: chat.id, title: chat.title, model: MODELS.includes(chat.model) ? chat.model : MODELS[0],
-    usePubmed: chat.usePubmed !== false, thinking: chat.thinking === true, pinned: chat.pinned === true,
+  // A model the server does not offer (now) is kept: ChatStore.modelOf() answers with another meanwhile.
+  return { id: chat.id, title: chat.title, model: modelId(chat.model) || defaultModel(),
+    usePubmed: chat.usePubmed !== false,
+    // Chats from before reasoning levels had an on/off switch.
+    effort: EFFORTS.includes(chat.effort) ? chat.effort : chat.thinking === true ? 'medium' : 'none',
+    pinned: chat.pinned === true,
     ...(chat.autoTitle === true ? { autoTitle: true } : {}), messages,
     updatedAt: Number(chat.updatedAt) || Date.now(),
     rev: Math.max(0, Math.floor(rev)) };  // the server compares revisions as integers
@@ -249,14 +405,16 @@ export function errorMessage(error, status) {
     unknown_tool: MODEL_TOOL_ERROR,
     tools_disabled: 'PubMed 검색이 꺼져 있어 논문을 찾을 수 없어요. 입력창에서 PubMed 검색을 켜고 다시 물어봐 주세요.',
     tool_call_truncated: '답변 길이 한도 때문에 논문 검색 요청이 잘렸어요. 설정에서 최대 답변 길이를 늘린 뒤 다시 시도해 주세요.',
-    vision_unsupported: '이 모델은 이미지를 볼 수 없어요. 이미지를 이해하는 모델로 바꾼 뒤 다시 시도해 주세요.',
+    vision_unsupported: '이 모델은 이미지를 볼 수 없어요. 입력창의 모델 메뉴에서 ‘이미지’ 표시가 있는 모델로 바꾼 뒤 다시 시도해 주세요.',
+    model_unavailable: '모델 서버가 아직 준비되지 않았어요. 잠시 후 다시 시도해 주세요.',
+    unknown_model: '이 모델은 지금 서버에서 쓸 수 없어요. 입력창에서 다른 모델을 고른 뒤 다시 시도해 주세요.',
     generation_failed: '모델이 답변을 만드는 중 오류가 났어요. 다시 시도해 주세요.',
     internal_error: '서버에서 예상하지 못한 오류가 났어요. 잠시 후 다시 시도해 주세요.',
     invalid_request: '요청 형식이 올바르지 않아요. 페이지를 새로고침한 뒤 다시 시도해 주세요.',
     request_too_large: '보낸 내용이 너무 커요. 첨부를 줄인 뒤 다시 시도해 주세요.',
     pubmed_tool_failed: 'PubMed가 이 요청을 처리하지 못했어요. 잠시 후 다시 시도해 주세요.',
     pubmed_schema_missing: 'PubMed 서비스 구성이 바뀌어 지금은 논문을 검색할 수 없어요. 서버 관리자에게 알려 주세요.',
-    context_overflow: '질문·첨부·논문 검색 결과를 합친 길이가 모델의 한도를 넘었습니다. 첨부를 줄이거나, PubMed 검색·추론을 끄거나, 설정에서 답변 길이를 줄여 보세요.',
+    context_overflow: '질문·첨부·논문 검색 결과를 합친 길이가 모델의 한도를 넘었습니다. 첨부를 줄이거나, PubMed 검색을 끄거나 추론을 낮추거나, 설정에서 답변 길이를 줄여 보세요.',
     model_missing: '모델 파일이 없습니다. 서버에서 모델 준비를 완료해 주세요.',
     device_unavailable: '설정된 실행 장치를 사용할 수 없습니다.',
     pubmed_timeout: 'PubMed 연결 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.',
@@ -268,6 +426,7 @@ export function errorMessage(error, status) {
   };
   if (Object.hasOwn(hints, error?.code)) return hints[error.code];
   if (status === 413) return hints.context_overflow;
+  if (status === 503) return hints.model_unavailable;
   if (status === 504) return hints.pubmed_timeout;
   if (status === 502) return 'PubMed 검색 중 문제가 생겼어요. 다시 시도해 주세요.';
   return typeof error?.message === 'string' ? error.message : '응답을 받지 못했습니다. 다시 시도해 주세요.';
@@ -352,7 +511,7 @@ export class ChatStore {
       if (!cacheOnly) this.storageWarning = '대화 기록을 불러오지 못했습니다. 새 대화로 시작합니다.';
     }
     if (!this.chats.length) {
-      this.chats = [freshChat()];
+      this.chats = [freshChat(this.settings)];
       this.activeId = this.chats[0].id;
     }
     if (this.locks) this.chats.filter(inProgress).forEach(chat => this.liveChats.add(chat.id));  // until checked
@@ -360,6 +519,25 @@ export class ChatStore {
   }
 
   get current() { return this.chats.find(chat => chat.id === this.activeId); }
+
+  /** The model that answers a chat: its own while the server offers it, else the one new chats start with. */
+  modelOf(chat = this.current) {
+    return modelInfo(chat?.model) ? chat.model : preferredModel(this.settings);
+  }
+
+  /** The reasoning level sent for a chat: its own, as far as its model supports it. */
+  effortOf(chat = this.current) {
+    return supportedEffort(this.modelOf(chat), chat?.effort);
+  }
+
+  /** Chats without messages take the model and reasoning level chosen last (e.g. once the server's settings arrive). */
+  followDefaults() {
+    for (const chat of this.chats) {
+      if (chat.messages.length || chat === this.requestChat) continue;
+      chat.model = preferredModel(this.settings);
+      chat.effort = this.settings.effort;
+    }
+  }
 
   /** Whether this tab may change a chat: not while it is answering, nor while another tab answers it. */
   canModify(chat = this.current) {
@@ -416,9 +594,11 @@ export class ChatStore {
     }
     if (this.requestChat && this.deleted.has(this.requestChat.id)) this.deleted.delete(this.requestChat.id);
     this.chats = this.chats.filter(chat => !this.deleted.has(chat.id));
-    if (!this.chats.length) this.chats = [freshChat()];
-    if (!this.current) this.activeId = this.chats[0].id;
+    // Another tab's settings; its empty chats are left as they are (a tab saving meanwhile can echo older
+    // settings for a moment), and the next new chat starts with these.
     if (adoptSettings) this.settings = restoreSettings(saved.settings);
+    if (!this.chats.length) this.chats = [freshChat(this.settings)];
+    if (!this.current) this.activeId = this.chats[0].id;
   }
 
   /** Called when another tab wrote to storage. */
@@ -460,9 +640,11 @@ export class ChatStore {
   newChat() {
     if (this.busy) return;
     const empty = this.chats.find(chat => !chat.messages.length);
-    if (empty) this.activeId = empty.id;
-    else {
-      const chat = freshChat();
+    if (empty) {
+      this.activeId = empty.id;
+      this.followDefaults();  // it may have been made before the last choice
+    } else {
+      const chat = freshChat(this.settings);
       this.chats.unshift(chat);
       this.activeId = chat.id;
     }
@@ -495,15 +677,18 @@ export class ChatStore {
     this.emit();
   }
 
-  /** Per-chat options set from the UI: model, usePubmed, thinking. */
-  updateChat(patch) {
+  /**
+   * Per-chat options set from the UI: model (one the server offers), usePubmed, effort.
+   * remember: new chats start with this model and reasoning level too.
+   */
+  updateChat(patch, { remember = false } = {}) {
     const chat = this.current;
     if (!this.canModify(chat)) return;
-    for (const key of ['model', 'usePubmed', 'thinking']) {
-      if (!(key in patch)) continue;
-      if (key === 'model' && !MODELS.includes(patch.model)) continue;
-      chat[key] = key === 'model' ? patch.model : patch[key] === true;
-    }
+    const choice = {};
+    if (modelInfo(patch.model)) choice.model = chat.model = patch.model;
+    if (EFFORTS.includes(patch.effort)) choice.effort = chat.effort = patch.effort;
+    if ('usePubmed' in patch) chat.usePubmed = patch.usePubmed === true;
+    if (remember) this.settings = restoreSettings({ ...this.settings, ...choice });
     this.touch(chat);
     this.emit();
   }
@@ -513,7 +698,7 @@ export class ChatStore {
     if (this.busy || (chat && !this.canModify(chat))) return;
     this.deleted.add(chatId);
     this.chats = this.chats.filter(chat => chat.id !== chatId);
-    if (!this.chats.length) this.chats = [freshChat()];
+    if (!this.chats.length) this.chats = [freshChat(this.settings)];
     if (!this.chats.some(chat => chat.id === this.activeId)) this.activeId = this.chats[0].id;
     this.emit();
   }
@@ -609,14 +794,17 @@ export class ChatStore {
       && messages.at(-2)?.role === 'user';
   }
 
-  /** Ask again, keeping earlier answers as versions; if the new attempt fails the old answer returns. */
-  async regenerate(messageId, { model, thinking } = {}) {
+  /**
+   * Ask again, keeping earlier answers as versions; if the new attempt fails the old answer returns.
+   * model / effort: try another model or reasoning level; the chat keeps using it afterwards.
+   */
+  async regenerate(messageId, { model, effort } = {}) {
     if (!this.canRegenerate(messageId)) return;
     const chat = this.current;
     const release = await this.claim(chat);
     if (!release) return;
-    if (MODELS.includes(model)) chat.model = model;  // "try again with another model" switches the chat
-    if (thinking === false) chat.thinking = false;
+    if (modelInfo(model)) chat.model = model;
+    if (EFFORTS.includes(effort)) chat.effort = effort;
     const previous = chat.messages.pop();
     const versions = previous.versions?.length ? previous.versions : [snapshot(previous)];
     await this.request(chat, chat.messages.at(-1), { versions, fallback: previous, release });
@@ -713,8 +901,8 @@ export class ChatStore {
     try {
       const fetcher = this.fetcher;
       const response = await fetcher('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model: chat.model, messages: [{ role: 'user', content: prompt }], max_tokens: 24,
-          temperature: 0.2, use_pubmed: false, ...chatIdField(chat) }) });
+        body: JSON.stringify({ model: this.modelOf(chat), messages: [{ role: 'user', content: prompt }], max_tokens: 24,
+          temperature: 0.2, use_pubmed: false, reasoning_effort: 'none', ...chatIdField(chat) }) });
       if (!response.ok) return;
       const text = (await response.json()).choices?.[0]?.message?.content;
       const title = typeof text === 'string' ? text.split('\n').map(line => line.trim()).find(Boolean) : '';
@@ -732,7 +920,7 @@ export class ChatStore {
   /** The newest images, up to MAX_IMAGES, if the chat's model can see; others are named in text. */
   imagesToSend(chat) {
     const chosen = new Set();
-    if (!VISION_MODELS.includes(chat.model)) return chosen;
+    if (!modelInfo(this.modelOf(chat))?.vision) return chosen;
     for (const message of [...chat.messages].reverse()) {
       if (message.error) continue;
       for (const file of [...(message.attachments || [])].reverse()) {
@@ -755,6 +943,8 @@ export class ChatStore {
     const original = continueFrom ? snapshot(continueFrom) : null;
     const answerText = continueFrom ? withoutCitationList(continueFrom.content) : '';
     const citationTail = continueFrom ? continueFrom.content.slice(answerText.length) : '';
+    const model = this.modelOf(chat);
+    const effort = continueFrom ? 'none' : this.effortOf(chat);  // a continuation only writes on
     const sentImages = this.imagesToSend(chat);
     const history = chat.messages.filter(item => !item.error && item.content.trim())
       .map(item => ({ role: item.role, content: item.role === 'user' ? userContent(item, sentImages)
@@ -772,7 +962,7 @@ export class ChatStore {
       delete draft.stopped;
       draft.streaming = true;
     } else {
-      draft = { id: id(), role: 'assistant', content: '', toolCalls: [], streaming: true, model: chat.model };
+      draft = { id: id(), role: 'assistant', content: '', toolCalls: [], streaming: true, model };
       chat.messages.push(draft);
     }
     const controller = new AbortController();
@@ -785,12 +975,12 @@ export class ChatStore {
       const fetcher = this.fetcher;
       const response = await fetcher('/v1/chat/completions', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-        body: JSON.stringify({ model: chat.model, messages: history,
-          max_tokens: chat.thinking && !continueFrom ? Math.max(this.settings.maxTokens, THINKING_MIN_TOKENS)
-            : this.settings.maxTokens,
-          temperature: this.settings.temperature, use_pubmed: chat.usePubmed && !continueFrom, stream: true,
-          truncate_history: true, ...chatIdField(chat), ...(chat.thinking && !continueFrom ? { thinking: true } : {}),
-          ...(continueFrom ? { continue_final: true } : {}) }),
+        // max_tokens is the answer alone (the server adds the reasoning budget); without a chosen
+        // temperature the model's recommended sampling applies.
+        body: JSON.stringify({ model, messages: history, max_tokens: this.settings.maxTokens,
+          ...(this.settings.temperature === null ? {} : { temperature: this.settings.temperature }),
+          use_pubmed: chat.usePubmed && !continueFrom, stream: true, truncate_history: true, ...chatIdField(chat),
+          reasoning_effort: effort, ...(continueFrom ? { continue_final: true } : {}) }),
       });
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));

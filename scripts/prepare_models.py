@@ -1,4 +1,8 @@
-"""Prepare pinned original weights; never depend on external cache symlinks."""
+"""Prepare the pinned weights of the models this server answers with; never depend on external cache symlinks.
+
+By default these are the enabled models (MODELS, or the MLX models on Apple Silicon and the Transformers
+models elsewhere); --model picks others, --all takes every model in models.json.
+"""
 import argparse
 import json
 from pathlib import Path
@@ -10,7 +14,7 @@ from huggingface_hub import snapshot_download
 from huggingface_hub.errors import LocalEntryNotFoundError
 from safetensors import safe_open
 from app.catalog import ModelSpec, load_catalog, model_weight_files
-from app.settings import Settings
+from app.settings import Settings, enabled_models
 
 PATTERNS = ['*.json', '*.safetensors', '*.jinja', 'merges.txt', 'vocab.txt', 'tokenizer.model', 'README.md', 'LICENSE*']
 
@@ -63,15 +67,24 @@ def prepare_model(spec: ModelSpec, destination: Path) -> Path:
     return destination
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--model', choices=list(load_catalog()))
-    args = parser.parse_args()
+def chosen_models(settings: Settings, catalog: dict[str, ModelSpec], models: list[str] | None,
+                  everything: bool) -> list[str]:
+    if everything:
+        return list(catalog)
+    return list(dict.fromkeys(models)) if models else enabled_models(settings, catalog)
+
+
+def main(argv: list[str] | None = None) -> None:
+    catalog = load_catalog()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--model', action='append', choices=list(catalog), help='this model only (repeatable)')
+    parser.add_argument('--all', action='store_true', help='every model in models.json')
+    args = parser.parse_args(argv)
     settings = Settings()
-    for spec in load_catalog().values():
-        if args.model is None or args.model == spec.id:
-            print(f'Preparing {spec.id} ({spec.revision})', flush=True)
-            print(prepare_model(spec, settings.models_dir / spec.directory), flush=True)
+    for model_id in chosen_models(settings, catalog, args.model, args.all):
+        spec = catalog[model_id]
+        print(f'Preparing {spec.id} ({spec.revision})', flush=True)
+        print(prepare_model(spec, settings.models_dir / spec.directory), flush=True)
 
 if __name__ == '__main__':
     main()

@@ -1,5 +1,6 @@
-import { ATTACHMENT_LIMIT, ChatStore, MAX_ATTACHMENTS, MAX_IMAGES, MODEL_LABELS, VISION_MODELS, attachmentTokenBudget,
-  chatMarkdown, estimateTokens, imageSource, isImage, readAttachments, renderMarkdown, withoutCitationList } from './chat.mjs';
+import { ATTACHMENT_LIMIT, ChatStore, MAX_ATTACHMENTS, MAX_IMAGES, attachmentTokenBudget, chatMarkdown, estimateTokens,
+  imageSource, isImage, modelInfo, modelLabel, modelList, readAttachments, renderMarkdown, revealItem, serverModels,
+  serverState, withoutCitationList } from './chat.mjs';
 import { RemoteSync, forgetCache, importLegacy, legacyChats, skipLegacy, uploadImage } from './sync.mjs';
 
 const $ = id => document.getElementById(id);
@@ -69,6 +70,10 @@ async function api(url, init) {
   return response;
 }
 
+/** The models the server offers, with their labels and states; checkServer keeps them current. */
+const modelSync = serverModels(api);
+await modelSync.load();  // before the store, so the chats it restores and starts see this server's models
+
 const store = new ChatStore(storage, api, { autoTitles: true, storageKey: 'pubmed-chat.v2:' + userName,
   cacheOnly: true });
 const sync = new RemoteSync(store, { fetcher: api, storage, onStatus: showSyncStatus, onNotice: text => toast(text) });
@@ -86,7 +91,8 @@ let toastTimer;
 let renderQueued = false;
 let pendingFiles = [];
 let attaching = 0;  // attachFiles calls still reading or uploading
-let contextTokens = 8192;  // updated from /health
+let healthContextTokens = 8192;  // the server's context budget from /health, for models that state none
+const contextTokensFor = model => modelInfo(model)?.contextTokens || healthContextTokens;
 let speakingId = null;
 const canSpeak = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
 const reasoningOpen = new Map();  // message id -> the user's own expand/collapse choice
@@ -200,7 +206,8 @@ function assistantHeading(message) {
   const avatar = element('span', 'assistant-avatar');
   avatar.append(icon('spark'));
   heading.append(avatar, element('span', '', 'PubMed Chat'));
-  if (MODEL_LABELS[message.model]) heading.append(element('span', 'model-tag', MODEL_LABELS[message.model]));
+  const label = modelLabel(message.model);
+  if (label) heading.append(element('span', 'model-tag', label));
   return heading;
 }
 
@@ -254,7 +261,10 @@ function progressLine(message, chat) {
     const { kind, query } = describeCall(running);
     text = 'PubMed ' + kind + ' 중' + (query ? ' · ' + query : '');
   } else if (message.stage === 'queued') text = '다른 요청이 끝나기를 기다리고 있어요';
-  else if (message.stage === 'loading_model') text = '모델을 불러오는 중이에요. 처음이나 모델을 바꾼 뒤에는 시간이 걸려요';
+  else if (message.stage === 'loading_model') {
+    const label = modelLabel(message.model);
+    text = (label ? label + ' 모델을' : '모델을') + ' 준비하고 있어요. 처음에는 시간이 걸릴 수 있어요';
+  }
   else if (message.retrying) {
     // A rejected tool call is being rewritten; with search off the model is answering directly instead.
     text = message.retrying === 'tools_disabled' ? '답변을 다시 준비하고 있어요' : '검색 조건을 고쳐서 다시 시도하고 있어요';
@@ -445,7 +455,7 @@ function renderAssistant(message, chat) {
   if (message.dropped) body.append(element('div', 'truncated-note',
     '대화가 길어 앞부분 메시지 ' + message.dropped + '개는 참고하지 않고 답했어요. 새 주제라면 새 대화를 시작해 보세요.'));
   if (message.truncated) body.append(element('div', 'truncated-note', !message.content.trim() && message.reasoning
-    ? '생각하는 데 답변 길이를 모두 써서 답을 쓰지 못했어요. 추론 없이 다시 생성하거나 설정에서 답변 길이를 늘려 보세요.'
+    ? '생각하는 데 길이를 모두 써서 답을 쓰지 못했어요. 추론 없이 다시 생성하거나 입력창에서 추론을 낮춰 보세요.'
     : '답변 길이 한도에 도달했습니다. 아래 “이어서 생성”을 누르거나 설정에서 답변 길이를 늘려 보세요.'));
   if (!message.streaming && message.sources?.length) body.append(sourceCards(message.sources));
   if (!message.streaming && message.toolCalls.length) body.append(toolDetails(message.toolCalls, false));
@@ -469,11 +479,13 @@ function renderAssistant(message, chat) {
       pager.append(back, element('span', '', (index + 1) + ' / ' + message.versions.length), next);
       actions.append(pager);
     }
-    if (store.canRegenerate(message.id) && message.truncated && !message.content.trim() && message.reasoning) {
+    // Thinking used up the whole length before any answer: offer the way out prominently.
+    const thoughtOnly = Boolean(message.truncated && !message.content.trim() && message.reasoning);
+    if (store.canRegenerate(message.id) && thoughtOnly) {
       const plain = element('button', 'continue-button');
       plain.type = 'button';
       plain.append(icon('refresh'), document.createTextNode('추론 없이 다시 생성'));
-      plain.addEventListener('click', () => { followOutput = true; store.regenerate(message.id, { thinking: false }); });
+      plain.addEventListener('click', () => { followOutput = true; store.regenerate(message.id, { effort: 'none' }); });
       actions.append(plain);
     }
     if (store.canContinue(message.id)) {
@@ -485,14 +497,21 @@ function renderAssistant(message, chat) {
     }
     if (store.canRegenerate(message.id)) {
       actions.append(iconButton('refresh', '답변 다시 생성', () => { followOutput = true; store.regenerate(message.id); }));
-      const question = store.current.messages.at(-2);
-      const asksAboutImages = question?.attachments?.some(isImage);
-      for (const [model, label] of Object.entries(MODEL_LABELS)) {
-        if (model === store.current.model || (asksAboutImages && !VISION_MODELS.includes(model))) continue;
-        const other = element('button', 'other-model-button', label + '로 다시');
+      if (!thoughtOnly && store.effortOf() !== 'none') {
+        const plain = element('button', 'other-model-button', '추론 없이 다시 생성');
+        plain.type = 'button';
+        plain.title = '생각하는 과정 없이 같은 질문에 바로 다시 답하게 합니다';
+        plain.addEventListener('click', () => { followOutput = true; store.regenerate(message.id, { effort: 'none' }); });
+        actions.append(plain);
+      }
+      const current = store.modelOf();
+      const asksAboutImages = store.current.messages.at(-2)?.attachments?.some(isImage);
+      for (const model of modelList()) {
+        if (model.id === current || model.state === 'missing' || (asksAboutImages && !model.vision)) continue;
+        const other = element('button', 'other-model-button', model.label + '로 다시');
         other.type = 'button';
-        other.title = label + ' 모델로 같은 질문에 다시 답하게 합니다';
-        other.addEventListener('click', () => { followOutput = true; store.regenerate(message.id, { model }); });
+        other.title = model.label + ' 모델로 같은 질문에 다시 답하게 합니다';
+        other.addEventListener('click', () => { followOutput = true; store.regenerate(message.id, { model: model.id }); });
         actions.append(other);
       }
     }
@@ -539,11 +558,15 @@ function renderMessages() {
   }
   const nextCache = new Map();
   const restores = [];
+  // Model names label every answer; the last one also offers the other models and "without reasoning".
+  const labels = JSON.stringify(modelList().map(model => model.label));
+  const choices = store.modelOf(chat) + store.effortOf(chat) + JSON.stringify(modelList());
   const nodes = chat.messages.map((message, index) => {
     // Rebuild a message only when its content or available actions change; streaming touches one node.
     // An open edit form is never rebuilt, so typed text and the caret survive unrelated updates.
+    const last = index === chat.messages.length - 1;
     const key = editingId === message.id ? 'editing' : JSON.stringify(message) + store.canModify()
-      + (index === chat.messages.length - 1) + chat.usePubmed + reasoningOpen.get(message.id) + (speakingId === message.id);
+      + last + chat.usePubmed + reasoningOpen.get(message.id) + (speakingId === message.id) + labels + (last ? choices : '');
     const cached = nodeCache.get(message.id);
     const node = cached?.key === key ? cached.node
       : message.role === 'user' ? renderUser(message) : renderAssistant(message, chat);
@@ -621,6 +644,17 @@ async function readImage(file) {
   return { name, kind: 'image', dataUrl: canvas.toDataURL('image/jpeg', 0.85) };
 }
 
+/** Pictures need a model that can see them: switch this chat (not the choice for new chats) to one. */
+function switchToVision() {
+  const vision = modelList().find(model => model.vision && model.state !== 'missing');
+  if (!vision) {
+    toast('이미지를 이해할 수 있는 모델이 없어 이미지는 빼고 보내요.');
+    return;
+  }
+  store.updateChat({ model: vision.id });
+  toast('이미지를 이해할 수 있는 ' + vision.label + ' 모델로 바꿨어요.');
+}
+
 const isPdf = file => file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
 
 /** PDFs are turned into text by the server; the result is attached like a text file. */
@@ -649,7 +683,6 @@ async function attachFiles(files) {
   const pendingTexts = pendingFiles.filter(file => !isImage(file));
   const used = pendingTexts.reduce((sum, file) => sum + file.text.length, 0);
   const usedTokens = pendingTexts.reduce((sum, file) => sum + estimateTokens(file.text), 0);
-  const tokenBudget = attachmentTokenBudget(contextTokens);
   attaching++;  // uploads take a moment; a message sent meanwhile would leave pictures behind
   updateComposer();
   try {
@@ -658,15 +691,13 @@ async function attachFiles(files) {
     if (images.length + texts.length + pdfs.length > slots()) toast('첨부는 한 번에 ' + MAX_ATTACHMENTS + '개까지예요.');
     else if (images.length > room) toast('이미지는 한 번에 ' + MAX_IMAGES + '장까지 보낼 수 있어요.');
     for (const file of images.slice(0, Math.max(0, room))) pendingFiles.push(await readImage(file));
-    if (images.length && !VISION_MODELS.includes(store.current.model)) {
-      store.updateChat({ model: VISION_MODELS[0] });
-      toast('이미지를 이해할 수 있는 ' + MODEL_LABELS[VISION_MODELS[0]] + ' 모델로 바꿨어요.');
-    }
+    if (images.length && !modelInfo(store.modelOf())?.vision) switchToVision();
     if (pdfs.length) {
       toast('PDF에서 글자를 읽고 있어요…');
       for (const file of pdfs.slice(0, Math.max(0, slots() - texts.length))) texts.push(await readPdf(file));
     }
     if (texts.length) {
+      const tokenBudget = attachmentTokenBudget(contextTokensFor(store.modelOf()));
       if (used >= ATTACHMENT_LIMIT || usedTokens >= tokenBudget) toast('텍스트 첨부가 모델이 읽을 수 있는 길이를 다 채웠어요.');
       else {
         const added = await readAttachments(texts.slice(0, Math.max(0, slots())), used, tokenBudget, usedTokens);
@@ -701,17 +732,15 @@ function updateComposer() {
 function render() {
   renderQueued = false;
   const chat = store.current;
-  $('model').value = chat.model;
   const locked = !store.canModify();
   const elsewhere = store.liveChats.has(chat.id);
-  $('model').disabled = locked;
+  renderPickers(locked);
   $('use-pubmed').checked = chat.usePubmed;
   $('use-pubmed').disabled = locked;
-  $('use-thinking').checked = chat.thinking;
-  $('use-thinking').disabled = locked;
   $('new-chat').disabled = store.busy;
   $('storage-warning').textContent = store.storageWarning;
   $('storage-warning').hidden = !store.storageWarning;
+  $('chat-heading').textContent = $('chat-heading').title = chat.title;
   document.title = chat.messages.length ? chat.title + ' · PubMed Chat' : 'PubMed Chat';
   $('export-chat').hidden = !chat.messages.length;
   if (store.notice) { toast(store.notice); store.notice = ''; }
@@ -730,16 +759,172 @@ function scheduleRender() {
   requestAnimationFrame(render);
 }
 
+const EFFORT_TEXT = { none: ['끔', '바로 답변'], light: ['가볍게', '잠깐 생각'], medium: ['보통', '차근차근 생각'],
+  high: ['깊게', '오래 생각'], max: ['최대', '가장 오래 생각, 느림'] };
+/** What a model's state means for someone about to ask it something. */
+const STATE_HINT = { starting: '준비 중…', stopped: '첫 질문 때 불러와요', failed: '시작하지 못했어요', missing: '모델 파일이 없어요' };
+let openMenu = null;
+
+/**
+ * A composer button with a menu of choices (WAI-ARIA menu button, radio items). Arrow keys, Home and End
+ * move, Enter or Space picks, Escape and Tab close; focus returns to the button. choices() gives
+ * [{ value, label, hint?, badge?, disabled?, checked }]; pick(value) applies one.
+ */
+function menuButton(button, menu, title, choices, pick) {
+  let shown = '';  // the choices on display, so unrelated renders leave an open menu and its focus alone
+  const items = () => [...menu.querySelectorAll('.menu-item')];
+  // Focus never scrolls the page; the menu alone scrolls to the item, which at 200% zoom or on a phone held
+  // sideways may lie past the part of the menu that fits on screen.
+  const focusAt = index => {
+    const list = items();
+    const at = (index + list.length) % list.length;
+    list[at]?.focus({ preventScroll: true });
+    revealItem(menu, list, at);
+  };
+  const item = choice => {
+    const node = element('button', 'menu-item');
+    node.type = 'button';
+    node.tabIndex = -1;
+    node.dataset.value = choice.value;
+    node.setAttribute('role', 'menuitemradio');
+    node.setAttribute('aria-checked', String(choice.checked));
+    // The visible parts, with pauses between them that their markup alone may not give a screen reader.
+    node.setAttribute('aria-label', [choice.label, choice.badge, choice.hint].filter(Boolean).join(', '));
+    if (choice.disabled) node.setAttribute('aria-disabled', 'true');
+    const name = element('span', 'menu-item-label', choice.label);
+    if (choice.badge) name.append(element('span', 'menu-badge', choice.badge));
+    const text = element('span', 'menu-item-text');
+    text.append(name);
+    if (choice.hint) text.append(element('span', 'menu-item-hint', choice.hint));
+    const check = icon('check');
+    check.classList.add('menu-check');
+    node.append(text, check);
+    node.addEventListener('click', () => {
+      if (choice.disabled) return;
+      close(true);
+      pick(choice.value);
+    });
+    // The pointer and the keyboard share one highlight.
+    node.addEventListener('pointermove', event => {
+      if (event.pointerType === 'mouse' && document.activeElement !== node) node.focus({ preventScroll: true });
+    });
+    return node;
+  };
+  const build = () => {
+    const list = choices();
+    const key = JSON.stringify(list);
+    if (key === shown) return;
+    shown = key;
+    const focused = menu.contains(document.activeElement) ? document.activeElement.dataset.value : undefined;
+    const heading = element('div', 'menu-heading', title);
+    heading.setAttribute('aria-hidden', 'true');  // the menu is named by its aria-label
+    menu.replaceChildren(heading, ...list.map(item));
+    if (focused !== undefined) items().find(node => node.dataset.value === focused)?.focus({ preventScroll: true });
+  };
+  // Keep the menu inside the window: it opens upwards unless only the space below fits it (a short
+  // landscape screen, a long draft), and shifts left when its button sits near the right edge.
+  const place = () => {
+    menu.style.left = menu.style.maxHeight = '';
+    const anchor = button.getBoundingClientRect();
+    const above = anchor.top - 20;
+    const below = document.documentElement.clientHeight - anchor.bottom - 20;
+    const down = menu.scrollHeight > above && below > above;
+    menu.classList.toggle('below', down);
+    menu.style.maxHeight = Math.max(120, Math.min(400, Math.floor(down ? below : above))) + 'px';
+    const { left, right } = menu.getBoundingClientRect();
+    const shift = Math.min(right - (document.documentElement.clientWidth - 12), left - 12);
+    if (shift > 0) menu.style.left = -shift + 'px';
+    const list = items();
+    revealItem(menu, list, list.indexOf(document.activeElement));  // a menu made shorter still shows its focus
+  };
+  const open = (target = 'checked') => {
+    if (openMenu && openMenu !== control) openMenu.close();
+    shown = '';
+    build();
+    menu.hidden = false;
+    button.setAttribute('aria-expanded', 'true');
+    openMenu = control;
+    place();
+    const list = items();
+    const checked = list.findIndex(node => node.getAttribute('aria-checked') === 'true');
+    focusAt(target === 'last' ? -1 : Math.max(checked, 0));
+  };
+  const close = (returnFocus = false) => {
+    if (menu.hidden) return;
+    menu.hidden = true;
+    button.setAttribute('aria-expanded', 'false');
+    if (openMenu === control) openMenu = null;
+    if (returnFocus) button.focus();
+  };
+  button.addEventListener('click', () => (menu.hidden ? open() : close(true)));
+  button.addEventListener('keydown', event => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    open(event.key === 'ArrowUp' ? 'last' : 'checked');
+  });
+  menu.addEventListener('keydown', event => {
+    const index = items().indexOf(document.activeElement);
+    const moves = { ArrowDown: index + 1, ArrowUp: index < 0 ? -1 : index - 1, Home: 0, End: -1 };
+    if (Object.hasOwn(moves, event.key)) {
+      event.preventDefault();
+      focusAt(moves[event.key]);
+    } else if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      close(true);
+    } else if (event.key === 'Tab') close(true);  // the browser then moves on from the button
+  });
+  const control = { close, place, refresh: () => { if (!menu.hidden) build(); },
+    contains: node => menu.contains(node) || button.contains(node) };
+  return control;
+}
+
+const modelMenu = menuButton($('model-button'), $('model-menu'), '모델', () => {
+  const current = store.modelOf();
+  return modelList().map(model => ({ value: model.id, label: model.label, badge: model.vision ? '이미지' : '',
+    hint: [model.summary, STATE_HINT[model.state]].filter(Boolean).join(' · '), disabled: model.state === 'missing',
+    checked: model.id === current }));
+}, model => {
+  store.updateChat({ model }, { remember: true });
+  const hasImages = store.current.messages.some(message => message.attachments?.some(isImage));
+  if (hasImages && !modelInfo(model)?.vision) {
+    toast(modelLabel(model) + '은(는) 이미지를 볼 수 없어 이 대화의 이미지는 빼고 보내요.');
+  }
+});
+const effortMenu = menuButton($('effort-button'), $('effort-menu'), '추론', () => {
+  const current = store.effortOf();
+  return ['none', ...(modelInfo(store.modelOf())?.efforts || [])].map(level => ({ value: level,
+    label: EFFORT_TEXT[level][0], hint: EFFORT_TEXT[level][1], checked: level === current }));
+}, effort => store.updateChat({ effort }, { remember: true }));
+
+/** The composer's model and reasoning buttons show what the next question is sent with. */
+function renderPickers(locked) {
+  const model = store.modelOf();
+  const info = modelInfo(model);
+  const effort = store.effortOf();
+  const reasons = Boolean(info?.efforts.length);
+  $('model-label').textContent = modelLabel(model);
+  $('model-button').title = [info?.summary, STATE_HINT[info?.state]].filter(Boolean).join(' · ') || '답할 모델 고르기';
+  $('model-button').disabled = locked;
+  $('effort-label').textContent = '추론: ' + EFFORT_TEXT[effort][0];
+  $('effort-button').classList.toggle('active', effort !== 'none');
+  $('effort-button').disabled = locked || !reasons;
+  $('effort-button').title = reasons ? '답하기 전에 얼마나 생각할지 고릅니다. 깊을수록 정확할 수 있지만 느립니다'
+    : '이 모델은 추론을 지원하지 않아요';
+  if (locked) modelMenu.close();
+  if (locked || !reasons) effortMenu.close();
+  modelMenu.refresh();
+  effortMenu.refresh();
+}
+
 store.onChange = scheduleRender;
 window.addEventListener('storage', event => { if (event.key === store.storageKey) store.sync(); });
 $('chat-form').addEventListener('submit', event => {
   event.preventDefault();
   if (attaching) { toast('첨부를 준비하고 있어요. 잠시 후 보내 주세요.'); return; }
   if (!store.canModify() || (!prompt.value.trim() && !pendingFiles.length)) return;
-  if (pendingFiles.some(isImage) && !VISION_MODELS.includes(store.current.model)) {
-    store.updateChat({ model: VISION_MODELS[0] });  // never send a picture to a model that cannot see it
-    toast('이미지를 이해할 수 있는 ' + MODEL_LABELS[VISION_MODELS[0]] + ' 모델로 바꿨어요.');
-  }
+  // Never send a picture to a model that cannot see it.
+  if (pendingFiles.some(isImage) && !modelInfo(store.modelOf())?.vision) switchToVision();
   const content = prompt.value;
   const files = pendingFiles;
   prompt.value = '';
@@ -805,18 +990,16 @@ $('messages').addEventListener('click', event => {
   button.textContent = '복사됨';
   setTimeout(() => { button.textContent = '복사'; }, 1500);
 });
-$('model').addEventListener('change', event => {
-  store.updateChat({ model: event.target.value });
-  const hasImages = store.current.messages.some(message => message.attachments?.some(isImage));
-  if (hasImages && !VISION_MODELS.includes(event.target.value)) {
-    toast(MODEL_LABELS[event.target.value] + '은(는) 이미지를 볼 수 없어 이 대화의 이미지는 빼고 보내요.');
-  }
-});
 $('use-pubmed').addEventListener('change', event => store.updateChat({ usePubmed: event.target.checked }));
-$('use-thinking').addEventListener('change', event => store.updateChat({ thinking: event.target.checked }));
+// A tap or click anywhere else closes an open composer menu; a resize (e.g. the on-screen keyboard) moves it.
+document.addEventListener('pointerdown', event => {
+  if (openMenu && !openMenu.contains(event.target)) openMenu.close();
+}, true);
+window.addEventListener('resize', () => openMenu?.place());
 $('chat-search').addEventListener('input', renderHistory);
 function newChat() {
   if (store.busy) return;
+  openMenu?.close();
   store.newChat();
   render();  // controls must reflect the new chat before the next input event
   prompt.value = '';
@@ -832,6 +1015,7 @@ document.addEventListener('keydown', event => {
   }
   if (event.key === 'Escape') {
     if (store.busy && document.activeElement === prompt) store.stop();
+    openMenu?.close();
     hideSidebar();
   }
 });
@@ -866,10 +1050,18 @@ function applyTheme(theme) {
 function savedTheme() {
   try { return storage.getItem(THEME_KEY) || 'system'; } catch { return 'system'; }
 }
-function showTemperature() { $('temperature-value').textContent = Number($('temperature').value).toFixed(1); }
+const MODEL_TEMPERATURE = 0.7;  // where the slider rests while the model's recommended sampling applies
+/** null: the model's own recommended sampling, which differs with and without reasoning. */
+function showTemperature(value = store.settings.temperature) {
+  const chosen = value !== null;
+  $('temperature-value').textContent = chosen ? Number(value).toFixed(1) : '모델 기본값';
+  $('temperature-reset').hidden = !chosen;
+  if (chosen) $('temperature').removeAttribute('aria-valuetext');
+  else $('temperature').setAttribute('aria-valuetext', '모델 기본값');
+}
 $('open-settings').addEventListener('click', () => {
   $('system-prompt').value = store.settings.systemPrompt;
-  $('temperature').value = store.settings.temperature;
+  $('temperature').value = store.settings.temperature ?? MODEL_TEMPERATURE;
   $('max-tokens').value = String(store.settings.maxTokens);
   $('theme').value = savedTheme();
   showTemperature();
@@ -879,8 +1071,14 @@ $('settings-dialog').addEventListener('click', event => {
   if (event.target === $('settings-dialog')) $('settings-dialog').close();  // backdrop click
 });
 $('system-prompt').addEventListener('input', event => store.updateSettings({ systemPrompt: event.target.value }));
-$('temperature').addEventListener('input', showTemperature);
+$('temperature').addEventListener('input', event => showTemperature(Number(event.target.value)));
 $('temperature').addEventListener('change', event => store.updateSettings({ temperature: Number(event.target.value) }));
+$('temperature-reset').addEventListener('click', () => {
+  store.updateSettings({ temperature: null });
+  $('temperature').value = MODEL_TEMPERATURE;
+  showTemperature();
+  $('temperature').focus();  // the button that had focus is hidden now
+});
 $('max-tokens').addEventListener('change', event => store.updateSettings({ maxTokens: Number(event.target.value) }));
 $('theme').addEventListener('change', event => applyTheme(event.target.value));
 function download(text, type, name) {
@@ -910,36 +1108,64 @@ function setupNotice(lines, command) {
   if (command) notice.append(element('code', '', command));
 }
 
+const RUNTIME_NAME = { mlx: 'MLX', transformers: 'Transformers' };
+const STATE_TEXT = { ready: '준비됨', starting: '준비 중', stopped: '대기 중 · 첫 질문 때 불러와요', failed: '시작 실패',
+  missing: '파일 없음' };
+const SERVER_TEXT = { ready: '서버 연결됨', starting: '모델 준비 중', unavailable: '모델 준비 필요' };
+let serverTimer;
+
+/** One model's line in the server status tooltip. */
+function modelStatus(model) {
+  const runtime = Object.hasOwn(RUNTIME_NAME, model.runtime) ? ' (' + RUNTIME_NAME[model.runtime] + ')' : '';
+  return model.label + runtime + ': ' + (STATE_TEXT[model.state] || '확인 전') + (model.error ? ' — ' + model.error : '');
+}
+
 async function checkServer() {
+  clearTimeout(serverTimer);
+  let starting = false;
+  const status = $('server-status');
   try {
     const response = await fetch('/health', { signal: AbortSignal.timeout(5000) });
     if (!response.ok) throw Error('offline');
     const health = await response.json();
-    const ready = health.ready_for_chat !== false;
-    $('server-status').classList.toggle('offline', !ready);
-    $('server-status').lastElementChild.textContent = ready ? '서버 연결됨' : '모델 준비 필요';
-    if (Number.isInteger(health.inference?.max_context_tokens)) contextTokens = health.inference.max_context_tokens;
-    const loaded = health.inference?.loaded_model;
-    $('server-status').title = '실행 장치: ' + String(health.inference?.device || '?').toUpperCase()
-      + ' · 메모리의 모델: ' + (MODEL_LABELS[loaded] || '없음 (첫 질문 때 불러옵니다)')
-      + ' · PubMed: ' + ({ available: '연결됨', unavailable: '연결 안 됨' }[health.pubmed?.status] || '확인 전');
-    const missing = Object.entries(health.inference?.model_files || {}).filter(([, ok]) => !ok).map(([name]) => name);
+    const inference = health.inference || {};
+    const states = inference.models && typeof inference.models === 'object' ? inference.models : null;
+    if (Number.isInteger(inference.max_context_tokens)) healthContextTokens = inference.max_context_tokens;
+    if (await modelSync.follow(states)) scheduleRender();
+    const state = serverState(health);
+    starting = state === 'starting';
+    status.classList.toggle('starting', starting);
+    status.classList.toggle('offline', state === 'unavailable');  // missing files or a failed start: see the notice
+    status.lastElementChild.textContent = SERVER_TEXT[state];
+    const models = states ? modelList().map(modelStatus)
+      : ['메모리의 모델: ' + (modelLabel(inference.loaded_model) || '없음 (첫 질문 때 불러옵니다)')];
+    status.title = [...models, 'PubMed: ' + ({ available: '연결됨', unavailable: '연결 안 됨' }[health.pubmed?.status] || '확인 전'),
+      '실행 장치: ' + String(inference.device || '?').toUpperCase()].join('\n');
+    // Only the models this server offers count; the files of others may well be absent.
+    const missing = states ? modelList().filter(model => model.state === 'missing').map(model => model.id)
+      : Object.entries(inference.model_files || {}).filter(([, ok]) => !ok).map(([name]) => name);
+    const failed = modelList().filter(model => model.state === 'failed');
     // People signing in from elsewhere cannot run commands on the server PC.
-    if (!missing.length) setupNotice(null);
-    else if (accounts) setupNotice(['서버에 모델이 아직 준비되지 않았습니다. 서버 관리자에게 알려 주세요.']);
-    else {
+    if (missing.length && accounts) setupNotice(['서버에 모델이 아직 준비되지 않았습니다. 서버 관리자에게 알려 주세요.']);
+    else if (missing.length) {
       setupNotice(['모델 파일이 준비되지 않았습니다: ' + missing.join(', '),
         '프로젝트 폴더에서 아래 명령을 실행한 뒤 이 페이지를 새로고침하세요.'], 'uv run python scripts/prepare_models.py');
-    }
+    } else if (failed.length && accounts) setupNotice(['모델을 시작하지 못했어요. 서버 관리자에게 알려 주세요.']);
+    else if (failed.length) {
+      setupNotice(['모델을 시작하지 못했어요: ' + failed.map(model => model.label
+        + (model.error ? ' (' + model.error + ')' : '')).join(', '), '서버 로그를 확인해 주세요.']);
+    } else setupNotice(null);
   } catch {
-    $('server-status').classList.add('offline');
-    $('server-status').lastElementChild.textContent = '서버 연결 끊김';
+    status.classList.remove('starting');
+    status.classList.add('offline');
+    status.lastElementChild.textContent = '서버 연결 끊김';
     if (accounts) setupNotice(['서버에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.']);
     else {
       setupNotice(['서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.'],
         'uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1');
     }
   }
+  serverTimer = setTimeout(checkServer, starting ? 3000 : 15000);  // a starting model is followed closely
 }
 
 const SYNC_TEXT = { synced: '서버에 저장됨', syncing: '저장하는 중…', offline: '오프라인 — 연결되면 저장해요',
@@ -1008,8 +1234,7 @@ async function offerLegacyImport() {
 
 showAccount();
 render();
-checkServer();
-setInterval(checkServer, 15000);
+checkServer();  // and again every 15 s, or every 3 s while a model is starting
 window.addEventListener('online', () => sync.syncNow());
 sync.start().then(async () => {
   await offerLegacyImport();

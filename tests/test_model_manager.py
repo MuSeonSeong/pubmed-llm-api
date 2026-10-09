@@ -2,6 +2,7 @@ import asyncio
 import threading
 import weakref
 import pytest
+from app.model_manager import THINKING_BUDGETS
 
 class Tokenizer:
     eos_token_id = 99
@@ -237,7 +238,7 @@ def test_thinking_flag_reaches_the_chat_template(monkeypatch):
             return super().apply_chat_template(messages, **kw)
     obj=manager(monkeypatch,loader=lambda spec:(Model(),Recording()))
     asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0))
-    asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0,thinking=True))
+    asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0,effort='medium'))
     assert seen == [False, True]
 
 
@@ -287,10 +288,11 @@ def test_thinking_budget_closes_runaway_reasoning_and_lets_the_model_answer(monk
         def decode(self, ids, skip_special_tokens=False):
             return 'reasoning' if 5 not in ids else 'reasoning</think>answer'
     seen=[]
+    monkeypatch.setitem(THINKING_BUDGETS,'medium',75)
     obj=manager(monkeypatch,loader=lambda spec:(Thinker(),Words()))
-    result=asyncio.run(obj.generate('qwen3-0.6b',[{'role':'user','content':'hi'}],[],100,0,thinking=True,on_text=seen.append))
-    assert calls[0] == (3, 75, 3)            # 75% of the answer budget for reasoning
-    assert calls[1] == (3 + 75 + 2, 23, 80)  # prompt + reasoning + forced close; the close counts toward 100
+    result=asyncio.run(obj.generate('qwen3-0.6b',[{'role':'user','content':'hi'}],[],100,0,effort='medium',on_text=seen.append))
+    assert calls[0] == (3, 75, 3)            # the effort's reasoning budget
+    assert calls[1] == (3 + 75 + 2, 98, 80)  # prompt + reasoning + forced close; the close counts toward 75 + 100
     assert result.finish_reason == 'stop' and result.raw_text.endswith('answer')
     assert any('</think>' in text for text in seen)
 
@@ -302,8 +304,8 @@ def test_reasoning_that_finishes_in_budget_is_not_forced(monkeypatch):
             calls.append(kw['max_new_tokens'])
             return super().generate(**kw)
     obj=manager(monkeypatch,loader=lambda spec:(Quick(),Tokenizer()))
-    asyncio.run(obj.generate('qwen3-0.6b',[],[],100,0,thinking=True))
-    assert calls == [75]
+    asyncio.run(obj.generate('qwen3-0.6b',[],[],100,0,effort='light'))
+    assert calls == [512]
 
 
 def test_an_answer_in_progress_at_the_budget_continues_without_forcing(monkeypatch):
@@ -319,9 +321,10 @@ def test_an_answer_in_progress_at_the_budget_continues_without_forcing(monkeypat
             raise AssertionError('no closing words once reasoning has ended')
         def decode(self, ids, skip_special_tokens=False):
             return 'r</think>answer so far'
+    monkeypatch.setitem(THINKING_BUDGETS,'high',75)
     obj=manager(monkeypatch,loader=lambda spec:(Answering(),Closed()))
-    result=asyncio.run(obj.generate('qwen3-0.6b',[],[],100,0,thinking=True))
-    assert calls == [(3, 75), (3 + 75, 25)]
+    result=asyncio.run(obj.generate('qwen3-0.6b',[],[],100,0,effort='high'))
+    assert calls == [(3, 75), (3 + 75, 100)]
     assert result.finish_reason == 'stop'
 
 
@@ -331,3 +334,143 @@ def test_strict_budget_refuses_instead_of_shrinking(monkeypatch):
     with pytest.raises(ServiceError) as e:
         asyncio.run(obj.generate('qwen3-0.6b',[{'role':'user','content':'hi'}],[],500,0,strict_budget=True))
     assert e.value.status_code == 413
+
+
+def test_reasoning_budget_is_capped_by_the_room_the_answer_leaves(monkeypatch):
+    calls=[]
+    class Quick(Model):
+        def generate(self, **kw):
+            calls.append(kw['max_new_tokens'])
+            return super().generate(**kw)
+    obj=manager(monkeypatch,budget=300,loader=lambda spec:(Quick(),Tokenizer()))
+    asyncio.run(obj.generate('qwen3-0.6b',[],[],100,0,effort='max'))
+    assert calls == [300 - 3 - 100]  # the answer keeps its 100 tokens; reasoning gets the rest, not 8192
+
+
+def test_without_room_to_reason_the_model_answers_directly(monkeypatch):
+    seen,calls=[],[]
+    class Recording(Tokenizer):
+        def apply_chat_template(self, messages, **kw):
+            seen.append(kw['enable_thinking'])
+            return super().apply_chat_template(messages, **kw)
+    class Quick(Model):
+        def generate(self, **kw):
+            calls.append(kw['max_new_tokens'])
+            return super().generate(**kw)
+    obj=manager(monkeypatch,budget=150,loader=lambda spec:(Quick(),Recording()))
+    result=asyncio.run(obj.generate('qwen3-0.6b',[],[],100,0,effort='medium'))
+    assert seen == [True, False] and calls == [100]  # 47 tokens would be too few to reason with
+    assert result.raw_text.startswith('<think></think><tool_call>')  # an empty reasoning keeps the reply's shape
+
+
+def test_effort_is_ignored_for_models_without_reasoning(monkeypatch):
+    import dataclasses
+    seen=[]
+    class Recording(Tokenizer):
+        def apply_chat_template(self, messages, **kw):
+            seen.append(kw['enable_thinking'])
+            return super().apply_chat_template(messages, **kw)
+    obj=manager(monkeypatch,loader=lambda spec:(Model(),Recording()))
+    obj.catalog={**obj.catalog,'qwen3-0.6b':dataclasses.replace(obj.catalog['qwen3-0.6b'],reasoning=False)}
+    asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0,effort='max'))
+    assert seen == [False]
+
+
+def test_temperature_left_to_the_model_is_the_old_default(monkeypatch):
+    import torch
+    seen=[]
+    class Sampling(Model):
+        def generate(self, **kw):
+            seen.append((kw['do_sample'], kw.get('temperature')))
+            return torch.cat((kw['input_ids'], torch.tensor([[42, 99]])), dim=1)
+    obj=manager(monkeypatch,loader=lambda spec:(Sampling(),Tokenizer()))
+    asyncio.run(obj.generate('qwen3-0.6b',[],[],10,None))
+    assert seen == [(True, 0.2)]
+
+
+def test_plan_output_keeps_the_answer_and_gives_reasoning_the_rest():
+    from app.model_manager import plan_output
+    from app.settings import ServiceError
+    assert plan_output(32768, 2000, 1024, 2048, strict=True) == (1024, 2048)
+    assert plan_output(4000, 2000, 1024, 8192, strict=True) == (1024, 976)
+    assert plan_output(3060, 2000, 1024, 8192, strict=False) == (1024, 0)   # 36 tokens left: no reasoning
+    assert plan_output(2500, 2000, 1024, 2048, strict=False) == (500, 0)    # the answer shrinks to the room left
+    for limit, strict in [(2900, True), (2050, False)]:
+        with pytest.raises(ServiceError) as e:
+            plan_output(limit, 2000, 1024, 0, strict=strict)
+        assert e.value.code == 'context_overflow' and e.value.status_code == 413
+
+
+def test_status_lists_every_enabled_model_with_its_state(tmp_path):
+    from app.model_manager import ModelManager
+    from app.catalog import load_catalog
+    from app.settings import Settings
+    folder=tmp_path/'qwen3-0.6b'
+    folder.mkdir()
+    for name in ['config.json','tokenizer_config.json','tokenizer.json']:
+        (folder/name).write_text('{}')
+    (folder/'model.safetensors').write_bytes(b'weights')
+    m=ModelManager(Settings(device='cpu',models_dir=tmp_path,models='qwen3-0.6b,qwen3.5-2b'),load_catalog())
+    assert m.default_model == 'qwen3-0.6b' and m.pool is None
+    status=m.status()
+    assert {'device','loaded_model','busy','max_context_tokens','model_files'} <= set(status)
+    assert status['models'] == {
+        'qwen3-0.6b':{'state':'ready','runtime':'transformers','label':'Qwen3 0.6B','error':None},
+        'qwen3.5-2b':{'state':'missing','runtime':'transformers','label':'Qwen3.5 2B','error':None}}
+
+
+def test_mlx_models_are_served_by_the_pool(monkeypatch):
+    from app.model_manager import ModelManager, GenerationResult
+    from app.catalog import load_catalog
+    from app.settings import Settings
+    monkeypatch.setattr('app.settings.mlx_available', lambda: True)  # MODELS may name MLX models on any machine here
+    class Pool:
+        def __init__(self): self.calls=[]
+        def __contains__(self, model_id): return model_id == 'qwen3.5-9b'
+        def status(self): return {'qwen3.5-9b':{'state':'starting','runtime':'mlx','label':'Qwen3.5 9B','error':None}}
+        async def generate(self, spec, *args, **kw):
+            self.calls.append((spec.id, args, kw))
+            return GenerationResult('hi','stop',1,1)
+        def close(self): self.closed=True
+    pool=Pool()
+    m=ModelManager(Settings(device='cpu',models='qwen3.5-9b,qwen3-0.6b'),load_catalog(),pool=pool)
+    result=asyncio.run(m.generate('qwen3.5-9b',[{'role':'user','content':'q'}],[],100,None,effort='high',tenant='user-1'))
+    assert result.raw_text == 'hi'
+    spec_id,args,kw=pool.calls[0]
+    assert spec_id == 'qwen3.5-9b' and args == ([{'role':'user','content':'q'}],[],100,None)
+    assert kw['effort'] == 'high' and kw['tenant'] == 'user-1'
+    assert m.status()['models']['qwen3.5-9b']['state'] == 'starting'
+    m.close()
+    assert pool.closed
+
+
+def test_the_manager_hands_mlx_starts_to_its_pool_for_the_apps_lifetime(tmp_path, monkeypatch):
+    from app.model_manager import ModelManager
+    from app.catalog import load_catalog
+    from app.settings import Settings
+    monkeypatch.setattr('app.settings.mlx_available', lambda: True)
+    settings=Settings(device='cpu',models_dir=tmp_path,models='qwen3.5-4b,qwen3-0.6b,qwen3.5-9b')
+    m=ModelManager(settings,load_catalog())
+    assert list(m.pool.sidecars) == ['qwen3.5-4b','qwen3.5-9b']
+    calls=[]
+    async def run(prefix, preload_ids):
+        calls.append((prefix, preload_ids))
+    m.pool.run=run
+    asyncio.run(m.start('prefix'))
+    assert calls == [('prefix', ['qwen3.5-4b'])]  # PRELOAD_MODELS=default: the 9B starts on its first question
+
+
+@pytest.mark.parametrize('models,mode,preloaded', [
+    ('qwen3.5-9b,qwen3.5-4b', 'default', ['qwen3.5-9b']),
+    ('qwen3.5-9b,qwen3.5-4b', 'all', ['qwen3.5-9b','qwen3.5-4b']),
+    ('qwen3.5-9b,qwen3.5-4b', 'none', []),
+    ('qwen3.5-4b,qwen3.5-9b', 'default', ['qwen3.5-4b']),            # the first in MODELS is the default
+    ('qwen3-0.6b,qwen3.5-4b,qwen3.5-9b', 'default', []),             # a Transformers default loads on first use
+    ('qwen3-0.6b,qwen3.5-4b,qwen3.5-9b', 'all', ['qwen3.5-4b','qwen3.5-9b'])])
+def test_preload_models_names_the_mlx_models_started_with_the_app(tmp_path, monkeypatch, models, mode, preloaded):
+    from app.model_manager import ModelManager
+    from app.catalog import load_catalog
+    from app.settings import Settings
+    monkeypatch.setattr('app.settings.mlx_available', lambda: True)
+    m=ModelManager(Settings(device='cpu',models_dir=tmp_path,models=models,preload_models=mode),load_catalog())
+    assert m.preload_ids() == preloaded

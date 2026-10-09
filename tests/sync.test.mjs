@@ -404,15 +404,32 @@ test('settings come from the server when it has them; otherwise this browser\'s 
   const first = device();
   first.server.settings = { systemPrompt: '항상 한국어로', temperature: 0.5, maxTokens: 1024 };
   await first.sync.start();
-  assert.deepEqual(first.store.settings, { systemPrompt: '항상 한국어로', temperature: 0.5, maxTokens: 1024 });
+  assert.deepEqual(first.store.settings,
+    { systemPrompt: '항상 한국어로', temperature: 0.5, maxTokens: 1024, model: null, effort: 'none' });
   first.store.updateSettings({ temperature: 0.9 });
   await first.sync.flush();
-  assert.deepEqual(first.server.settings, { systemPrompt: '항상 한국어로', temperature: 0.9, maxTokens: 1024 });
+  assert.deepEqual(first.server.settings,
+    { systemPrompt: '항상 한국어로', temperature: 0.9, maxTokens: 1024, model: null, effort: 'none' });
 
   const second = device();
   second.store.updateSettings({ systemPrompt: '내 지시문' });
   await second.sync.start();
   assert.equal(second.server.settings.systemPrompt, '내 지시문');
+});
+
+test('the model and reasoning level chosen last travel with the settings and start new chats elsewhere', async () => {
+  const { server, store, sync } = device();
+  server.settings = { systemPrompt: '', temperature: null, maxTokens: 1024, model: 'qwen3.5-4b', effort: 'high' };
+  await sync.start();
+  assert.equal(store.current.messages.length, 0);
+  assert.deepEqual([store.current.model, store.current.effort], ['qwen3.5-4b', 'high']);
+  store.updateChat({ model: 'qwen3.5-9b', effort: 'light' }, { remember: true });
+  await sync.flush();
+  assert.deepEqual([server.settings.model, server.settings.effort], ['qwen3.5-9b', 'light']);
+  await store.send('질문');
+  await sync.flush();
+  assert.deepEqual([server.chat(store.current.id).model, server.chat(store.current.id).effort], ['qwen3.5-9b', 'light']);
+  assert.equal(server.completions[0].reasoning_effort, 'light');
 });
 
 test('settings changed while offline win over the server copy on the next visit', async () => {
@@ -652,6 +669,21 @@ test('pages carry no inline script, style or event handler, so the CSP can forbi
     assert.ok(!/\son[a-z]+\s*=/i.test(html), name + ': inline event handler');
     assert.ok(html.includes('<script src="/static/theme.js"></script>'), name + ': theme script');
   }
+});
+
+test('every element the page script looks up, and every id the page refers to, exists in the page', async () => {
+  const html = await readFile(new URL('../app/static/index.html', import.meta.url), 'utf8');
+  const script = await readFile(new URL('../app/static/app.mjs', import.meta.url), 'utf8');
+  const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map(match => match[1]);
+  assert.deepEqual(ids.filter((name, index) => ids.indexOf(name) !== index), []);  // ids are unique
+  const used = new Set([...script.matchAll(/\$\('([^']+)'\)/g)].map(match => match[1]));
+  assert.ok(used.has('model-button') && used.has('effort-menu'));
+  assert.deepEqual([...used].filter(name => !ids.includes(name)), []);
+  const references = [...html.matchAll(/\s(?:aria-controls|aria-describedby|for)="([^"]+)"/g)].map(match => match[1]);
+  assert.deepEqual(references.filter(name => !ids.includes(name)), []);
+  const symbols = new Set([...html.matchAll(/<symbol id="i-([^"]+)"/g)].map(match => match[1]));
+  const icons = [...script.matchAll(/icon(?:Button)?\('([a-z-]+)'/g)].map(match => match[1]);
+  assert.deepEqual(icons.filter(name => !symbols.has(name)), []);
 });
 
 test('the sign-in form is sent only by its script, so the password never ends up in a URL', async () => {

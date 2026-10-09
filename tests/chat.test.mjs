@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ATTACHMENT_LIMIT, ChatStore, attachmentTokenBudget, chatMarkdown, cleanTitle, errorMessage, estimateTokens, highlight, normalizeSources, readAttachments, readEvents, renderMarkdown,
-  withoutCitationList } from '../app/static/chat.mjs';
+import { ATTACHMENT_LIMIT, ChatStore, attachmentTokenBudget, chatMarkdown, cleanTitle, defaultModel, errorMessage, estimateTokens, highlight, modelInfo, modelLabel,
+  modelList, normalizeSources, readAttachments, readEvents, renderMarkdown, revealItem, serverModels, serverState, setModels,
+  supportedEffort, updateModelStates, withoutCitationList } from '../app/static/chat.mjs';
 
 const memory = () => {
   const data = new Map();
@@ -18,14 +19,14 @@ test('follow-up sends previous turns and selected settings, excluding tool metad
     return reply('답변', [{ name: 'pubmed_search_articles', arguments: { query: 'CRISPR' } }]);
   });
   await store.send('첫 질문');
-  store.current.model = 'qwen3-0.6b';
+  store.current.model = 'qwen3.5-4b';
   store.current.usePubmed = false;
   await store.send('이어서 설명해줘');
   assert.deepEqual(requests[1].messages, [
     { role: 'user', content: '첫 질문' }, { role: 'assistant', content: '답변' },
     { role: 'user', content: '이어서 설명해줘' },
   ]);
-  assert.equal(requests[1].model, 'qwen3-0.6b');
+  assert.equal(requests[1].model, 'qwen3.5-4b');
   assert.equal(requests[1].use_pubmed, false);
   assert.equal(store.current.messages[1].toolCalls.length, 1);
 });
@@ -313,8 +314,8 @@ test('custom instructions and generation settings are sent and persisted', async
   store.updateSettings({ temperature: 9, maxTokens: 1.5 });
   const restored = new ChatStore(storage);
   assert.equal(restored.settings.systemPrompt, '항상 존댓말로 답해줘.');
-  assert.equal(restored.settings.temperature, 0.2);
-  assert.equal(restored.settings.maxTokens, 512);
+  assert.equal(restored.settings.temperature, null);  // the model's recommended sampling
+  assert.equal(restored.settings.maxTokens, 1024);
 });
 
 test('rename trims titles and ignores blanks', () => {
@@ -373,7 +374,7 @@ test('requests ask the server to trim old turns and show how many were dropped',
 });
 
 
-test('thinking mode streams reasoning separately and raises the token floor', async () => {
+test('a reasoning level streams reasoning separately and leaves the answer length as set', async () => {
   let body;
   const store = new ChatStore(memory(), async (_, init) => {
     body = JSON.parse(init.body);
@@ -381,10 +382,11 @@ test('thinking mode streams reasoning separately and raises the token floor', as
       { type: 'delta', content: '4' },
       { type: 'done', choices: [{ message: { content: '4', reasoning_content: '더해 보면 4' }, finish_reason: 'stop' }] }]);
   });
-  store.current.thinking = true;
+  store.updateChat({ effort: 'medium' });
   await store.send('2+2?');
-  assert.equal(body.thinking, true);
-  assert.equal(body.max_tokens, 2048);
+  assert.equal(body.reasoning_effort, 'medium');
+  assert.equal(body.thinking, undefined);
+  assert.equal(body.max_tokens, 1024);  // the server adds the reasoning budget
   const answer = store.current.messages.at(-1);
   assert.equal(answer.reasoning, '더해 보면 4');
   assert.ok(Number.isFinite(answer.thinkMs));
@@ -399,6 +401,7 @@ test('reasoning-only answers are kept, and plain chats never send the thinking f
   });
   await store.send('질문');
   assert.equal(bodies[0].thinking, undefined);
+  assert.equal(bodies[0].reasoning_effort, 'none');
   const answer = store.current.messages.at(-1);
   assert.equal(answer.role, 'assistant');
   assert.equal(answer.truncated, true);
@@ -435,10 +438,10 @@ test('attachments are sent to the model, kept for display and persisted', async 
   assert.equal(question.content, '첨부한 파일의 내용을 요약해 줘.');
   assert.ok(bodies[0].messages[0].content.includes('[첨부 파일: notes.txt]'));
   assert.ok(bodies[0].messages[0].content.includes('혈당 측정 결과'));
-  assert.equal(store.current.messages[1].model, 'qwen3.5-2b');
+  assert.equal(store.current.messages[1].model, 'qwen3.5-9b');
   const restored = new ChatStore(storage);
   assert.equal(restored.current.messages[0].attachments[0].name, 'notes.txt');
-  assert.ok(chatMarkdown(restored.current).includes('## Qwen3.5 · 2B'));
+  assert.ok(chatMarkdown(restored.current).includes('## Qwen3.5 9B'));
 });
 
 test('reading attachments enforces a shared size budget and rejects binary files', async () => {
@@ -518,10 +521,10 @@ test('option changes and version switches win over a stale save from another tab
   const tabB = new ChatStore(storage);
   await tick();
   tabA.selectVersion(tabA.current.messages.at(-1).id, 0);
-  tabA.updateChat({ model: 'qwen3-0.6b' });
+  tabA.updateChat({ model: 'qwen3.5-4b' });
   tabB.newChat();  // B saves its older copy of the chat
   const chat = new ChatStore(storage).chats.find(c => c.id === tabA.current.id);
-  assert.equal(chat.model, 'qwen3-0.6b');
+  assert.equal(chat.model, 'qwen3.5-4b');
   assert.equal(chat.messages.at(-1).content, '답 1');
 });
 
@@ -609,14 +612,15 @@ test('continuing a cut-off answer appends to it and sends the partial answer bac
     return bodies.length === 1 ? sse([{ ...done('봄에는', 'length'), usage: { completion_tokens: 3 } }])
       : sse([{ type: 'delta', content: ' 꽃이' }, { ...done(' 꽃이 핍니다.'), usage: { completion_tokens: 4 } }]);
   });
-  store.current.thinking = true;
+  store.updateChat({ effort: 'medium' });
   await store.send('사계절');
   const answer = store.current.messages.at(-1);
   assert.ok(store.canContinue(answer.id));
   await store.continueAnswer(answer.id);
+  assert.equal(bodies[0].reasoning_effort, 'medium');
   assert.equal(bodies[1].continue_final, true);
   assert.equal(bodies[1].use_pubmed, false);
-  assert.equal(bodies[1].thinking, undefined);
+  assert.equal(bodies[1].reasoning_effort, 'none');  // a continuation only writes on
   assert.deepEqual(bodies[1].messages.at(-1), { role: 'assistant', content: '봄에는' });
   assert.equal(store.current.messages.length, 2);
   assert.equal(answer.content, '봄에는 꽃이 핍니다.');
@@ -718,23 +722,28 @@ const PNG = 'data:image/png;base64,iVBORw0KGgo=';
 const image = name => ({ name, kind: 'image', dataUrl: PNG });
 
 test('images go to vision models as parts, newest first and at most four per request', async () => {
-  const bodies = [];
-  const store = new ChatStore(memory(), async (_, init) => {
-    bodies.push(JSON.parse(init.body));
-    return sse([done('보여요')]);
-  });
-  await store.send('', [image('a.png'), image('b.png'), image('c.png')]);
-  assert.equal(store.current.messages[0].content, '이 이미지를 설명해 줘.');
-  assert.deepEqual(bodies[0].messages[0].content.map(part => part.type), ['image_url', 'image_url', 'image_url', 'text']);
-  await store.send('이것도', [image('d.png'), image('e.png')]);
-  const [first, , second] = bodies[1].messages;
-  assert.equal(first.content.filter(part => part.type === 'image_url').length, 2);  // only the newest four go
-  assert.ok(first.content.at(-1).text.includes('[이미지 생략: a.png]'));
-  assert.equal(second.content.filter(part => part.type === 'image_url').length, 2);
-  store.updateChat({ model: 'qwen3-0.6b' });
-  await store.send('텍스트 모델');
-  assert.equal(typeof bodies[2].messages[0].content, 'string');
-  assert.ok(bodies[2].messages[0].content.includes('[이미지 생략: c.png]'));
+  setModels({ data: [{ id: 'qwen3.5-9b', vision: true }, { id: 'text-only', vision: false }] });
+  try {
+    const bodies = [];
+    const store = new ChatStore(memory(), async (_, init) => {
+      bodies.push(JSON.parse(init.body));
+      return sse([done('보여요')]);
+    });
+    await store.send('', [image('a.png'), image('b.png'), image('c.png')]);
+    assert.equal(store.current.messages[0].content, '이 이미지를 설명해 줘.');
+    assert.deepEqual(bodies[0].messages[0].content.map(part => part.type), ['image_url', 'image_url', 'image_url', 'text']);
+    await store.send('이것도', [image('d.png'), image('e.png')]);
+    const [first, , second] = bodies[1].messages;
+    assert.equal(first.content.filter(part => part.type === 'image_url').length, 2);  // only the newest four go
+    assert.ok(first.content.at(-1).text.includes('[이미지 생략: a.png]'));
+    assert.equal(second.content.filter(part => part.type === 'image_url').length, 2);
+    store.updateChat({ model: 'text-only' });
+    await store.send('텍스트 모델');
+    assert.equal(typeof bodies[2].messages[0].content, 'string');
+    assert.ok(bodies[2].messages[0].content.includes('[이미지 생략: c.png]'));
+  } finally {
+    setModels(null);
+  }
 });
 
 test('stored images must be base64 raster data URLs', () => {
@@ -770,11 +779,11 @@ test('regenerating with another model switches the chat and keeps both versions'
     return sse([done('답 ' + bodies.length)]);
   });
   await store.send('질문');
-  await store.regenerate(store.current.messages.at(-1).id, { model: 'qwen3-0.6b' });
-  assert.equal(bodies[1].model, 'qwen3-0.6b');
-  assert.equal(store.current.model, 'qwen3-0.6b');
+  await store.regenerate(store.current.messages.at(-1).id, { model: 'qwen3.5-4b' });
+  assert.equal(bodies[1].model, 'qwen3.5-4b');
+  assert.equal(store.current.model, 'qwen3.5-4b');
   const answer = store.current.messages.at(-1);
-  assert.deepEqual(answer.versions.map(v => v.model), ['qwen3.5-2b', 'qwen3-0.6b']);
+  assert.deepEqual(answer.versions.map(v => v.model), ['qwen3.5-9b', 'qwen3.5-4b']);
 });
 
 
@@ -796,7 +805,7 @@ test('attachment budgets count estimated tokens, so Korean text is cut sooner th
   assert.ok(korean.text.length < english.text.length);
 });
 
-test('regenerating without thinking turns reasoning off for the chat', async () => {
+test('regenerating without reasoning turns it off for the chat', async () => {
   const bodies = [];
   const store = new ChatStore(memory(), async (_, init) => {
     bodies.push(JSON.parse(init.body));
@@ -804,12 +813,14 @@ test('regenerating without thinking turns reasoning off for the chat', async () 
       ? sse([{ type: 'done', choices: [{ message: { content: '', reasoning_content: '길게 생각' }, finish_reason: 'length' }] }])
       : sse([done('바로 답')]);
   });
-  store.current.thinking = true;
+  store.updateChat({ effort: 'high' });
   await store.send('질문');
-  await store.regenerate(store.current.messages.at(-1).id, { thinking: false });
-  assert.equal(bodies[1].thinking, undefined);
-  assert.equal(store.current.thinking, false);
+  assert.equal(bodies[0].reasoning_effort, 'high');
+  await store.regenerate(store.current.messages.at(-1).id, { effort: 'none' });
+  assert.equal(bodies[1].reasoning_effort, 'none');
+  assert.equal(store.current.effort, 'none');
   assert.equal(store.current.messages.at(-1).content, '바로 답');
+  assert.equal(store.current.messages.at(-1).versions.length, 2);  // the reasoning-only attempt stays browsable
 });
 
 test('a continuation interrupted by a closed tab keeps its citation list when settled', async () => {
@@ -835,6 +846,8 @@ test('the first answer is followed by a model-written title unless the user rena
   assert.equal(store.current.title, '메트포르민 작용');
   assert.equal(bodies[1].use_pubmed, false);
   assert.equal(bodies[1].max_tokens, 24);
+  assert.equal(bodies[1].reasoning_effort, 'none');
+  assert.equal(bodies[1].model, bodies[0].model);
   await store.send('부작용은?');
   assert.equal(bodies.length, 3);  // only after the first exchange
 
@@ -965,4 +978,255 @@ test('a retried tool call discards the rejected round and shows progress until t
   await pending;
   assert.equal(store.current.messages.at(-1).content, '찾은 논문입니다');
   assert.equal(store.current.messages.at(-1).retrying, undefined);
+});
+
+
+test('each chat keeps its reasoning level, and chats saved with the old on/off switch get a matching one', () => {
+  const chat = (chatId, extra) => ({ id: chatId, title: chatId, messages: [{ id: chatId + '-q', role: 'user', content: 'q' }],
+    ...extra });
+  const saved = { activeId: 'on', chats: [chat('on', { thinking: true }), chat('off', { thinking: false }),
+    chat('deep', { effort: 'high', thinking: false }), chat('odd', { effort: 'turbo' })] };
+  const store = new ChatStore({ getItem: () => JSON.stringify(saved), setItem: () => {} });
+  assert.deepEqual(store.chats.map(c => [c.id, c.effort]), [['on', 'medium'], ['off', 'none'], ['deep', 'high'], ['odd', 'none']]);
+  assert.ok(store.chats.every(c => !('thinking' in c)));
+  store.updateChat({ effort: 'turbo' });  // not a level: ignored
+  assert.equal(store.current.effort, 'medium');
+  store.updateChat({ effort: 'max' });
+  assert.equal(store.effortOf(), 'max');
+  assert.equal(store.effortOf(store.chats[1]), 'none');
+});
+
+test('requests carry the reasoning level and the answer length, and a temperature only once one is chosen', async () => {
+  const bodies = [];
+  const store = new ChatStore(memory(), async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return sse([done('답')]);
+  });
+  await store.send('기본값');
+  assert.equal(bodies[0].reasoning_effort, 'none');
+  assert.equal(bodies[0].max_tokens, 1024);
+  assert.ok(!('temperature' in bodies[0]));
+  assert.ok(!('thinking' in bodies[0]));
+  store.updateSettings({ temperature: 0.4, maxTokens: 4096 });
+  store.updateChat({ effort: 'light' });
+  await store.send('바꾼 설정');
+  assert.equal(bodies[1].temperature, 0.4);
+  assert.equal(bodies[1].max_tokens, 4096);
+  assert.equal(bodies[1].reasoning_effort, 'light');
+  store.updateSettings({ temperature: null });  // "기본값으로"
+  await store.send('되돌린 설정');
+  assert.ok(!('temperature' in bodies[2]));
+});
+
+test('settings saved before reasoning levels drop the old defaults but keep what was chosen', () => {
+  const restored = settings => new ChatStore({ getItem: () => JSON.stringify({ chats: [], settings }), setItem: () => {} }).settings;
+  assert.deepEqual(restored({ systemPrompt: '짧게', temperature: 0.2, maxTokens: 512 }),
+    { systemPrompt: '짧게', temperature: null, maxTokens: 1024, model: null, effort: 'none' });
+  assert.deepEqual(restored({ systemPrompt: '', temperature: 0.9, maxTokens: 2048 }),
+    { systemPrompt: '', temperature: 0.9, maxTokens: 2048, model: null, effort: 'none' });
+  // Saved by this version, 0.2 and 512 are choices.
+  assert.deepEqual(restored({ systemPrompt: '', temperature: 0.2, maxTokens: 512, model: 'qwen3.5-4b', effort: 'high' }),
+    { systemPrompt: '', temperature: 0.2, maxTokens: 512, model: 'qwen3.5-4b', effort: 'high' });
+  assert.equal(restored({ maxTokens: 4097, effort: 'none' }).maxTokens, 1024);
+  assert.deepEqual([restored({ model: '../x', effort: 'turbo' }).model, restored({ effort: 'turbo' }).effort], [null, 'none']);
+});
+
+test('new chats start with the model and reasoning level chosen last', async () => {
+  const storage = memory();
+  const store = new ChatStore(storage, async () => sse([done('답')]));
+  store.updateChat({ model: 'qwen3.5-4b', effort: 'high' }, { remember: true });
+  await store.send('질문');
+  store.newChat();
+  const fresh = store.current;
+  assert.equal(fresh.messages.length, 0);
+  assert.deepEqual([fresh.model, fresh.effort], ['qwen3.5-4b', 'high']);
+  // A change for one chat only (like switching to a model that sees a picture) is not remembered...
+  store.updateChat({ model: 'qwen3.5-9b', effort: 'none' });
+  assert.deepEqual([store.settings.model, store.settings.effort], ['qwen3.5-4b', 'high']);
+  // ...and an empty chat that is reused for a new one follows the choice again.
+  store.newChat();
+  assert.equal(store.current, fresh);
+  assert.deepEqual([fresh.model, fresh.effort], ['qwen3.5-4b', 'high']);
+  const reloaded = new ChatStore(storage);
+  assert.deepEqual([reloaded.settings.model, reloaded.settings.effort], ['qwen3.5-4b', 'high']);
+});
+
+test('the server\'s model list replaces the built-in one, and chats with a model it lacks use the default', async () => {
+  const saved = { activeId: 'old', chats: [{ id: 'old', title: 'old', model: 'qwen3.5-2b', effort: 'high', messages: [
+    { id: 'q', role: 'user', content: '질문' }, { id: 'a', role: 'assistant', content: '답', model: 'qwen3.5-2b' }] }] };
+  const changed = setModels({ object: 'list', default: 'big', data: [
+    { id: 'small', label: 'Small', summary: '빠름', vision: false, reasoning: false, efforts: [], context_tokens: 8192, state: 'ready' },
+    { id: 'big', label: 'Big', summary: '정확함', vision: true, reasoning: true, efforts: ['light', 'medium'], state: 'starting' },
+    { id: 'big', label: 'Duplicate' }, { id: 'bad id!' }, null] });
+  try {
+    assert.equal(changed, true);
+    assert.deepEqual(modelList().map(model => [model.id, model.label]), [['small', 'Small'], ['big', 'Big']]);
+    assert.equal(defaultModel(), 'big');
+    assert.deepEqual([modelInfo('big').state, modelInfo('small').contextTokens, modelInfo('big').contextTokens], ['starting', 8192, null]);
+    assert.deepEqual([supportedEffort('big', 'max'), supportedEffort('big', 'light'), supportedEffort('small', 'high'),
+      supportedEffort('gone', 'high'), supportedEffort('big', 'none')], ['medium', 'light', 'none', 'none', 'none']);
+    const bodies = [];
+    const store = new ChatStore({ getItem: () => JSON.stringify(saved), setItem: () => {} }, async (_, init) => {
+      bodies.push(JSON.parse(init.body));
+      return sse([done('새 답')]);
+    });
+    const chat = store.current;
+    assert.equal(chat.model, 'qwen3.5-2b');  // kept, so it returns if the server offers that model again
+    assert.equal(store.modelOf(), 'big');
+    assert.equal(store.effortOf(), 'medium');  // the nearest level Big has
+    assert.equal(modelLabel(chat.messages[1].model), 'Qwen3.5 2B');  // older answers keep their author's name
+    assert.deepEqual([modelLabel('custom-model'), modelLabel('constructor'), modelLabel(undefined)], ['custom-model', 'constructor', '']);
+    store.updateChat({ model: 'qwen3.5-9b' });  // not offered by this server
+    assert.equal(store.modelOf(), 'big');
+    await store.send('다음');
+    assert.deepEqual([bodies[0].model, bodies[0].reasoning_effort, chat.messages.at(-1).model], ['big', 'medium', 'big']);
+    store.updateChat({ model: 'small' });
+    await store.send('작은 모델로', [image('a.png')]);
+    assert.equal(bodies[1].reasoning_effort, 'none');  // Small does not reason
+    assert.equal(typeof bodies[1].messages.at(-1).content, 'string');  // nor see pictures
+    assert.equal(setModels({ data: [{ id: '' }] }), false);  // nothing usable: the list stays
+    assert.equal(defaultModel(), 'big');
+  } finally {
+    setModels(null);
+  }
+  assert.deepEqual(modelList().map(model => model.id), ['qwen3.5-9b', 'qwen3.5-4b']);
+});
+
+test('model states reported by /health update the list', () => {
+  try {
+    assert.equal(updateModelStates({ 'qwen3.5-9b': { state: 'starting', runtime: 'mlx' }, unknown: { state: 'ready' } }), true);
+    assert.deepEqual([modelInfo('qwen3.5-9b').state, modelInfo('qwen3.5-9b').runtime], ['starting', 'mlx']);
+    assert.equal(updateModelStates({ 'qwen3.5-9b': { state: 'starting', runtime: 'mlx' } }), false);
+    updateModelStates({ 'qwen3.5-9b': { state: 'failed', runtime: 'mlx', error: 'exited with code 1' },
+      'qwen3.5-4b': { state: 'bogus' } });
+    assert.equal(modelInfo('qwen3.5-9b').error, 'exited with code 1');
+    assert.equal(modelInfo('qwen3.5-4b').state, undefined);
+    updateModelStates({ 'qwen3.5-9b': { state: 'ready', runtime: 'mlx', error: 'stale' } });
+    assert.equal(modelInfo('qwen3.5-9b').error, undefined);  // only a failed model carries an error
+    assert.equal(updateModelStates(null), false);
+  } finally {
+    setModels(null);
+  }
+  assert.equal(modelInfo('qwen3.5-9b').state, undefined);
+});
+
+test('the model list is fetched until it arrives and when the server\'s models change, and a failed fetch is retried', async () => {
+  const card = id => ({ id, label: id.toUpperCase(), reasoning: false });
+  const report = (...ids) => Object.fromEntries(ids.map(id => [id, { state: 'ready', runtime: 'mlx' }]));
+  let offered = { default: 'a', data: [card('a'), card('b')] };
+  let failure = () => { throw new TypeError('Failed to fetch'); };
+  let fetches = 0;
+  const models = serverModels(async (url, init) => {
+    fetches++;
+    assert.deepEqual([url, init.cache], ['/v1/models', 'no-store']);
+    return failure ? failure() : new Response(JSON.stringify(offered));
+  });
+  try {
+    assert.equal(await models.load(), null);  // the built-in list stands in
+    assert.equal(await models.follow(report('a', 'b')), false);
+    failure = null;
+    assert.equal(await models.follow(report('a', 'b')), true);
+    assert.deepEqual([fetches, modelList().map(model => model.id), modelInfo('a').state], [3, ['a', 'b'], 'ready']);
+    assert.equal(await models.follow(report('a', 'b')), false);  // the same models: not fetched again
+    assert.equal(fetches, 3);
+    // The server restarted with other models and the list could not be fetched: the next check tries again.
+    offered = { default: 'c', data: [card('c')] };
+    failure = () => new Response('{}', { status: 503 });
+    assert.equal(await models.follow(report('c')), false);
+    assert.deepEqual([fetches, modelList().map(model => model.id)], [4, ['a', 'b']]);
+    failure = null;
+    assert.equal(await models.follow(report('c')), true);
+    assert.deepEqual([modelList().map(model => model.id), defaultModel(), modelInfo('c').state], [['c'], 'c', 'ready']);
+    assert.equal(await models.follow(report('c')), false);
+    assert.equal(fetches, 5);
+  } finally {
+    setModels(null);
+  }
+});
+
+test('a restart with the same models but another default fetches the list again', async () => {
+  const card = id => ({ id, label: id.toUpperCase(), reasoning: false });
+  // /health lists the enabled models in the server's order, the default first, as /v1/models does.
+  const report = (...ids) => Object.fromEntries(ids.map(id => [id, { state: 'ready', runtime: 'mlx' }]));
+  let offered = { default: 'a', data: [card('a'), card('b')] };
+  let fetches = 0;
+  const models = serverModels(async () => { fetches++; return new Response(JSON.stringify(offered)); });
+  try {
+    assert.equal(await models.load(), true);
+    assert.equal(await models.follow(report('a', 'b')), true);  // the states arrive
+    assert.equal(await models.follow(report('a', 'b')), false);
+    assert.deepEqual([fetches, defaultModel()], [1, 'a']);
+    offered = { default: 'b', data: [card('b'), card('a')] };  // MODELS=b,a: README's way to change the default
+    assert.equal(await models.follow(report('b', 'a')), true);
+    assert.deepEqual([fetches, defaultModel(), modelList().map(model => model.id)], [2, 'b', ['b', 'a']]);
+    assert.equal(await models.follow(report('b', 'a')), false);
+    assert.equal(fetches, 2);
+  } finally {
+    setModels(null);
+  }
+});
+
+test('the server pill is red only when the default model\'s files are missing or it failed to start', () => {
+  const report = (first, second = 'stopped') => ({ 'qwen3.5-9b': { state: first }, 'qwen3.5-4b': { state: second } });
+  const pill = (states, readyForChat) => {
+    updateModelStates(states);
+    return serverState({ ready_for_chat: readyForChat });
+  };
+  try {
+    // PRELOAD_MODELS=none, or stopped after MLX_IDLE_MINUTES without a question: the first question starts it.
+    assert.equal(pill(report('stopped'), false), 'ready');
+    // The default: the 9B stays loaded, the 4B waits for its first question and is stopped again when idle.
+    assert.equal(pill(report('ready', 'stopped'), true), 'ready');
+    assert.equal(pill(report('ready', 'failed'), true), 'ready');  // another model's failure gets a notice alone
+    assert.equal(pill(report('ready', 'starting'), true), 'starting');
+    assert.equal(pill(report('starting'), false), 'starting');
+    assert.equal(pill(report('missing'), false), 'unavailable');
+    assert.equal(pill(report('failed'), false), 'unavailable');
+    setModels(null);  // without per-model states, the server's ready_for_chat decides
+    assert.deepEqual([serverState({ ready_for_chat: false }), serverState({ status: 'ok' })], ['unavailable', 'ready']);
+  } finally {
+    setModels(null);
+  }
+});
+
+test('a menu scrolls only itself, just enough to show the item focused from the keyboard', () => {
+  // A 30 px heading and five 40 px items in a menu with 5 px padding that shows 100 px of its 240.
+  const list = [0, 1, 2, 3, 4].map(index => ({ offsetTop: 35 + 40 * index, offsetHeight: 40 }));
+  const menu = { scrollTop: 0, clientHeight: 100, scrollHeight: 240 };
+  const reveal = index => {
+    revealItem(menu, list, index);
+    return menu.scrollTop;
+  };
+  assert.equal(reveal(0), 0);  // in view
+  assert.equal(reveal(2), 55);  // below: scrolled until its bottom shows
+  assert.equal(reveal(1), 55);  // in view
+  assert.equal(reveal(4), 140);  // the last brings the padding below it along
+  assert.equal(reveal(3), 140);
+  assert.equal(reveal(1), 75);  // above: scrolled until its top shows
+  assert.equal(reveal(0), 0);  // the first brings the heading along
+  assert.equal(reveal(-1), 0);  // nothing in the menu has focus
+  revealItem(menu, [], 0);
+  assert.equal(menu.scrollTop, 0);
+});
+
+test('model errors are explained without naming a fixed model', () => {
+  assert.ok(errorMessage({ code: 'model_unavailable' }, 503).includes('모델 서버'));
+  assert.equal(errorMessage({}, 503), errorMessage({ code: 'model_unavailable' }, 503));
+  const vision = errorMessage({ code: 'vision_unsupported', message: 'qwen3.5-2b cannot read images' }, 422);
+  assert.ok(!/qwen|\d+(?:\.\d+)?B\b/i.test(vision), vision);
+  assert.ok(errorMessage({ code: 'unknown_model' }, 422).includes('다른 모델'));
+});
+
+test('settings another tab saved become the default for new chats, not for the chat on screen', async () => {
+  const storage = memory();
+  const store = new ChatStore(storage);
+  const shown = store.current;
+  storage.setItem('pubmed-chat.v1', JSON.stringify({ chats: [], settings: { systemPrompt: '', temperature: null,
+    maxTokens: 1024, model: 'qwen3.5-4b', effort: 'max' } }));
+  await store.sync();
+  assert.deepEqual([store.settings.model, store.settings.effort], ['qwen3.5-4b', 'max']);
+  assert.deepEqual([shown.model, shown.effort], ['qwen3.5-9b', 'none']);
+  store.newChat();
+  assert.equal(store.current, shown);
+  assert.deepEqual([shown.model, shown.effort], ['qwen3.5-4b', 'max']);
 });

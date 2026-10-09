@@ -1,14 +1,15 @@
-"""One model at a time, with a worker-owned lock even after cancellation."""
-from collections.abc import Callable
+"""Every enabled model: MLX models through their sidecars (app/mlx_runtime.py), Transformers models here,
+one at a time, with a worker-owned lock even after cancellation."""
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import partial
 import gc
 import threading
 import anyio
 import torch
-from app.catalog import ModelSpec, model_weight_files
+from app.catalog import ModelSpec, files_ready
 from app.images import IMAGE_TOKEN, MODEL_MAX_PIXELS, VISION_TOKENS, decode_image
-from app.settings import Settings, ServiceError
+from app.settings import Settings, ServiceError, enabled_models
 
 @dataclass(frozen=True)
 class GenerationResult:
@@ -26,11 +27,31 @@ def select_device(requested: str, *, cuda_available: bool, mps_available: bool) 
         raise ServiceError('device_unavailable', f'Device {requested} is unavailable', 503)
     return requested
 
-# Reasoning may use this share of the answer budget before it is closed for the model.
-THINKING_SHARE = 0.75
+# Reasoning tokens each effort may spend before reasoning is closed, for both runtimes. Qwen3.5-9B on MLX thinks
+# ~700-1000 tokens about a small logic puzzle at ~20 tok/s, so these cap the wait near 25 s, 100 s, 3.5 and 7 min.
+THINKING_BUDGETS = {'none': 0, 'light': 512, 'medium': 2048, 'high': 4096, 'max': 8192}
 THINKING_CLOSE = ('\n\nConsidering the limited time by the user, I have to give the solution based on the '
                   'thinking directly now.\n</think>\n\n')
-MIN_OUTPUT_TOKENS = 64  # below this an answer is not worth starting, so overflow is reported instead
+MIN_OUTPUT_TOKENS = 64  # below this an answer (or reasoning) is not worth starting
+EMPTY_REASONING = '<think></think>'
+TRANSFORMERS_TEMPERATURE = 0.2  # when a request leaves the temperature to the model
+
+
+def plan_output(limit: int, prompt_tokens: int, max_tokens: int, thinking_budget: int,
+                strict: bool) -> tuple[int, int]:
+    """The answer length and reasoning budget that fit in the context the prompt leaves.
+
+    Strict callers can still drop old turns, so they get the whole answer or a 413; otherwise the answer
+    shrinks to the room left and only below MIN_OUTPUT_TOKENS is it refused. Reasoning gets what the answer
+    leaves, and nothing when that is below MIN_OUTPUT_TOKENS.
+    """
+    room = limit - prompt_tokens
+    if room < (max_tokens if strict else min(max_tokens, MIN_OUTPUT_TOKENS)):
+        raise ServiceError('context_overflow', 'Input plus requested output exceeds context budget', 413,
+                           {'prompt_tokens': prompt_tokens, 'max_tokens': max_tokens, 'limit': limit})
+    answer = min(max_tokens, room)
+    budget = min(thinking_budget, room - answer)
+    return answer, (budget if budget >= MIN_OUTPUT_TOKENS else 0)
 
 
 class TextCallbackStreamer:
@@ -62,8 +83,15 @@ class CancelCriteria:
 
 
 class ModelManager:
-    def __init__(self, settings: Settings, catalog: dict[str, ModelSpec]):
+    def __init__(self, settings: Settings, catalog: dict[str, ModelSpec], pool=None):
         self.settings, self.catalog = settings, catalog
+        self.enabled = enabled_models(settings, catalog)
+        self.default_model = self.enabled[0]
+        mlx = [catalog[model_id] for model_id in self.enabled if catalog[model_id].loader == 'mlx']
+        if pool is None and mlx:
+            from app.mlx_runtime import MLXPool  # imported here because it builds on this module
+            pool = MLXPool(settings, mlx)
+        self.pool = pool
         self.device = select_device(settings.device, cuda_available=torch.cuda.is_available(),
                                     mps_available=torch.backends.mps.is_available())
         self._lock = threading.Lock()
@@ -72,20 +100,30 @@ class ModelManager:
         self._vision = None  # (model id, image processor), loaded on the first image
 
     def status(self) -> dict:
+        """Today's Transformers fields plus `models`: the state of every enabled model."""
+        files = {name: files_ready(self.settings.models_dir / spec.directory) for name, spec in self.catalog.items()}
+        sidecars = self.pool.status() if self.pool is not None else {}
+        models = {model_id: sidecars.get(model_id) or {
+            'state': 'ready' if files[model_id] else 'missing', 'runtime': 'transformers',
+            'label': self.catalog[model_id].label, 'error': None} for model_id in self.enabled}
         return {'device': self.device, 'loaded_model': self._loaded_id, 'busy': self._lock.locked(),
-                'max_context_tokens': self.settings.max_context_tokens,
-                'model_files': {name: self._files_available(self.settings.models_dir / spec.directory)
-                                for name, spec in self.catalog.items()}}
+                'max_context_tokens': self.settings.max_context_tokens, 'model_files': files, 'models': models}
 
-    @staticmethod
-    def _files_available(path) -> bool:
-        if not all((path / name).is_file() for name in ['config.json', 'tokenizer_config.json', 'tokenizer.json']):
-            return False
-        try:
-            model_weight_files(path)
-            return True
-        except (OSError, ValueError, KeyError):
-            return False
+    async def start(self, prefix: Callable[[], Awaitable[tuple[str, list[dict]]]] | None = None) -> None:
+        """Own the MLX models' starts until cancelled at shutdown, starting the preloaded ones now; Transformers
+        models load on first use.
+
+        prefix gives the system prompt and tool schemas PubMed questions start with, cached after each start.
+        """
+        if self.pool is not None:
+            await self.pool.run(prefix, self.preload_ids())
+
+    def preload_ids(self) -> list[str]:
+        """The MLX models PRELOAD_MODELS starts with the app and keeps loaded, default first: the default model
+        (when it is an MLX model), all of them or none."""
+        mode = self.settings.preload_models
+        return [model_id for model_id in self.enabled if self.catalog[model_id].loader == 'mlx'
+                and (mode == 'all' or mode == 'default' and model_id == self.default_model)]
 
     def _release(self) -> None:
         self._model = self._tokenizer = None
@@ -98,13 +136,15 @@ class ModelManager:
             torch.mps.empty_cache()
 
     def close(self) -> None:
+        if self.pool is not None:
+            self.pool.close()
         with self._lock:
             self._release()
 
     def _load(self, spec: ModelSpec):
         from transformers import AutoTokenizer, AutoModelForCausalLM, Qwen3_5ForConditionalGeneration
         path = self.settings.models_dir / spec.directory
-        if not self._files_available(path):
+        if not files_ready(path):
             raise ServiceError('model_missing', 'Run: uv run python scripts/prepare_models.py', 503)
         dtype = torch.float32 if self.device == 'cpu' else torch.float16
         if self.device == 'cuda' and torch.cuda.is_bf16_supported():
@@ -181,12 +221,12 @@ class ModelManager:
                 'pixel_values': features['pixel_values'], 'image_grid_thw': features['image_grid_thw']}
 
     @staticmethod
-    def _generate_with_thinking_budget(model, tokenizer, inputs, kwargs, count, max_tokens, eos, cancel):
-        """Budget forcing: if reasoning runs past its share, close it and let the model answer.
+    def _generate_with_thinking_budget(model, tokenizer, inputs, kwargs, count, budget, eos, cancel):
+        """Budget forcing: if reasoning runs past its budget, close it and let the model answer.
 
         Small models can keep second-guessing until no tokens are left for the answer.
         """
-        budget = max(1, int(max_tokens * THINKING_SHARE))
+        total = kwargs['max_new_tokens']  # the reasoning budget plus the answer
         outputs = model.generate(**inputs, **{**kwargs, 'max_new_tokens': budget})
         generated = outputs[0, count:].tolist()
         if (generated and generated[-1] in eos) or (cancel and cancel.is_set()):
@@ -195,8 +235,8 @@ class ModelManager:
         closed = '</think>' in tokenizer.decode(generated, skip_special_tokens=False)
         close_ids = [] if closed else tokenizer(THINKING_CLOSE, add_special_tokens=False)['input_ids']
         forced = torch.tensor([close_ids], dtype=outputs.dtype, device=outputs.device)
-        # The closing words count against the budget so the total never exceeds max_tokens.
-        remaining = max_tokens - budget - len(close_ids)
+        # The closing words count against the total, which never exceeds the budget plus the answer.
+        remaining = total - budget - len(close_ids)
         if remaining < 1:
             return outputs
         prefix = torch.cat([outputs, forced], dim=1)
@@ -218,68 +258,87 @@ class ModelManager:
                 extended[name] = value
         return model.generate(**extended, **{**kwargs, 'max_new_tokens': remaining})
 
-    async def generate(self, model_id: str, messages: list[dict], tools: list[dict],
-                       max_tokens: int, temperature: float, *, on_text: Callable[[str], None] | None = None,
-                       cancel: threading.Event | None = None, thinking: bool = False,
-                       continue_final: bool = False, strict_budget: bool = False) -> GenerationResult:
-        """strict_budget refuses (413) instead of shortening the answer, so callers can trim history first."""
-        """on_text runs on the worker thread with the cumulative raw completion text."""
-        if model_id not in self.catalog:
+    async def generate(self, model_id: str, messages: list[dict], tools: list[dict], max_tokens: int,
+                       temperature: float | None = None, *, on_text: Callable[[str], None] | None = None,
+                       cancel: threading.Event | None = None, effort: str = 'none', continue_final: bool = False,
+                       strict_budget: bool = False, tenant: str | None = None) -> GenerationResult:
+        """on_text runs on a worker thread with the cumulative raw completion text.
+
+        strict_budget refuses (413) instead of shortening the answer, so callers can trim history first.
+        tenant keeps one account's cached prompts apart from the others' (MLX models).
+        """
+        spec = self.catalog.get(model_id)
+        if spec is None:
             raise ServiceError('unknown_model', f'Unknown model: {model_id}', 422)
+        effort = effort if spec.reasoning else 'none'
+        if spec.loader == 'mlx':
+            if self.pool is None or model_id not in self.pool:
+                raise ServiceError('unknown_model', f'{model_id} is not enabled on this server', 422)
+            return await self.pool.generate(spec, messages, tools, max_tokens, temperature, on_text=on_text,
+                                            cancel=cancel, effort=effort, continue_final=continue_final,
+                                            strict_budget=strict_budget, tenant=tenant)
         return await anyio.to_thread.run_sync(partial(self._generate_sync, model_id, messages, tools,
-                                                     max_tokens, temperature, on_text, cancel, thinking,
+                                                     max_tokens, temperature, on_text, cancel, effort,
                                                      continue_final, strict_budget),
                                               abandon_on_cancel=False)
 
     def _generate_sync(self, model_id, messages, tools, max_tokens, temperature, on_text=None, cancel=None,
-                       thinking=False, continue_final=False, strict_budget=False):
+                       effort='none', continue_final=False, strict_budget=False):
+        spec = self.catalog[model_id]
+        thinking = effort != 'none' and not continue_final
+        temperature = TRANSFORMERS_TEMPERATURE if temperature is None else temperature
         with self._lock:
             if cancel is not None and cancel.is_set():
                 return GenerationResult('', 'cancelled', 0, 0)
             try:
-                images, templated = self._decode_images(self.catalog[model_id], messages)
+                images, templated = self._decode_images(spec, messages)
                 if self._loaded_id != model_id:
                     self._release()
-                    self._model, self._tokenizer = self._load(self.catalog[model_id])
+                    self._model, self._tokenizer = self._load(spec)
                     self._loaded_id = model_id
                 tokenizer, model = self._tokenizer, self._model
                 template = ({'continue_final_message': True, 'add_generation_prompt': False} if continue_final
                             else {'add_generation_prompt': True})
-                inputs = self._prepare_inputs(self.catalog[model_id], tokenizer, images, templated, tools,
-                                              thinking, template)
+                limit = spec.context_tokens or self.settings.max_context_tokens
+                inputs = self._prepare_inputs(spec, tokenizer, images, templated, tools, thinking, template)
                 count = inputs['input_ids'].shape[-1]
-                room = self.settings.max_context_tokens - count
-                if room < (max_tokens if strict_budget else min(max_tokens, MIN_OUTPUT_TOKENS)):
-                    raise ServiceError('context_overflow', 'Input plus requested output exceeds context budget',
-                                       413, {'prompt_tokens': count, 'max_tokens': max_tokens,
-                                             'limit': self.settings.max_context_tokens})
                 # Shorten the answer rather than refuse it; finish_reason 'length' lets clients continue.
-                max_tokens = min(max_tokens, room)
+                answer, budget = plan_output(limit, count, max_tokens, THINKING_BUDGETS[effort] if thinking else 0,
+                                             strict_budget)
+                skipped = ''
+                if thinking and not budget:
+                    # No room left to reason: answer directly, behind an empty reasoning so callers that asked
+                    # for reasoning still find where the answer starts.
+                    thinking, skipped = False, EMPTY_REASONING
+                    inputs = self._prepare_inputs(spec, tokenizer, images, templated, tools, False, template)
+                    count = inputs['input_ids'].shape[-1]
+                    answer, _ = plan_output(limit, count, answer, 0, False)
                 inputs = {name: value.to(self.device) for name, value in inputs.items()}
                 if 'pixel_values' in inputs:
                     inputs['pixel_values'] = inputs['pixel_values'].to(getattr(model, 'dtype', torch.float32))
-                kwargs = dict(max_new_tokens=max_tokens, do_sample=temperature > 0,
+                kwargs = dict(max_new_tokens=answer + budget, do_sample=temperature > 0,
                               pad_token_id=tokenizer.eos_token_id)
                 if temperature > 0:
                     kwargs['temperature'] = temperature
                 if on_text is not None:
-                    kwargs['streamer'] = TextCallbackStreamer(tokenizer, on_text)
+                    kwargs['streamer'] = TextCallbackStreamer(tokenizer, (lambda text: on_text(skipped + text))
+                                                              if skipped else on_text)
                 if cancel is not None:
                     from transformers import StoppingCriteriaList
                     kwargs['stopping_criteria'] = StoppingCriteriaList([CancelCriteria(cancel)])
                 eos = getattr(getattr(model, 'generation_config', None), 'eos_token_id', tokenizer.eos_token_id)
                 eos = eos if isinstance(eos, list) else [eos]
                 with torch.inference_mode():
-                    if thinking and not continue_final and max_tokens > 1:
+                    if thinking:
                         outputs = self._generate_with_thinking_budget(model, tokenizer, inputs, kwargs, count,
-                                                                      max_tokens, eos, cancel)
+                                                                      budget, eos, cancel)
                     else:
                         outputs = model.generate(**inputs, **kwargs)
                 generated = outputs[0, count:].tolist()
                 reason = 'stop' if generated and generated[-1] in eos else 'length'
                 if cancel is not None and cancel.is_set() and reason == 'length':
                     reason = 'cancelled'
-                return GenerationResult(tokenizer.decode(generated, skip_special_tokens=False),
+                return GenerationResult(skipped + tokenizer.decode(generated, skip_special_tokens=False),
                                         reason, count, len(generated))
             except ServiceError:
                 raise

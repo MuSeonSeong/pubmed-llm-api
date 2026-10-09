@@ -16,12 +16,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from app.auth import PUBLIC_API, Auth, User, unauthorized
-from app.catalog import load_catalog
-from app.settings import Settings, ServiceError
-from app.model_manager import ModelManager
+from app.catalog import ModelSpec, load_catalog
+from app.settings import Settings, ServiceError, enabled_models
+from app.model_manager import THINKING_BUDGETS, ModelManager
 from app.pubmed import PubMedClient
 from app.schemas import CHAT_ID, ChatRequest, ChatResponse, LoginRequest
-from app.chat_service import ChatService, error_payload
+from app.chat_service import GUIDANCE, ChatService, error_payload
 from app.documents import MAX_PDF_BYTES, extract_pdf_text
 from app.images import MAX_BYTES as MAX_IMAGE_BYTES, invalid, validate_image_bytes
 from app.storage import LOCAL_USER, StaleChat, Storage
@@ -144,6 +144,21 @@ class Activity:
         return sorted(self.chats.get(user_id, ()))
 
 
+def model_state(status: dict, model_id: str) -> str:
+    """missing, stopped, starting, ready or failed; a manager without per-model states reports files only."""
+    info = (status.get('models') or {}).get(model_id)
+    if info:
+        return info['state']
+    return 'ready' if status.get('model_files', {}).get(model_id) else 'missing'
+
+
+def model_card(spec: ModelSpec, state: str, settings: Settings) -> dict:
+    return {'id': spec.id, 'object': 'model', 'repo_id': spec.repo_id, 'revision': spec.revision,
+            'label': spec.label, 'summary': spec.summary, 'vision': spec.vision, 'reasoning': spec.reasoning,
+            'efforts': list(THINKING_BUDGETS) if spec.reasoning else [],
+            'context_tokens': spec.context_tokens or settings.max_context_tokens, 'state': state}
+
+
 def error_response(exc: ServiceError) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, headers=exc.headers, content={'error': error_payload(exc)})
 
@@ -188,6 +203,7 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
                pubmed: PubMedClient | None = None) -> FastAPI:
     settings = settings or Settings()
     catalog = load_catalog()
+    enabled = enabled_models(settings, catalog)  # a wrong MODELS stops the server here
     manager = manager if manager is not None else ModelManager(settings, catalog)
     pubmed = pubmed if pubmed is not None else PubMedClient(settings.pubmed_mcp_url)
     service = ChatService(manager, pubmed)
@@ -196,10 +212,19 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
     activity = Activity(COMPLETIONS_PER_USER)
     web_dir = WEB_DIR
 
+    async def pubmed_prefix() -> tuple[str, list[dict]]:
+        return GUIDANCE, await pubmed.tool_schemas()
+
     @asynccontextmanager
     async def lifespan(application):
         try:
-            yield
+            async with anyio.create_task_group() as group:
+                # MLX models load in the background, so pages and /health answer meanwhile, and the manager owns
+                # every model start until shutdown cancels it. With accounts every user's prompts are cached
+                # apart, so only local mode gains from caching the PubMed prompt after a start.
+                group.start_soon(manager.start, None if settings.auth_enabled else pubmed_prefix)
+                yield
+                group.cancel_scope.cancel()
         finally:
             await pubmed.close()
             await anyio.to_thread.run_sync(manager.close)
@@ -278,7 +303,7 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
             return {'status': 'ok'}
         inference, dependency = manager.status(), pubmed.status()
         return {'status': 'ok', 'inference': inference, 'pubmed': dependency,
-                'ready_for_chat': all(inference['model_files'].values()),
+                'ready_for_chat': model_state(inference, enabled[0]) == 'ready',
                 'ready_for_pubmed': dependency['status'] == 'available'}
 
     @application.get('/api/session')
@@ -382,6 +407,18 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
         mime, data = found
         return f'data:{mime};base64,' + base64.b64encode(data).decode()
 
+    async def cache_tenant(user: User) -> str | None:
+        """With accounts, the MLX prefix cache is salted per account, so nobody can time another's prompts.
+
+        An id alone is not enough: SQLite gives a removed newest account's id to the next account created.
+        """
+        if not settings.auth_enabled:
+            return None
+        created = await anyio.to_thread.run_sync(storage.user_created, user.id)
+        if created is None:  # removed since this request signed in
+            raise unauthorized()
+        return f'user-{user.id}-{created}'
+
     async def resolve_files(user: User, request: ChatRequest) -> None:
         """Swap the caller's own uploads (/api/files/<id>) for data URLs the model manager decodes."""
         for message in request.messages:
@@ -392,10 +429,10 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
 
     @application.get('/v1/models', dependencies=[signed_in])
     async def models():
-        return {'object': 'list', 'default': 'qwen3.5-2b', 'data': [
-            {'id': spec.id, 'object': 'model', 'repo_id': spec.repo_id, 'revision': spec.revision,
-             'vision': spec.vision}
-            for spec in catalog.values()]}
+        """The enabled models, default first, with what each can do and whether it is ready."""
+        status = manager.status()
+        return {'object': 'list', 'default': enabled[0], 'data': [
+            model_card(catalog[model_id], model_state(status, model_id), settings) for model_id in enabled]}
 
     @application.post('/v1/documents/extract', dependencies=[signed_in])
     async def extract_document(request: Request):
@@ -406,19 +443,25 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
 
     @application.post('/v1/chat/completions', response_model=ChatResponse)
     async def chat(request: ChatRequest, user: User = signed_in):
-        if request.model not in catalog:
+        request.model = request.model or enabled[0]
+        if request.model not in enabled:
             raise ServiceError('unknown_model', f'Unknown model: {request.model}', 422)
-        if request.has_images and not catalog[request.model].vision:
-            raise ServiceError('vision_unsupported', f'{request.model} cannot read images; use qwen3.5-2b', 422)
+        spec = catalog[request.model]
+        if request.has_images and not spec.vision:
+            raise ServiceError('vision_unsupported', f'{request.model} cannot read images; choose a model with '
+                               'vision in /v1/models', 422)
+        if not spec.reasoning:
+            request.reasoning_effort = 'none'
+        tenant = await cache_tenant(user)
         finish = activity.start(user.id, request.chat_id if request.stream else None)
         try:
             await resolve_files(user, request)
             if request.stream:
-                response = EventStreamResponse(lambda emit, cancel: service.stream(request, emit, cancel),
+                response = EventStreamResponse(lambda emit, cancel: service.stream(request, emit, cancel, tenant),
                                                on_close=finish)
                 finish = None  # released by the response once the stream is over
                 return response
-            return await service.complete(request)
+            return await service.complete(request, tenant)
         finally:
             if finish is not None:
                 finish()
