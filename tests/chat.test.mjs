@@ -873,3 +873,50 @@ test('edited questions keep earlier wordings as branches with their own follow-u
   restored.switchBranch(question.id, 1);
   assert.deepEqual(restored.current.messages.map(m => m.content), ['고친 질문', '답 3']);
 });
+
+
+test('branches keep their own failure state and never duplicate attachments', async () => {
+  const storage = memory();
+  let calls = 0;
+  const store = new ChatStore(storage, async () => {
+    if (++calls === 2) throw new TypeError('offline');
+    return sse([done('A' + calls)]);
+  });
+  await store.send('Q1', [image('pic.png')]);
+  const q = store.current.messages[0];
+  await store.edit(q.id, 'Q1 edited');
+  assert.ok(q.error);
+  store.switchBranch(q.id, 0);
+  assert.equal(q.error, undefined);
+  assert.deepEqual(store.current.messages.map(m => m.content), ['Q1', 'A1']);
+  store.switchBranch(q.id, 1);
+  assert.ok(q.error && store.canRetry(q.id));
+  assert.equal(storage.getItem('pubmed-chat.v1').split(PNG).length - 1, 1);  // one stored copy of the image
+});
+
+test('the branch being viewed survives the branch limit', async () => {
+  let n = 0;
+  const store = new ChatStore(memory(), async () => sse([done('A' + ++n)]));
+  await store.send('Q0');
+  const q = store.current.messages[0];
+  for (let i = 1; i < 10; i++) await store.edit(q.id, 'Q' + i);
+  store.switchBranch(q.id, 0);
+  await store.send('follow up');
+  await store.edit(q.id, 'Q10');
+  assert.equal(q.branches.length, 10);
+  assert.ok(q.branches.some(branch => branch.tail.some(m => m.content === 'follow up')));
+});
+
+test('a title still lands when another tab replaced the chat object meanwhile', async () => {
+  const storage = memory();
+  let other;
+  const store = new ChatStore(storage, async (_, init) => {
+    if (JSON.parse(init.body).stream) return sse([done('답')]);
+    other = new ChatStore(storage);
+    other.togglePin(other.current.id);  // another tab saves the chat while the title is being written
+    store.sync();
+    return { ok: true, json: async () => ({ choices: [{ message: { content: '새 제목' } }] }) };
+  }, { autoTitles: true });
+  await store.send('질문 하나');
+  assert.equal(store.current.title, '새 제목');
+});

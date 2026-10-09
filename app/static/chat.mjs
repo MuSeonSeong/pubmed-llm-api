@@ -137,14 +137,19 @@ function restoreSettings(value) {
 
 /** Validate a stored chat. In-progress requests are kept as-is; settleInterrupted() decides if they died. */
 const MAX_BRANCHES = 10;
+const branchOf = (message, tail) => ({ content: message.content, tail,
+  ...(message.error ? { error: message.error } : {}) });
 const MAX_BRANCH_DEPTH = 6;
 
-/** Earlier wordings of an edited question, each with the conversation that followed it. */
+/**
+ * Earlier wordings of an edited question, each with the conversation that followed it and whether it
+ * failed. Attachments are not part of a branch: editing changes only the words, so the message keeps them.
+ */
 function restoreBranches(message, depth) {
   if (message.role !== 'user' || !Array.isArray(message.branches) || depth >= MAX_BRANCH_DEPTH) return {};
   const branches = message.branches.filter(item => item && typeof item.content === 'string').slice(-MAX_BRANCHES)
-    .map(item => ({ content: item.content, attachments: restoreAttachments(item.attachments),
-      tail: restoreMessages(Array.isArray(item.tail) ? item.tail : [], depth + 1) }));
+    .map(item => ({ content: item.content, tail: restoreMessages(Array.isArray(item.tail) ? item.tail : [], depth + 1),
+      ...(typeof item.error === 'string' ? { error: item.error } : {}) }));
   if (branches.length < 2) return {};
   const branch = Math.min(Math.max(Number.isInteger(message.branch) ? message.branch : branches.length - 1, 0),
     branches.length - 1);
@@ -502,8 +507,13 @@ export class ChatStore {
       chat.autoTitle = true;
     }
     await this.request(chat, message, { release });
+    await this.titleAfterFirstAnswer(chat);
+  }
+
+  /** Once the first question has an answer (even via retry or regenerate), name the chat. */
+  async titleAfterFirstAnswer(chat) {
     const [question, answer, ...rest] = chat.messages;
-    if (this.autoTitles && chat.autoTitle && !rest.length && !question.error && answer?.content.trim()) {
+    if (this.autoTitles && chat.autoTitle && !rest.length && !question?.error && answer?.content.trim()) {
       await this.suggestTitle(chat, question, answer);
     }
   }
@@ -517,7 +527,9 @@ export class ChatStore {
     if (!this.canRetry(messageId)) return;
     const chat = this.current;
     const release = await this.claim(chat);
-    if (release) return this.request(chat, chat.messages.at(-1), { release });
+    if (!release) return;
+    await this.request(chat, chat.messages.at(-1), { release });
+    await this.titleAfterFirstAnswer(chat);
   }
 
   canRegenerate(messageId) {
@@ -536,7 +548,8 @@ export class ChatStore {
     if (thinking === false) chat.thinking = false;
     const previous = chat.messages.pop();
     const versions = previous.versions?.length ? previous.versions : [snapshot(previous)];
-    return this.request(chat, chat.messages.at(-1), { versions, fallback: previous, release });
+    await this.request(chat, chat.messages.at(-1), { versions, fallback: previous, release });
+    await this.titleAfterFirstAnswer(chat);
   }
 
   canSelectVersion(messageId) {
@@ -566,11 +579,17 @@ export class ChatStore {
     const message = chat.messages[index];
     // Keep the old wording and everything after it as a branch the user can switch back to.
     const branches = message.branches ? [...message.branches] : [];
-    branches[message.branch ?? 0] = { content: message.content, attachments: message.attachments || [],
-      tail: chat.messages.splice(index + 1) };
-    branches.push({ content: content.trim(), attachments: message.attachments || [], tail: [] });
-    message.branches = branches.slice(-MAX_BRANCHES);
-    message.branch = message.branches.length - 1;
+    let saved = message.branch ?? 0;
+    branches[saved] = branchOf(message, chat.messages.splice(index + 1));
+    branches.push({ content: content.trim(), tail: [] });
+    while (branches.length > MAX_BRANCHES) {
+      // Evict the oldest branch, but never the one the user was just looking at.
+      const victim = saved === 0 ? 1 : 0;
+      branches.splice(victim, 1);
+      if (victim < saved) saved--;
+    }
+    message.branches = branches;
+    message.branch = branches.length - 1;
     message.content = content.trim();
     delete message.error;
     return this.request(chat, message, { release });
@@ -588,12 +607,11 @@ export class ChatStore {
     const index = chat.messages.findIndex(item => item.id === messageId);
     const message = chat.messages[index];
     if (!message.branches[target] || target === message.branch) return;
-    message.branches[message.branch] = { content: message.content, attachments: message.attachments || [],
-      tail: chat.messages.splice(index + 1) };
+    message.branches[message.branch] = branchOf(message, chat.messages.splice(index + 1));
     const chosen = message.branches[target];
     message.content = chosen.content;
-    if (chosen.attachments.length) message.attachments = chosen.attachments;
-    else delete message.attachments;
+    if (chosen.error) message.error = chosen.error;
+    else delete message.error;
     chat.messages.push(...chosen.tail);
     chosen.tail = [];  // the live list owns these messages now
     message.branch = target;
@@ -630,10 +648,12 @@ export class ChatStore {
       const text = (await response.json()).choices?.[0]?.message?.content;
       const title = typeof text === 'string' ? text.split('\n').map(line => line.trim()).find(Boolean) : '';
       const clean = (title || '').replace(/^(제목\s*[:：]\s*|#+\s*)/, '').replace(/^["'“‘「]+|["'”’」.]+$/g, '').trim().slice(0, 40);
-      if (!clean || !chat.autoTitle || !this.chats.includes(chat)) return;  // renamed or deleted meanwhile
-      chat.title = clean;
-      delete chat.autoTitle;
-      this.touch(chat);
+      // Another tab's save may have replaced the object; renamed or deleted chats keep their name.
+      const live = this.chats.find(item => item.id === chat.id);
+      if (!clean || !live?.autoTitle) return;
+      live.title = clean;
+      delete live.autoTitle;
+      this.touch(live);
       this.emit();
     } catch { /* the provisional title stays */ }
   }
@@ -812,8 +832,8 @@ function dropOldImages(chats, keepChatId) {
     let dropped = false;
     const visit = messages => {
       for (const message of messages) {
-        const branchFiles = (message.branches || []).flatMap(branch => { visit(branch.tail); return branch.attachments; });
-        for (const file of [...(message.attachments || []), ...branchFiles]) {
+        for (const branch of message.branches || []) visit(branch.tail);
+        for (const file of message.attachments || []) {
           if (isImage(file) && file.dataUrl) { delete file.dataUrl; file.removed = true; dropped = true; }
         }
       }
