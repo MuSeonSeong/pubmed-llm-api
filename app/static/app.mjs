@@ -626,6 +626,14 @@ $('clear-chats').addEventListener('click', () => {
   toast('모든 대화를 삭제했습니다.');
 });
 
+function setupNotice(lines, command) {
+  const notice = $('setup-notice');
+  notice.hidden = !lines;
+  if (!lines) return;
+  notice.replaceChildren(...lines.map(line => element('p', '', line)));
+  if (command) notice.append(element('code', '', command));
+}
+
 async function checkServer() {
   try {
     const response = await fetch('/health', { signal: AbortSignal.timeout(5000) });
@@ -634,9 +642,15 @@ async function checkServer() {
     const ready = health.ready_for_chat;
     $('server-status').classList.toggle('offline', !ready);
     $('server-status').lastElementChild.textContent = ready ? '서버 연결됨' : '모델 준비 필요';
+    const missing = Object.entries(health.inference?.model_files || {}).filter(([, ok]) => !ok).map(([name]) => name);
+    setupNotice(missing.length ? ['모델 파일이 준비되지 않았습니다: ' + missing.join(', '),
+      '프로젝트 폴더에서 아래 명령을 실행한 뒤 이 페이지를 새로고침하세요.'] : null,
+    missing.length ? 'uv run python scripts/prepare_models.py' : '');
   } catch {
     $('server-status').classList.add('offline');
     $('server-status').lastElementChild.textContent = '서버 연결 끊김';
+    setupNotice(['서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.'],
+      'uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1');
   }
 }
 render();
