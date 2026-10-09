@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ATTACHMENT_LIMIT, ChatStore, attachmentTokenBudget, chatMarkdown, cleanTitle, estimateTokens, highlight, normalizeSources, readAttachments, readEvents, renderMarkdown,
+import { ATTACHMENT_LIMIT, ChatStore, attachmentTokenBudget, chatMarkdown, cleanTitle, errorMessage, estimateTokens, highlight, normalizeSources, readAttachments, readEvents, renderMarkdown,
   withoutCitationList } from '../app/static/chat.mjs';
 
 const memory = () => {
@@ -927,4 +927,42 @@ test('titles are cleaned of list markers, emphasis and quotes, and sentences are
   assert.equal(cleanTitle('- `파이썬 정렬`'), '파이썬 정렬');
   assert.equal(cleanTitle('제목: "감기 관리법".'), '감기 관리법');
   assert.equal(cleanTitle('이 대화는 사용자가 감기에 걸렸을 때 집에서 할 수 있는 관리 방법에 대해 물어본 내용입니다'), '');
+});
+
+
+test('tool errors explain the cause instead of always suggesting to turn PubMed off', () => {
+  assert.ok(errorMessage({ code: 'tools_disabled' }, 502).includes('PubMed 검색을 켜고'));
+  assert.ok(errorMessage({ code: 'tool_call_truncated' }, 502).includes('답변 길이'));
+  assert.ok(!errorMessage({ code: 'generation_failed', message: 'MPS backend out of memory' }, 500).includes('MPS'));
+  for (const code of ['invalid_tool_call', 'invalid_tool_arguments', 'unknown_tool']) {
+    const text = errorMessage({ code }, 502);
+    assert.ok(text.includes('다시 시도하면 대부분 해결'), code);
+    assert.ok(!text.includes('꺼 주세요'), code);
+  }
+  assert.ok(errorMessage({ code: 'pubmed_unavailable' }, 502).includes('꺼 주세요'));  // a real outage
+  assert.ok(errorMessage({ code: 'pubmed_tool_failed' }, 502).includes('PubMed가'));
+  assert.ok(!errorMessage({ code: 'something_new' }, 502).includes('꺼 주세요'));
+  assert.equal(errorMessage({ code: 'constructor' }, 500), '응답을 받지 못했습니다. 다시 시도해 주세요.');
+});
+
+test('a retried tool call discards the rejected round and shows progress until the next step', async () => {
+  let stream;
+  const store = new ChatStore(memory(), async (_, init) => (stream = controlledStream(init.signal)).response);
+  const pending = store.send('논문 찾아줘');
+  await tick();
+  stream.push({ type: 'delta', content: '검색해 볼게요' });
+  stream.push({ type: 'retry', reason: 'invalid_tool_arguments' });
+  await tick();
+  const draft = store.current.messages.at(-1);
+  assert.equal(draft.content, '');
+  assert.equal(draft.retrying, 'invalid_tool_arguments');
+  stream.push({ type: 'tool', status: 'running', name: 'pubmed_search_articles', arguments: { query: 'x' } });
+  await tick();
+  assert.equal(draft.retrying, undefined);
+  stream.push({ type: 'tool', status: 'done', name: 'pubmed_search_articles', arguments: { query: 'x' } });
+  stream.push(done('찾은 논문입니다'));
+  stream.close();
+  await pending;
+  assert.equal(store.current.messages.at(-1).content, '찾은 논문입니다');
+  assert.equal(store.current.messages.at(-1).retrying, undefined);
 });

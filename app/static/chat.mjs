@@ -237,8 +237,25 @@ function settleInterrupted(chat) {
   return true;
 }
 
-function errorMessage(error, status) {
+const MODEL_TOOL_ERROR = '모델이 논문 검색 요청을 제대로 만들지 못했어요. 다시 시도하면 대부분 해결돼요. '
+  + '계속 실패하면 질문을 더 짧고 단순하게 바꿔 보세요.';
+
+/** Korean explanation for a server error; the cause decides the advice, not just the HTTP status. */
+export function errorMessage(error, status) {
   const hints = {
+    // The model wrote a bad tool call even after the server corrected and re-asked: retrying usually works.
+    invalid_tool_call: MODEL_TOOL_ERROR,
+    invalid_tool_arguments: MODEL_TOOL_ERROR,
+    unknown_tool: MODEL_TOOL_ERROR,
+    tools_disabled: 'PubMed 검색이 꺼져 있어 논문을 찾을 수 없어요. 입력창에서 PubMed 검색을 켜고 다시 물어봐 주세요.',
+    tool_call_truncated: '답변 길이 한도 때문에 논문 검색 요청이 잘렸어요. 설정에서 최대 답변 길이를 늘린 뒤 다시 시도해 주세요.',
+    vision_unsupported: '이 모델은 이미지를 볼 수 없어요. 이미지를 이해하는 모델로 바꾼 뒤 다시 시도해 주세요.',
+    generation_failed: '모델이 답변을 만드는 중 오류가 났어요. 다시 시도해 주세요.',
+    internal_error: '서버에서 예상하지 못한 오류가 났어요. 잠시 후 다시 시도해 주세요.',
+    invalid_request: '요청 형식이 올바르지 않아요. 페이지를 새로고침한 뒤 다시 시도해 주세요.',
+    request_too_large: '보낸 내용이 너무 커요. 첨부를 줄인 뒤 다시 시도해 주세요.',
+    pubmed_tool_failed: 'PubMed가 이 요청을 처리하지 못했어요. 잠시 후 다시 시도해 주세요.',
+    pubmed_schema_missing: 'PubMed 서비스 구성이 바뀌어 지금은 논문을 검색할 수 없어요. 서버 관리자에게 알려 주세요.',
     context_overflow: '질문·첨부·논문 검색 결과를 합친 길이가 모델의 한도를 넘었습니다. 첨부를 줄이거나, PubMed 검색·추론을 끄거나, 설정에서 답변 길이를 줄여 보세요.',
     model_missing: '모델 파일이 없습니다. 서버에서 모델 준비를 완료해 주세요.',
     device_unavailable: '설정된 실행 장치를 사용할 수 없습니다.',
@@ -249,10 +266,10 @@ function errorMessage(error, status) {
     busy: '이 계정에서 이미 다른 답변을 만들고 있어요. 그 답변이 끝난 뒤 다시 시도해 주세요.',
     unauthorized: '로그인이 필요합니다. 다시 로그인해 주세요.',
   };
-  if (hints[error?.code]) return hints[error.code];
+  if (Object.hasOwn(hints, error?.code)) return hints[error.code];
   if (status === 413) return hints.context_overflow;
   if (status === 504) return hints.pubmed_timeout;
-  if (status === 502) return 'PubMed 검색을 완료하지 못했습니다. 다시 시도하거나 PubMed 검색을 꺼 주세요.';
+  if (status === 502) return 'PubMed 검색 중 문제가 생겼어요. 다시 시도해 주세요.';
   return typeof error?.message === 'string' ? error.message : '응답을 받지 못했습니다. 다시 시도해 주세요.';
 }
 
@@ -797,12 +814,20 @@ export class ChatStore {
             draft.thinkStart ??= Date.now();
             draft.reasoning = (draft.reasoning || '') + event.content;
           } else if (event.type === 'delta') {
+            delete draft.retrying;
             if (draft.thinkStart && draft.thinkMs === undefined) draft.thinkMs = Date.now() - draft.thinkStart;
             draft.content += event.content;
           }
           else if (event.type === 'status') draft.stage = event.stage;
+          else if (event.type === 'retry') {
+            // The server rejected the model's tool call and asked it to write a corrected one.
+            draft.content = '';
+            draft.retrying = event.reason || 'invalid_tool_call';
+            if (draft.reasoning) draft.reasoning += '\n\n';
+          }
           else if (event.type === 'tool') {
             if (event.status === 'running') {
+              delete draft.retrying;
               draft.content = '';  // text before a tool call is superseded by the grounded answer
               if (draft.reasoning) draft.reasoning += '\n\n';
               draft.toolCalls.push({ name: event.name, arguments: event.arguments || {}, running: true });
@@ -848,6 +873,7 @@ export class ChatStore {
       if (draft.thinkStart && draft.thinkMs === undefined) draft.thinkMs = Date.now() - draft.thinkStart;
       if (finished) draft.elapsedMs = Date.now() - started + (base?.elapsedMs || 0);
       delete draft.thinkStart;
+      delete draft.retrying;
       delete draft.pendingTail;
       delete draft.streaming;
       delete draft.stage;

@@ -255,6 +255,10 @@ function progressLine(message, chat) {
     text = 'PubMed ' + kind + ' 중' + (query ? ' · ' + query : '');
   } else if (message.stage === 'queued') text = '다른 요청이 끝나기를 기다리고 있어요';
   else if (message.stage === 'loading_model') text = '모델을 불러오는 중이에요. 처음이나 모델을 바꾼 뒤에는 시간이 걸려요';
+  else if (message.retrying) {
+    // A rejected tool call is being rewritten; with search off the model is answering directly instead.
+    text = message.retrying === 'tools_disabled' ? '답변을 다시 준비하고 있어요' : '검색 조건을 고쳐서 다시 시도하고 있어요';
+  }
   else if (message.toolCalls.length) text = '찾은 논문을 읽고 답변을 쓰고 있어요';
   else if (!message.stage && chat.usePubmed) text = 'PubMed 연결을 준비하고 있어요';
   line.append(dots, document.createTextNode(text));
