@@ -55,6 +55,23 @@ export function chatMarkdown(chat) {
   return lines.join('\n');
 }
 
+const MAX_VERSIONS = 10;
+const VERSION_FIELDS = ['content', 'toolCalls', 'truncated', 'stopped', 'reasoning', 'thinkMs', 'model', 'dropped'];
+
+/** The parts of an answer that differ between regenerated versions. */
+function snapshot(message) {
+  return Object.fromEntries(VERSION_FIELDS.filter(key => message[key] !== undefined).map(key => [key, message[key]]));
+}
+
+function restoreVersions(versions) {
+  if (!Array.isArray(versions)) return [];
+  return versions.filter(item => item && typeof item.content === 'string').slice(-MAX_VERSIONS)
+    .map(item => snapshot({ ...item, toolCalls: normalizeTools(item.toolCalls), truncated: item.truncated === true,
+      stopped: item.stopped === true, reasoning: typeof item.reasoning === 'string' && item.reasoning ? item.reasoning : undefined,
+      thinkMs: Number.isFinite(item.thinkMs) ? item.thinkMs : undefined, model: MODELS.includes(item.model) ? item.model : undefined,
+      dropped: Number.isInteger(item.dropped) && item.dropped > 0 ? item.dropped : undefined }));
+}
+
 function restoreSettings(value) {
   const number = (input, min, max, fallback) =>
     Number.isFinite(input) && input >= min && input <= max ? input : fallback;
@@ -80,6 +97,10 @@ function restoreChat(chat, live = false) {
       ...(typeof message.reasoning === 'string' && message.reasoning ? { reasoning: message.reasoning } : {}),
       ...(Number.isFinite(message.thinkMs) && message.thinkMs >= 0 ? { thinkMs: message.thinkMs } : {}),
       ...(MODELS.includes(message.model) ? { model: message.model } : {}),
+      ...(message.role === 'assistant' && restoreVersions(message.versions).length > 1 ? {
+        versions: restoreVersions(message.versions),
+        version: Math.min(Math.max(Number.isInteger(message.version) ? message.version : 0, 0),
+          restoreVersions(message.versions).length - 1) } : {}),
       ...(message.role === 'user' && restoreAttachments(message.attachments).length
         ? { attachments: restoreAttachments(message.attachments) } : {}),
       ...(typeof message.error === 'string' ? { error: message.error } : {}),
@@ -155,6 +176,7 @@ export class ChatStore {
     this.fetcher = fetcher;
     this.busy = false;
     this.controller = null;
+    this.notice = '';
     this.onChange = () => {};
     this.storageWarning = '';
     this.chats = [];
@@ -289,11 +311,29 @@ export class ChatStore {
       && messages.at(-2)?.role === 'user';
   }
 
+  /** Ask again, keeping earlier answers as versions; if the new attempt fails the old answer returns. */
   async regenerate(messageId) {
     if (!this.canRegenerate(messageId)) return;
     const chat = this.current;
-    chat.messages.pop();
-    return this.request(chat, chat.messages.at(-1));
+    const previous = chat.messages.pop();
+    const versions = previous.versions?.length ? previous.versions : [snapshot(previous)];
+    return this.request(chat, chat.messages.at(-1), { versions, fallback: previous });
+  }
+
+  canSelectVersion(messageId) {
+    const message = this.current.messages.at(-1);
+    return !this.busy && message?.id === messageId && (message.versions?.length || 0) > 1;
+  }
+
+  selectVersion(messageId, index) {
+    if (!this.canSelectVersion(messageId)) return;
+    const message = this.current.messages.at(-1);
+    const chosen = message.versions[index];
+    if (!chosen) return;
+    for (const key of VERSION_FIELDS) delete message[key];
+    Object.assign(message, { toolCalls: [], truncated: false, stopped: false }, structuredClone(chosen));
+    message.version = index;
+    this.emit();
   }
 
   /** Replace a question and discard everything after it, as answers to the old wording no longer apply. */
@@ -309,7 +349,7 @@ export class ChatStore {
 
   stop() { this.controller?.abort(); }
 
-  async request(chat, message) {
+  async request(chat, message, { versions = null, fallback = null } = {}) {
     this.busy = true;
     this.requestChat = chat;
     delete message.error;
@@ -375,9 +415,13 @@ export class ChatStore {
       else if (controller.signal.aborted && draft.content.trim()) draft.stopped = true;
       else {
         chat.messages.splice(chat.messages.indexOf(draft), 1);
-        message.error = controller.signal.aborted ? STOPPED : error instanceof TypeError
+        const reason = controller.signal.aborted ? STOPPED : error instanceof TypeError
           ? '서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하고 다시 시도해 주세요.'
           : error.message || '응답을 받지 못했습니다. 다시 시도해 주세요.';
+        if (fallback) {
+          chat.messages.push(fallback);  // a failed regeneration must not cost the answer we had
+          this.notice = reason;
+        } else message.error = reason;
       }
     } finally {
       if (draft.thinkStart && draft.thinkMs === undefined) draft.thinkMs = Date.now() - draft.thinkStart;
@@ -385,6 +429,10 @@ export class ChatStore {
       delete draft.streaming;
       delete draft.stage;
       draft.toolCalls = normalizeTools(draft.toolCalls.map(({ running, ...call }) => call));
+      if (versions && chat.messages.includes(draft)) {
+        draft.versions = [...versions, snapshot(draft)].slice(-MAX_VERSIONS);
+        draft.version = draft.versions.length - 1;
+      }
       delete message.pending;
       this.busy = false;
       this.requestChat = null;

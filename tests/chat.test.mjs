@@ -476,3 +476,36 @@ test('a request running in another tab is shown as in progress, not as failed', 
   assert.equal(live.messages[0].error, undefined);
   assert.equal(live.messages[1].streaming, true);
 });
+
+
+test('regenerated answers are kept as versions that can be browsed and persist', async () => {
+  const storage = memory();
+  let count = 0;
+  const store = new ChatStore(storage, async () => sse([done('답 ' + ++count)]));
+  await store.send('질문');
+  await store.regenerate(store.current.messages.at(-1).id);
+  await store.regenerate(store.current.messages.at(-1).id);
+  let answer = store.current.messages.at(-1);
+  assert.deepEqual(answer.versions.map(v => v.content), ['답 1', '답 2', '답 3']);
+  assert.equal(answer.version, 2);
+  store.selectVersion(answer.id, 0);
+  assert.equal(store.current.messages.at(-1).content, '답 1');
+  const restored = new ChatStore(storage);
+  answer = restored.current.messages.at(-1);
+  assert.equal(answer.content, '답 1');
+  assert.equal(answer.version, 0);
+  assert.equal(answer.versions.length, 3);
+});
+
+test('a failed regeneration restores the previous answer and reports why', async () => {
+  let attempts = 0;
+  const store = new ChatStore(memory(), async () => {
+    if (++attempts === 2) throw new TypeError('offline');
+    return sse([done('원래 답')]);
+  });
+  await store.send('질문');
+  await store.regenerate(store.current.messages.at(-1).id);
+  assert.deepEqual(store.current.messages.map(m => m.content), ['질문', '원래 답']);
+  assert.equal(store.current.messages[0].error, undefined);
+  assert.ok(store.notice.includes('서버'));
+});

@@ -313,6 +313,16 @@ function renderAssistant(message, chat) {
   if (!message.streaming) {
     const actions = element('div', 'message-actions');
     actions.append(iconButton('copy', '답변 복사', () => copyText(message.content, '답변을 복사했습니다.')));
+    if (store.canSelectVersion(message.id)) {
+      const pager = element('div', 'version-pager');
+      const index = message.version ?? message.versions.length - 1;
+      const back = iconButton('left', '이전 답변', () => store.selectVersion(message.id, index - 1));
+      back.disabled = index === 0;
+      const next = iconButton('right', '다음 답변', () => store.selectVersion(message.id, index + 1));
+      next.disabled = index === message.versions.length - 1;
+      pager.append(back, element('span', '', (index + 1) + ' / ' + message.versions.length), next);
+      actions.append(pager);
+    }
     if (store.canRegenerate(message.id)) {
       actions.append(iconButton('refresh', '답변 다시 생성', () => { followOutput = true; store.regenerate(message.id); }));
     }
@@ -416,6 +426,7 @@ function render() {
   $('storage-warning').hidden = !store.storageWarning;
   document.title = chat.messages.length ? chat.title + ' · PubMed Chat' : 'PubMed Chat';
   $('export-chat').hidden = !chat.messages.length;
+  if (store.notice) { toast(store.notice); store.notice = ''; }
   $('attach').disabled = store.busy;
   announce();
   renderHistory();
