@@ -1,9 +1,11 @@
 """FastAPI application used identically by native hosts and CPU containers."""
 from contextlib import asynccontextmanager
+from pathlib import Path
 import anyio
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from app.catalog import load_catalog
 from app.settings import Settings, ServiceError
 from app.model_manager import ModelManager
@@ -29,6 +31,12 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
             await anyio.to_thread.run_sync(manager.close)
 
     application = FastAPI(title='PubMed Local LLM API', version='0.1.0', lifespan=lifespan)
+    web_dir = Path(__file__).resolve().parent / 'static'
+    application.mount('/static', StaticFiles(directory=web_dir), name='static')
+
+    @application.get('/', include_in_schema=False)
+    async def chat_page():
+        return FileResponse(web_dir / 'index.html', headers={'Cache-Control': 'no-cache'})
 
     @application.exception_handler(ServiceError)
     async def service_error(request: Request, exc: ServiceError):

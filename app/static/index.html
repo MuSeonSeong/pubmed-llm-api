@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#faf9f6">
+  <title>PubMed Chat</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%231c6758'/%3E%3Cpath d='M13 28V12h8a5 5 0 0 1 0 10h-8' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="module" src="/static/app.mjs"></script>
+</head>
+<body>
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M9 4v16"/></symbol>
+    <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5Z"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M12 19V5m-6 6 6-6 6 6"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M4 4h6a3 3 0 0 1 3 3v14a4 4 0 0 0-4-3H4Zm16 0h-4a3 3 0 0 0-3 3v14a4 4 0 0 1 4-3h3Z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 4.5 4.5"/></symbol>
+    <symbol id="i-spark" viewBox="0 0 24 24"><path d="m12 3 2.5 6.5L21 12l-6.5 2.5L12 21l-2.5-6.5L3 12l6.5-2.5Z"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="13" rx="2"/><path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v6M14 10v6"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5M6 7a7 7 0 0 1 12-1l2 3M4 15l2 3a7 7 0 0 0 12-1"/></symbol>
+  </svg>
+
+  <div class="app-shell">
+    <button id="sidebar-backdrop" class="sidebar-backdrop" aria-label="대화 목록 닫기" hidden></button>
+    <aside id="sidebar" class="sidebar" aria-label="대화 목록">
+      <div class="sidebar-header">
+        <a class="brand" href="/" aria-label="PubMed Chat 홈"><span class="brand-mark">p<span>+</span></span><span>PubMed<span class="brand-light"> Chat</span></span></a>
+        <button id="close-sidebar" class="icon-button" aria-label="대화 목록 접기"><svg class="icon"><use href="#i-panel"/></svg></button>
+      </div>
+      <button id="new-chat" class="new-chat"><svg class="icon"><use href="#i-plus"/></svg>새 대화<span class="key-hint">⌘ K</span></button>
+      <div class="history-heading">내 대화</div>
+      <nav id="chat-list" class="chat-list" aria-label="저장된 대화"></nav>
+      <div class="sidebar-footer">
+        <div class="local-label"><span class="local-dot"></span>내 컴퓨터에서 실행 중</div>
+        <p>대화 기록은 이 브라우저에 저장됩니다.</p>
+        <a href="/docs" target="_blank" rel="noopener noreferrer">API 문서 <span aria-hidden="true">↗</span></a>
+      </div>
+    </aside>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <div class="model-control">
+          <button id="open-sidebar" class="icon-button" aria-label="대화 목록 열기" hidden><svg class="icon"><use href="#i-panel"/></svg></button>
+          <label class="sr-only" for="model">사용할 모델</label>
+          <select id="model" aria-label="사용할 모델">
+            <option value="qwen3.5-2b">Qwen3.5 · 2B</option>
+            <option value="qwen3-0.6b">Qwen3 · 0.6B</option>
+          </select>
+          <span class="model-badge">LOCAL</span>
+        </div>
+        <div id="server-status" class="server-status"><span class="status-dot"></span><span>서버 확인 중</span></div>
+      </header>
+
+      <div id="storage-warning" class="storage-warning" role="status" hidden></div>
+      <section id="conversation" class="conversation" aria-label="채팅 내용">
+        <div id="welcome" class="welcome">
+          <div class="welcome-mark"><svg class="icon"><use href="#i-spark"/></svg></div>
+          <div class="eyebrow">YOUR LOCAL RESEARCH COMPANION</div>
+          <h1>어떤 이야기를 나눠볼까요?</h1>
+          <p>궁금한 것을 물어보세요.<br>논문 검색부터 일상적인 질문까지, 함께 살펴볼게요.</p>
+          <div class="suggestions">
+            <button class="suggestion" data-prompt="PubMed에서 CRISPR 유전자 편집에 관한 논문을 1건 검색하고 핵심 내용을 한국어로 요약해줘."><svg class="icon"><use href="#i-search"/></svg><strong>논문 찾아보기</strong><span>CRISPR 연구 논문 검색하기</span><span class="suggestion-arrow" aria-hidden="true">↗</span></button>
+            <button class="suggestion" data-prompt="PMID 22745249 논문의 초록을 조회하고 핵심 내용을 한국어로 쉽게 설명해줘."><svg class="icon"><use href="#i-book"/></svg><strong>논문 이해하기</strong><span>PMID로 초록 조회·요약하기</span><span class="suggestion-arrow" aria-hidden="true">↗</span></button>
+            <button class="suggestion" data-prompt="오늘 할 일을 효율적으로 정리하는 방법을 알려줘." data-pubmed="false"><svg class="icon"><use href="#i-chat"/></svg><strong>편하게 대화하기</strong><span>일상 속 궁금한 것 물어보기</span><span class="suggestion-arrow" aria-hidden="true">↗</span></button>
+          </div>
+        </div>
+        <div id="messages" class="messages" role="log" aria-label="대화 메시지" aria-live="polite" aria-relevant="additions"></div>
+      </section>
+
+      <div class="composer-area">
+        <div id="request-status" class="request-status" role="status" aria-live="polite"></div>
+        <form id="chat-form" class="composer">
+          <label class="sr-only" for="prompt">메시지</label>
+          <textarea id="prompt" placeholder="메시지를 입력하세요" rows="1" aria-label="메시지" required></textarea>
+          <div class="composer-bottom">
+            <label class="pubmed-toggle" for="use-pubmed"><input id="use-pubmed" type="checkbox" checked><svg class="icon"><use href="#i-search"/></svg><span>PubMed 검색</span><span class="toggle-indicator"></span></label>
+            <div class="send-controls"><span class="input-hint">Shift + Enter로 줄바꿈</span><button id="send" class="send-button" type="submit" aria-label="메시지 보내기" disabled><svg class="icon"><use href="#i-arrow"/></svg></button></div>
+          </div>
+        </form>
+        <p class="composer-note">작은 로컬 모델의 답변에는 오류가 있을 수 있습니다. 논문 원문과 함께 확인해 주세요.</p>
+      </div>
+    </main>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <noscript>채팅을 사용하려면 브라우저에서 JavaScript를 켜 주세요.</noscript>
+</body>
+</html>
