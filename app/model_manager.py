@@ -26,6 +26,10 @@ def select_device(requested: str, *, cuda_available: bool, mps_available: bool) 
         raise ServiceError('device_unavailable', f'Device {requested} is unavailable', 503)
     return requested
 
+# Reasoning may use this share of the answer budget before it is closed for the model.
+THINKING_SHARE = 0.75
+THINKING_CLOSE = ('\n\nConsidering the limited time by the user, I have to give the solution based on the '
+                  'thinking directly now.\n</think>\n\n')
 MIN_OUTPUT_TOKENS = 64  # below this an answer is not worth starting, so overflow is reported instead
 
 
@@ -176,6 +180,40 @@ class ModelManager:
                 'mm_token_type_ids': image_mask.long(),
                 'pixel_values': features['pixel_values'], 'image_grid_thw': features['image_grid_thw']}
 
+    @staticmethod
+    def _generate_with_thinking_budget(model, tokenizer, inputs, kwargs, count, max_tokens, eos, cancel):
+        """Budget forcing: if reasoning runs past its share, close it and let the model answer.
+
+        Small models can keep second-guessing until no tokens are left for the answer.
+        """
+        budget = max(1, int(max_tokens * THINKING_SHARE))
+        outputs = model.generate(**inputs, **{**kwargs, 'max_new_tokens': budget})
+        generated = outputs[0, count:].tolist()
+        if (generated and generated[-1] in eos) or (cancel and cancel.is_set()):
+            return outputs
+        # Still reasoning: close it. Already answering: just keep going with the rest of the budget.
+        closed = '</think>' in tokenizer.decode(generated, skip_special_tokens=False)
+        close_ids = [] if closed else tokenizer(THINKING_CLOSE, add_special_tokens=False)['input_ids']
+        forced = torch.tensor([close_ids], dtype=outputs.dtype, device=outputs.device)
+        prefix = torch.cat([outputs, forced], dim=1)
+        streamer = kwargs.get('streamer')
+        if streamer is not None:  # show any closing words, then treat the next prompt as already seen
+            streamer.ids.extend(forced[0].tolist())
+            streamer.on_text(tokenizer.decode(streamer.ids, skip_special_tokens=False))
+            streamer.prompt_seen = False
+        extended = {}
+        for name, value in inputs.items():
+            if name == 'input_ids':
+                extended[name] = prefix
+            elif torch.is_tensor(value) and value.dim() == 2 and value.shape[-1] == count:
+                # attention_mask and mm_token_type_ids grow with plain text tokens
+                fill = torch.ones if name == 'attention_mask' else torch.zeros
+                pad = fill((value.shape[0], prefix.shape[-1] - count), dtype=value.dtype, device=value.device)
+                extended[name] = torch.cat([value, pad], dim=1)
+            else:
+                extended[name] = value
+        return model.generate(**extended, **{**kwargs, 'max_new_tokens': max(1, max_tokens - budget)})
+
     async def generate(self, model_id: str, messages: list[dict], tools: list[dict],
                        max_tokens: int, temperature: float, *, on_text: Callable[[str], None] | None = None,
                        cancel: threading.Event | None = None, thinking: bool = False,
@@ -224,11 +262,15 @@ class ModelManager:
                 if cancel is not None:
                     from transformers import StoppingCriteriaList
                     kwargs['stopping_criteria'] = StoppingCriteriaList([CancelCriteria(cancel)])
-                with torch.inference_mode():
-                    outputs = model.generate(**inputs, **kwargs)
-                generated = outputs[0, count:].tolist()
                 eos = getattr(getattr(model, 'generation_config', None), 'eos_token_id', tokenizer.eos_token_id)
                 eos = eos if isinstance(eos, list) else [eos]
+                with torch.inference_mode():
+                    if thinking and not continue_final and max_tokens > 1:
+                        outputs = self._generate_with_thinking_budget(model, tokenizer, inputs, kwargs, count,
+                                                                      max_tokens, eos, cancel)
+                    else:
+                        outputs = model.generate(**inputs, **kwargs)
+                generated = outputs[0, count:].tolist()
                 reason = 'stop' if generated and generated[-1] in eos else 'length'
                 if cancel is not None and cancel.is_set() and reason == 'length':
                     reason = 'cancelled'

@@ -131,7 +131,7 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"qwen3.5-2b","messages":[{"role":"user","content":"PubMed에서 A programmable dual-RNA-guided DNA endonuclease in adaptive bacterial immunity 논문을 1건 검색하고, 검색된 PMID로 초록을 조회한 뒤 한국어 두 문장으로 요약해줘."}],"max_tokens":512,"temperature":0,"use_pubmed":true}'
 ```
 
-`model` 생략 시 `qwen3.5-2b`, `max_tokens` 기본 512·범위 1~2048, `temperature` 기본 0.2·범위 0~2, `use_pubmed` 기본 true, `stream`·`truncate_history`·`thinking` 기본 false입니다. `thinking: true`이면 Qwen의 생각 모드를 켜고, 생각 내용은 답변과 분리해 `choices[0].message.reasoning_content`로 반환합니다. 메시지는 system/user/assistant 텍스트를 지원하며 최소 한 개의 user 메시지가 필요합니다. system 메시지는 템플릿 호환을 위해 앞쪽에서 병합합니다. 대화는 서버에 저장하지 않으므로 다음 요청에 필요한 기록을 포함하세요.
+`model` 생략 시 `qwen3.5-2b`, `max_tokens` 기본 512·범위 1~2048, `temperature` 기본 0.2·범위 0~2, `use_pubmed` 기본 true, `stream`·`truncate_history`·`thinking` 기본 false입니다. `thinking: true`이면 Qwen의 생각 모드를 켜고, 생각 내용은 답변과 분리해 `choices[0].message.reasoning_content`로 반환합니다. 생각이 `max_tokens`의 75%를 넘으면 마무리 문구와 `</think>`를 넣어 생각을 닫고 남은 길이로 답하게 합니다(budget forcing). 작은 모델이 답을 쓰지 못한 채 계속 고민하는 것을 막기 위해서입니다. 메시지는 system/user/assistant 텍스트를 지원하며 최소 한 개의 user 메시지가 필요합니다. system 메시지는 템플릿 호환을 위해 앞쪽에서 병합합니다. 대화는 서버에 저장하지 않으므로 다음 요청에 필요한 기록을 포함하세요.
 
 응답의 `choices[0].message.content`에 답변이 있고 `tool_calls`에 실행된 도구와 실제 자료가 있습니다. `sources`에는 도구가 실제로 돌려준 논문의 `pmid`, `url`, `title`, `authors`, `journal`, `year`, `doi`, `abstract_fetched`(초록 조회 여부)를 정리해 담습니다. PubMed 답변에는 실제 결과의 PMID 링크를 덧붙입니다. 검색·조회 출처 목록은 모델의 모든 문장이 검증되었다는 뜻은 아닙니다. 작은 모델의 논문 해석과 도구 선택 정확도는 별도 평가가 필요합니다.
 
@@ -253,6 +253,7 @@ git status
 | 이미지 입력 (Qwen3.5-2B MPS) | 도형 그림 2장을 각각 정확히 설명, 1200×800 이미지 포함 프롬프트 약 264토큰·약 9초, 붙여넣기·새로고침 후 썸네일 유지 |
 | 이어서 생성 | 두 모델 모두 끊긴 문장 뒤를 공백까지 맞춰 이어 씀, 브라우저에서 256토큰 답변을 한 메시지로 확장 |
 | 여러 탭 (Chromium) | 답변 중 연 탭은 진행 중 표시·입력 잠금·내용 따라감, 답변 탭을 닫으면 다른 탭이 몇 초 안에 정리 |
+| 추론 생각 예산 | 2B가 반복 입력에 1,500토큰을 생각만 하던 요청이, 예산 강제 후 1,185토큰 안에 답까지 완료 |
 | 추론 모드 | Qwen3-0.6B 약 3초, Qwen3.5-2B 약 37초 생각 후 답변, 생각 과정 분리 표시 |
 | Windows/Linux 네이티브, NVIDIA CUDA | 실장비 미검증 |
 

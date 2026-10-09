@@ -270,3 +270,56 @@ def test_answer_length_shrinks_to_the_room_the_prompt_leaves(monkeypatch):
     asyncio.run(obj.generate('qwen3-0.6b',[{'role':'user','content':'hi'}],[],500,0))
     assert seen == [117]  # 120 budget - 3 prompt tokens
     assert obj.status()['max_context_tokens'] == 120
+
+
+def test_thinking_budget_closes_runaway_reasoning_and_lets_the_model_answer(monkeypatch):
+    import torch
+    calls=[]
+    class Thinker(Model):
+        def generate(self, **kw):
+            calls.append((kw['input_ids'].shape[-1], kw['max_new_tokens'], kw['attention_mask'].shape[-1]))
+            new = [7]*kw['max_new_tokens'] if len(calls) == 1 else [42, 99]  # think forever, then answer
+            return torch.cat((kw['input_ids'], torch.tensor([new])), dim=1)
+    class Words(Tokenizer):
+        def __call__(self, text, add_special_tokens=False):
+            assert '</think>' in text
+            return {'input_ids': [5, 6]}
+        def decode(self, ids, skip_special_tokens=False):
+            return 'reasoning' if 5 not in ids else 'reasoning</think>answer'
+    seen=[]
+    obj=manager(monkeypatch,loader=lambda spec:(Thinker(),Words()))
+    result=asyncio.run(obj.generate('qwen3-0.6b',[{'role':'user','content':'hi'}],[],100,0,thinking=True,on_text=seen.append))
+    assert calls[0] == (3, 75, 3)            # 75% of the answer budget for reasoning
+    assert calls[1] == (3 + 75 + 2, 25, 80)  # prompt + reasoning + forced close, rest for the answer
+    assert result.finish_reason == 'stop' and result.raw_text.endswith('answer')
+    assert any('</think>' in text for text in seen)
+
+
+def test_reasoning_that_finishes_in_budget_is_not_forced(monkeypatch):
+    calls=[]
+    class Quick(Model):
+        def generate(self, **kw):
+            calls.append(kw['max_new_tokens'])
+            return super().generate(**kw)
+    obj=manager(monkeypatch,loader=lambda spec:(Quick(),Tokenizer()))
+    asyncio.run(obj.generate('qwen3-0.6b',[],[],100,0,thinking=True))
+    assert calls == [75]
+
+
+def test_an_answer_in_progress_at_the_budget_continues_without_forcing(monkeypatch):
+    import torch
+    calls=[]
+    class Answering(Model):
+        def generate(self, **kw):
+            calls.append((kw['input_ids'].shape[-1], kw['max_new_tokens']))
+            new = [8]*kw['max_new_tokens'] if len(calls) == 1 else [42, 99]
+            return torch.cat((kw['input_ids'], torch.tensor([new])), dim=1)
+    class Closed(Tokenizer):
+        def __call__(self, text, add_special_tokens=False):
+            raise AssertionError('no closing words once reasoning has ended')
+        def decode(self, ids, skip_special_tokens=False):
+            return 'r</think>answer so far'
+    obj=manager(monkeypatch,loader=lambda spec:(Answering(),Closed()))
+    result=asyncio.run(obj.generate('qwen3-0.6b',[],[],100,0,thinking=True))
+    assert calls == [(3, 75), (3 + 75, 25)]
+    assert result.finish_reason == 'stop'
