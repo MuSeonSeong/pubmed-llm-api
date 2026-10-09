@@ -14,6 +14,8 @@ class ChatRequest(BaseModel):
     temperature: FiniteFloat = Field(default=0.2, ge=0, le=2, strict=True)
     use_pubmed: bool = True
     stream: bool = False
+    # Drop the oldest turns instead of failing when the conversation exceeds the context budget.
+    truncate_history: bool = False
 
     @model_validator(mode='after')
     def require_user_query(self):
@@ -40,3 +42,4 @@ class ChatResponse(BaseModel):
     model: str
     choices: list[Choice]
     tool_calls: list[ToolTrace] = Field(default_factory=list)
+    dropped_messages: int = 0

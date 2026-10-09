@@ -85,6 +85,19 @@ def visible_text(raw_text: str) -> str:
     return text.lstrip()
 
 
+def drop_oldest_turn(messages: list[dict]) -> int:
+    """Remove the oldest question and its replies, never the latest question; return how many went."""
+    start = 1 if messages and messages[0]['role'] == 'system' else 0
+    last_user = max(index for index, message in enumerate(messages) if message['role'] == 'user')
+    if start >= last_user:
+        return 0
+    end = start + 1
+    while end < last_user and messages[end]['role'] != 'user':
+        end += 1
+    del messages[start:end]
+    return end - start
+
+
 def error_payload(exc: ServiceError) -> dict:
     return {'code': exc.code, 'message': exc.message, 'details': exc.details}
 
@@ -145,7 +158,7 @@ class ChatService:
                    cancel: threading.Event | None = None) -> ChatResponse:
         notify = emit or (lambda event: None)
         messages = [message.model_dump() for message in request.messages]
-        traces = []
+        traces, dropped = [], 0
         try:
             tools = await self.pubmed.tool_schemas() if request.use_pubmed else []
             system = [message['content'] for message in messages if message['role'] == 'system']
@@ -158,17 +171,25 @@ class ChatService:
                 if self.manager.status().get('loaded_model') != request.model:
                     notify({'type': 'status', 'stage': 'loading_model', 'model': request.model})
                 stream = {'on_text': self._text_relay(emit), 'cancel': cancel} if emit else {}
-                result = await self.manager.generate(request.model, messages, tools,
-                                                     request.max_tokens, request.temperature, **stream)
+                try:
+                    result = await self.manager.generate(request.model, messages, tools,
+                                                         request.max_tokens, request.temperature, **stream)
+                except ServiceError as exc:
+                    removed = drop_oldest_turn(messages) if (
+                        exc.code == 'context_overflow' and request.truncate_history) else 0
+                    if not removed:
+                        raise
+                    dropped += removed
+                    continue
                 if result.finish_reason == 'cancelled':
                     return ChatResponse(model=request.model, choices=[Choice(
                         message=AssistantMessage(content=visible_text(result.raw_text).strip()),
-                        finish_reason='cancelled')], tool_calls=traces)
+                        finish_reason='cancelled')], tool_calls=traces, dropped_messages=dropped)
                 calls = parse_tool_calls(result.raw_text, tools)
                 if not calls:
                     return ChatResponse(model=request.model, choices=[Choice(
                         message=AssistantMessage(content=append_citations(clean_text(result.raw_text), traces)),
-                        finish_reason=result.finish_reason)], tool_calls=traces)
+                        finish_reason=result.finish_reason)], tool_calls=traces, dropped_messages=dropped)
                 if not tools:
                     raise ServiceError('tools_disabled', 'Model requested tools when PubMed is disabled', 502)
                 if len(traces) + len(calls) > 4:

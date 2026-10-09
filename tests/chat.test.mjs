@@ -353,3 +353,17 @@ test('bare links cannot break out of the href attribute', () => {
   assert.ok(!rendered.includes('"onmouseover'));
   assert.ok(!/href="[^"]*"[^>]*onmouseover/.test(rendered));
 });
+
+
+test('requests ask the server to trim old turns and show how many were dropped', async () => {
+  const storage = memory();
+  let body;
+  const store = new ChatStore(storage, async (_, init) => {
+    body = JSON.parse(init.body);
+    return sse([{ ...done('답'), dropped_messages: 4 }]);
+  });
+  await store.send('질문');
+  assert.equal(body.truncate_history, true);
+  assert.equal(store.current.messages.at(-1).dropped, 4);
+  assert.equal(new ChatStore(storage).current.messages.at(-1).dropped, 4);
+});

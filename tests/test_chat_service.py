@@ -208,3 +208,51 @@ def test_cancelled_generation_finishes_with_partial_text():
 def test_visible_text_hides_markup_until_it_is_unambiguous(raw,shown):
     from app.chat_service import visible_text
     assert visible_text(raw) == shown
+
+
+class Budget(Generator):
+    """Overflows while the prompt holds more than `limit` messages."""
+    def __init__(self,outputs,limit):
+        super().__init__(outputs)
+        self.limit=limit
+    async def generate(self,model_id,messages,tools,max_tokens,temperature,**kw):
+        if len(messages) > self.limit:
+            self.messages.append(list(messages))
+            raise ServiceError('context_overflow','large',413)
+        return await super().generate(model_id,messages,tools,max_tokens,temperature,**kw)
+
+
+def history(*contents):
+    roles=['user','assistant']
+    return [{'role':roles[i%2],'content':c} for i,c in enumerate(contents)]
+
+
+def test_truncation_drops_oldest_turns_but_keeps_system_and_latest_question():
+    from app.chat_service import ChatService
+    from app.schemas import ChatRequest
+    g=Budget(['ok'],limit=3)
+    request=ChatRequest(messages=[{'role':'system','content':'Be brief.'},*history('q1','a1','q2','a2','q3')],
+                        use_pubmed=False,truncate_history=True)
+    r=asyncio.run(ChatService(g,PubMed()).complete(request))
+    assert r.dropped_messages == 4
+    assert [m['content'] for m in g.messages[-1]] == ['Be brief.','q3']
+    assert r.choices[0].message.content == 'ok'
+
+
+def test_overflow_without_truncation_or_with_only_the_question_is_an_error():
+    from app.chat_service import ChatService
+    from app.schemas import ChatRequest
+    for truncate,messages in [(False,history('q1','a1','q2')),(True,history('only question'))]:
+        g=Budget(['ok'],limit=0)
+        request=ChatRequest(messages=messages,use_pubmed=False,truncate_history=truncate)
+        with pytest.raises(ServiceError) as e:
+            asyncio.run(ChatService(g,PubMed()).complete(request))
+        assert e.value.code == 'context_overflow'
+
+
+def test_drop_oldest_turn_removes_a_whole_turn():
+    from app.chat_service import drop_oldest_turn
+    messages=history('q1','a1','q2')
+    assert drop_oldest_turn(messages) == 2
+    assert [m['content'] for m in messages] == ['q2']
+    assert drop_oldest_turn(messages) == 0

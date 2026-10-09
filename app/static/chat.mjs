@@ -32,6 +32,7 @@ function restoreChat(chat) {
     .map(message => ({ id: message.id, role: message.role, content: message.content,
       toolCalls: normalizeTools(message.toolCalls), truncated: message.truncated === true,
       stopped: message.stopped === true || message.streaming === true,
+      ...(Number.isInteger(message.dropped) && message.dropped > 0 ? { dropped: message.dropped } : {}),
       ...(typeof message.error === 'string' ? { error: message.error } : {}),
       ...(message.role === 'user' && message.pending === true ? { pending: true } : {}) }));
   messages.forEach((message, index) => {
@@ -91,6 +92,7 @@ function finish(draft, data) {
   draft.toolCalls = normalizeTools(data.tool_calls);
   draft.truncated = choice.finish_reason === 'length';
   draft.stopped = choice.finish_reason === 'cancelled';
+  if (Number.isInteger(data.dropped_messages) && data.dropped_messages > 0) draft.dropped = data.dropped_messages;
   if (!content.trim() && !draft.stopped) throw new Error('빈 응답을 받았습니다. 다시 시도해 주세요.');
 }
 
@@ -237,7 +239,8 @@ export class ChatStore {
       const response = await fetcher('/v1/chat/completions', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
         body: JSON.stringify({ model: chat.model, messages: history, max_tokens: this.settings.maxTokens,
-          temperature: this.settings.temperature, use_pubmed: chat.usePubmed, stream: true }),
+          temperature: this.settings.temperature, use_pubmed: chat.usePubmed, stream: true,
+          truncate_history: true }),
       });
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));

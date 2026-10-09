@@ -259,6 +259,8 @@ function renderAssistant(message, chat) {
   }
   if (message.streaming && !message.content) body.append(progressLine(message, chat));
   if (message.stopped) body.append(element('div', 'truncated-note', '답변 생성을 중지했습니다.'));
+  if (message.dropped) body.append(element('div', 'truncated-note',
+    '대화가 길어 앞부분 메시지 ' + message.dropped + '개는 참고하지 않고 답했어요. 새 주제라면 새 대화를 시작해 보세요.'));
   if (message.truncated) body.append(element('div', 'truncated-note',
     '답변 길이 한도에 도달했습니다. “이어서 설명해줘”라고 요청하거나 설정에서 답변 길이를 늘려 보세요.'));
   if (!message.streaming && message.toolCalls.length) body.append(toolDetails(message.toolCalls, false));
