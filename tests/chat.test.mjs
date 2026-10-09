@@ -259,7 +259,7 @@ test('regenerate replaces only the last answer and does not resend it', async ()
   assert.deepEqual(bodies[1].messages, [{ role: 'user', content: '질문' }]);
 });
 
-test('editing a question discards later turns and asks again', async () => {
+test('editing a question replaces later turns and asks again', async () => {
   const bodies = [];
   const store = new ChatStore(memory(), async (_, init) => {
     bodies.push(JSON.parse(init.body));
@@ -848,4 +848,28 @@ test('the first answer is followed by a model-written title unless the user rena
   await renamed.send('질문');
   assert.equal(titleRequests, 0);
   assert.equal(renamed.current.title, '내가 지은 이름');
+});
+
+
+test('edited questions keep earlier wordings as branches with their own follow-ups', async () => {
+  const storage = memory();
+  const bodies = [];
+  const store = new ChatStore(storage, async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return sse([done('답 ' + bodies.length)]);
+  });
+  await store.send('첫 질문');
+  await store.send('둘째 질문');
+  const first = store.current.messages[0];
+  await store.edit(first.id, '고친 질문');
+  assert.deepEqual(store.current.messages.map(m => m.content), ['고친 질문', '답 3']);
+  assert.equal(first.branches.length, 2);
+  assert.equal(first.branch, 1);
+  store.switchBranch(first.id, 0);
+  assert.deepEqual(store.current.messages.map(m => m.content), ['첫 질문', '답 1', '둘째 질문', '답 2']);
+  const restored = new ChatStore(storage);
+  const question = restored.current.messages[0];
+  assert.equal(question.branch, 0);
+  restored.switchBranch(question.id, 1);
+  assert.deepEqual(restored.current.messages.map(m => m.content), ['고친 질문', '답 3']);
 });

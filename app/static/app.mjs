@@ -346,6 +346,17 @@ function renderUser(message) {
   const edit = iconButton('edit', '질문 수정', () => startEdit(message));
   edit.disabled = !store.canModify();
   actions.append(edit);
+  if (message.branches?.length > 1) {
+    // Earlier wordings stay reachable, each with the conversation that followed it.
+    const pager = element('div', 'version-pager');
+    const back = iconButton('left', '이전 질문', () => store.switchBranch(message.id, message.branch - 1));
+    back.disabled = message.branch === 0 || !store.canSwitchBranch(message.id);
+    const next = iconButton('right', '다음 질문', () => store.switchBranch(message.id, message.branch + 1));
+    next.disabled = message.branch === message.branches.length - 1 || !store.canSwitchBranch(message.id);
+    pager.append(back, element('span', '', (message.branch + 1) + ' / ' + message.branches.length), next);
+    actions.prepend(pager);
+    actions.classList.add('has-branches');
+  }
   article.append(actions);
   if (message.error) {
     const error = element('div', 'message-error');

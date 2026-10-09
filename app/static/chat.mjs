@@ -136,10 +136,23 @@ function restoreSettings(value) {
 }
 
 /** Validate a stored chat. In-progress requests are kept as-is; settleInterrupted() decides if they died. */
-function restoreChat(chat) {
-  if (!chat || typeof chat.id !== 'string' || typeof chat.title !== 'string'
-      || !Array.isArray(chat.messages)) return null;
-  const messages = chat.messages.filter(message => message && typeof message.id === 'string'
+const MAX_BRANCHES = 10;
+const MAX_BRANCH_DEPTH = 6;
+
+/** Earlier wordings of an edited question, each with the conversation that followed it. */
+function restoreBranches(message, depth) {
+  if (message.role !== 'user' || !Array.isArray(message.branches) || depth >= MAX_BRANCH_DEPTH) return {};
+  const branches = message.branches.filter(item => item && typeof item.content === 'string').slice(-MAX_BRANCHES)
+    .map(item => ({ content: item.content, attachments: restoreAttachments(item.attachments),
+      tail: restoreMessages(Array.isArray(item.tail) ? item.tail : [], depth + 1) }));
+  if (branches.length < 2) return {};
+  const branch = Math.min(Math.max(Number.isInteger(message.branch) ? message.branch : branches.length - 1, 0),
+    branches.length - 1);
+  return { branches, branch };
+}
+
+function restoreMessages(list, depth = 0) {
+  return list.filter(message => message && typeof message.id === 'string'
     && ['user', 'assistant'].includes(message.role) && typeof message.content === 'string')
     .map(message => ({ id: message.id, role: message.role, content: message.content,
       toolCalls: normalizeTools(message.toolCalls), truncated: message.truncated === true,
@@ -161,7 +174,14 @@ function restoreChat(chat) {
       ...(message.role === 'user' && restoreAttachments(message.attachments).length
         ? { attachments: restoreAttachments(message.attachments) } : {}),
       ...(typeof message.error === 'string' ? { error: message.error } : {}),
-      ...(message.role === 'user' && message.pending === true ? { pending: true } : {}) }));
+      ...(message.role === 'user' && message.pending === true ? { pending: true } : {}),
+      ...restoreBranches(message, depth) }));
+}
+
+function restoreChat(chat) {
+  if (!chat || typeof chat.id !== 'string' || typeof chat.title !== 'string'
+      || !Array.isArray(chat.messages)) return null;
+  const messages = restoreMessages(chat.messages);
   return { id: chat.id, title: chat.title, model: MODELS.includes(chat.model) ? chat.model : MODELS[0],
     usePubmed: chat.usePubmed !== false, thinking: chat.thinking === true, pinned: chat.pinned === true,
     ...(chat.autoTitle === true ? { autoTitle: true } : {}), messages,
@@ -544,9 +564,41 @@ export class ChatStore {
     const release = await this.claim(chat);
     if (!release) return;
     const message = chat.messages[index];
-    chat.messages.splice(index + 1);
+    // Keep the old wording and everything after it as a branch the user can switch back to.
+    const branches = message.branches ? [...message.branches] : [];
+    branches[message.branch ?? 0] = { content: message.content, attachments: message.attachments || [],
+      tail: chat.messages.splice(index + 1) };
+    branches.push({ content: content.trim(), attachments: message.attachments || [], tail: [] });
+    message.branches = branches.slice(-MAX_BRANCHES);
+    message.branch = message.branches.length - 1;
     message.content = content.trim();
+    delete message.error;
     return this.request(chat, message, { release });
+  }
+
+  canSwitchBranch(messageId) {
+    const message = this.current.messages.find(item => item.id === messageId);
+    return this.canModify() && (message?.branches?.length || 0) > 1;
+  }
+
+  /** Show another wording of an edited question together with the conversation that followed it. */
+  switchBranch(messageId, target) {
+    if (!this.canSwitchBranch(messageId)) return;
+    const chat = this.current;
+    const index = chat.messages.findIndex(item => item.id === messageId);
+    const message = chat.messages[index];
+    if (!message.branches[target] || target === message.branch) return;
+    message.branches[message.branch] = { content: message.content, attachments: message.attachments || [],
+      tail: chat.messages.splice(index + 1) };
+    const chosen = message.branches[target];
+    message.content = chosen.content;
+    if (chosen.attachments.length) message.attachments = chosen.attachments;
+    else delete message.attachments;
+    chat.messages.push(...chosen.tail);
+    chosen.tail = [];  // the live list owns these messages now
+    message.branch = target;
+    this.touch(chat);
+    this.emit();
   }
 
   canContinue(messageId) {
@@ -758,11 +810,15 @@ function dropOldImages(chats, keepChatId) {
   for (const chat of [...chats].sort((a, b) => a.updatedAt - b.updatedAt)) {
     if (chat.id === keepChatId) continue;
     let dropped = false;
-    for (const message of chat.messages) {
-      for (const file of message.attachments || []) {
-        if (isImage(file) && file.dataUrl) { delete file.dataUrl; file.removed = true; dropped = true; }
+    const visit = messages => {
+      for (const message of messages) {
+        const branchFiles = (message.branches || []).flatMap(branch => { visit(branch.tail); return branch.attachments; });
+        for (const file of [...(message.attachments || []), ...branchFiles]) {
+          if (isImage(file) && file.dataUrl) { delete file.dataUrl; file.removed = true; dropped = true; }
+        }
       }
-    }
+    };
+    visit(chat.messages);
     if (dropped) return true;
   }
   return false;

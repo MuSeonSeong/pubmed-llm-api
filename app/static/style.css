@@ -120,6 +120,7 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .user-content { max-width: 85%; background: var(--bubble); padding: 11px 18px; border-radius: 18px 18px 4px 18px; font-size: 14px; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
 .user-actions { padding-left: 0; margin-top: 4px; opacity: 0; transition: opacity .15s; }
 .message-user:hover .user-actions, .message-user:focus-within .user-actions { opacity: 1; }
+.user-actions.has-branches { opacity: 1; }
 .edit-form { width: min(100%, 640px); background: var(--bubble); border-radius: 18px; padding: 12px 14px 10px; }
 .edit-input { display: block; width: 100%; resize: none; border: 0; outline: 0; background: transparent; font-size: 14px; line-height: 1.8; min-height: 30px; }
 .edit-buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
