@@ -821,3 +821,31 @@ test('a continuation interrupted by a closed tab keeps its citation list when se
   assert.equal(store.current.messages[1].content, '봄에는 꽃이\n\nPubMed 검색·조회 출처:\n- PMID [1](u)');
   assert.equal(store.current.messages[1].pendingTail, undefined);
 });
+
+
+test('the first answer is followed by a model-written title unless the user renamed the chat', async () => {
+  const bodies = [];
+  const store = new ChatStore(memory(), async (_, init) => {
+    const body = JSON.parse(init.body);
+    bodies.push(body);
+    return body.stream ? sse([done('메트포르민은 혈당을 낮춥니다.')])
+      : { ok: true, json: async () => ({ choices: [{ message: { content: '제목: "메트포르민 작용"\n설명' } }] }) };
+  }, { autoTitles: true });
+  await store.send('메트포르민이 어떻게 작용하는지 아주 자세하게 알려줄 수 있을까요?');
+  assert.equal(store.current.title, '메트포르민 작용');
+  assert.equal(bodies[1].use_pubmed, false);
+  assert.equal(bodies[1].max_tokens, 24);
+  await store.send('부작용은?');
+  assert.equal(bodies.length, 3);  // only after the first exchange
+
+  let titleRequests = 0;
+  const renamed = new ChatStore(memory(), async (_, init) => {
+    if (!JSON.parse(init.body).stream) { titleRequests++; return { ok: false }; }
+    delete renamed.current.autoTitle;  // the user renames the chat while the answer streams
+    renamed.current.title = '내가 지은 이름';
+    return sse([done('답')]);
+  }, { autoTitles: true });
+  await renamed.send('질문');
+  assert.equal(titleRequests, 0);
+  assert.equal(renamed.current.title, '내가 지은 이름');
+});

@@ -163,7 +163,8 @@ function restoreChat(chat) {
       ...(typeof message.error === 'string' ? { error: message.error } : {}),
       ...(message.role === 'user' && message.pending === true ? { pending: true } : {}) }));
   return { id: chat.id, title: chat.title, model: MODELS.includes(chat.model) ? chat.model : MODELS[0],
-    usePubmed: chat.usePubmed !== false, thinking: chat.thinking === true, pinned: chat.pinned === true, messages,
+    usePubmed: chat.usePubmed !== false, thinking: chat.thinking === true, pinned: chat.pinned === true,
+    ...(chat.autoTitle === true ? { autoTitle: true } : {}), messages,
     updatedAt: Number(chat.updatedAt) || Date.now(),
     rev: Number.isFinite(chat.rev) ? chat.rev : Number(chat.updatedAt) || 0 };
 }
@@ -254,7 +255,9 @@ export class ChatStore {
    * that is still running elsewhere from one whose tab was closed. Without it, requests found in storage
    * are treated as interrupted.
    */
-  constructor(storage = globalThis.localStorage, fetcher = globalThis.fetch, { locks = globalThis.navigator?.locks } = {}) {
+  constructor(storage = globalThis.localStorage, fetcher = globalThis.fetch,
+    { locks = globalThis.navigator?.locks, autoTitles = false } = {}) {
+    this.autoTitles = autoTitles;  // ask the model for a short title after a chat's first answer
     this.storage = storage;
     this.fetcher = fetcher;
     this.locks = locks || null;
@@ -398,6 +401,7 @@ export class ChatStore {
     const clean = String(title).replace(/\s+/g, ' ').trim().slice(0, 80);
     if (chat && clean && this.canModify(chat)) {
       chat.title = clean;
+      delete chat.autoTitle;  // a name the user chose is never replaced
       this.touch(chat);
       this.emit();
     }
@@ -473,8 +477,15 @@ export class ChatStore {
     const message = { id: id(), role: 'user', content: content.trim() || fallbackPrompt,
       ...(files.length ? { attachments: files } : {}) };
     chat.messages.push(message);
-    if (chat.title === '새 대화') chat.title = message.content.replace(/\s+/g, ' ').slice(0, 36);
-    return this.request(chat, message, { release });
+    if (chat.title === '새 대화') {
+      chat.title = message.content.replace(/\s+/g, ' ').slice(0, 36);
+      chat.autoTitle = true;
+    }
+    await this.request(chat, message, { release });
+    const [question, answer, ...rest] = chat.messages;
+    if (this.autoTitles && chat.autoTitle && !rest.length && !question.error && answer?.content.trim()) {
+      await this.suggestTitle(chat, question, answer);
+    }
   }
 
   canRetry(messageId) {
@@ -552,6 +563,27 @@ export class ChatStore {
     const release = await this.claim(chat);
     if (!release) return;
     return this.request(chat, chat.messages.at(-2), { continueFrom: chat.messages.at(-1), release });
+  }
+
+  /** Replace the provisional title (the start of the first question) with a short one from the model. */
+  async suggestTitle(chat, question, answer) {
+    const prompt = '다음 대화에 어울리는 짧은 한국어 제목을 15자 이내로 하나만 써 줘. 따옴표나 설명 없이 제목만 써.\n\n'
+      + '질문: ' + question.content.slice(0, 800) + '\n답변: ' + withoutCitationList(answer.content).slice(0, 1200);
+    try {
+      const fetcher = this.fetcher;
+      const response = await fetcher('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: chat.model, messages: [{ role: 'user', content: prompt }], max_tokens: 24,
+          temperature: 0.2, use_pubmed: false }) });
+      if (!response.ok) return;
+      const text = (await response.json()).choices?.[0]?.message?.content;
+      const title = typeof text === 'string' ? text.split('\n').map(line => line.trim()).find(Boolean) : '';
+      const clean = (title || '').replace(/^(제목\s*[:：]\s*|#+\s*)/, '').replace(/^["'“‘「]+|["'”’」.]+$/g, '').trim().slice(0, 40);
+      if (!clean || !chat.autoTitle || !this.chats.includes(chat)) return;  // renamed or deleted meanwhile
+      chat.title = clean;
+      delete chat.autoTitle;
+      this.touch(chat);
+      this.emit();
+    } catch { /* the provisional title stays */ }
   }
 
   /** The newest images, up to MAX_IMAGES, if the chat's model can see; others are named in text. */

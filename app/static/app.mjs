@@ -30,7 +30,7 @@ const iconButton = (name, label, onClick) => {
 let storage;
 try { storage = window.localStorage; }
 catch { storage = { getItem: () => null, setItem: () => { throw Error('Storage unavailable'); } }; }
-const store = new ChatStore(storage);
+const store = new ChatStore(storage, undefined, { autoTitles: true });
 const prompt = $('prompt');
 const conversation = $('conversation');
 const THEME_KEY = 'pubmed-chat.theme';
