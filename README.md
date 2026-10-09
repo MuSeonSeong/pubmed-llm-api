@@ -1,0 +1,174 @@
+# PubMed LLM API
+
+PyTorch·Transformers로 실행하는 로컬 채팅 API입니다. macOS, Windows, Linux에서 동일한 Python 소스를 사용하며, PubMed MCP를 통해 논문 검색과 초록 조회를 수행합니다.
+
+## 포함된 모델
+
+| API ID | 원본 | 용도 | 원본 가중치 |
+| --- | --- | --- | --- |
+| `qwen3-0.6b` | Qwen/Qwen3-0.6B | 가벼운 동작 테스트 | 약 1.50 GB |
+| `qwen3.5-2b` | Qwen/Qwen3.5-2B | 기본 채팅·PubMed | 약 4.55 GB |
+
+두 모델 모두 공식 원본 Safetensors이며 MLX 전용 파일이 아닙니다. 정확한 리비전은 [models.json](models.json)에 고정합니다. 모델 하나만 메모리에 유지하고, 모델을 바꾸면 이전 모델을 해제합니다. 처음 요청과 모델 전환 시 로딩 시간이 발생합니다.
+
+## 로컬 설치와 실행
+
+[uv](https://docs.astral.sh/uv/getting-started/installation/)를 설치한 다음 이 프로젝트 폴더에서 실행합니다. `uv`가 Python 3.12와 **프로젝트 전용 `.venv`**를 준비합니다.
+
+```sh
+cd ../pubmed-llm-api
+uv sync --frozen --dev
+uv run python scripts/prepare_models.py
+uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+기본 잠금 환경의 맥 대상은 Apple Silicon·macOS 14 이상입니다. 현재 맥에는 `.venv`와 모델 2개가 준비되어 있으므로 마지막 명령으로 바로 실행할 수 있습니다. 다른 PC에서는 설치와 모델 준비부터 실행합니다. `.venv`는 다른 PC에 복사하지 않습니다. Git 소스와 `uv.lock`으로 새 환경을 만듭니다.
+
+가상환경을 직접 활성화해 실행하려면:
+
+```sh
+# macOS / Linux
+source .venv/bin/activate
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+```powershell
+# Windows PowerShell, 프로젝트 폴더에서
+uv sync --frozen --dev
+uv run python scripts/prepare_models.py
+.\.venv\Scripts\Activate.ps1
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+PowerShell 환경에서 활성화 스크립트가 차단되어 있으면 가상환경 활성화 없이 `uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1`로 실행할 수 있습니다.
+
+- API 문서: <http://127.0.0.1:8000/docs>
+- 상태: <http://127.0.0.1:8000/health>
+- 모델 목록: <http://127.0.0.1:8000/v1/models>
+
+프로젝트를 어느 경로에 두어도 모델 경로 기본값은 이 프로젝트의 `models/`입니다. 다운로드 스크립트는 Hugging Face 캐시를 활용하며 모델 파일을 역참조해 저장하므로 기존 캐시 폴더의 심볼릭 링크에 의존하지 않습니다. 완료된 모델은 다시 다운로드하지 않습니다.
+
+## 설정과 장치 선택
+
+`.env.example`을 `.env`로 복사한 뒤 수정할 수 있습니다.
+
+| 설정 | 기본값 | 의미 |
+| --- | --- | --- |
+| `DEVICE` | `auto` | `cuda` → `mps` → `cpu` 순으로 가용 장치 선택 |
+| `MODELS_DIR` | `models` | 프로젝트 기준 상대 경로 또는 절대 경로 |
+| `MAX_CONTEXT_TOKENS` | `4096` | 입력 템플릿·도구 스키마·생성 예약 토큰의 합, 최대 8192 |
+| `PUBMED_MCP_URL` | `https://pubmed.caseyjhand.com/mcp` | Streamable HTTP MCP 주소 |
+
+맥 MPS는 FP16, CPU는 FP32, CUDA는 BF16 지원 시 BF16/그 외 FP16을 사용합니다. 명시한 장치를 사용할 수 없으면 오류를 반환합니다. 맥에서는 원본 가중치를 CPU에서 읽은 뒤 MPS로 옮깁니다. 직접 MPS로 로드할 때 발생한 프로세스 종료를 피하기 위한 경로이며 로딩 중 일시적인 메모리 사용이 늘어납니다.
+
+Qwen3.5-2B는 CPU FP32에서 가중치만 약 9 GB가 필요하고 추가 메모리도 사용합니다. CPU 또는 Docker에서 메모리가 부족하면 `qwen3-0.6b`로 먼저 실행하세요. 맥의 직접 실행은 MPS를 사용하고, 맥 Docker는 Linux CPU를 사용합니다.
+
+### NVIDIA CUDA — Windows / Linux
+
+기본 잠금 환경은 Windows/Linux에 CPU PyTorch를 설치합니다. NVIDIA GPU를 사용하려면 [공식 PyTorch 설치 선택표](https://pytorch.org/get-started/locally/)에서 장비와 드라이버에 맞는 CUDA wheel 인덱스를 선택합니다. 아래 예시의 `cu130`은 선택한 인덱스로 바꾸세요.
+
+```sh
+uv pip install --reinstall 'torch==2.14.1' --index-url https://download.pytorch.org/whl/cu130
+uv run --no-sync python -c "import torch; print(torch.cuda.is_available())"
+uv run --no-sync uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+이 설치는 로컬 `.venv`의 PyTorch 배포를 교체합니다. 이후 `uv sync` 또는 `--no-sync` 없는 `uv run`은 잠금 파일의 CPU 배포로 복원할 수 있으므로 CUDA 실행에서는 `--no-sync`를 사용합니다. 자세한 배포 설정은 [uv의 PyTorch 문서](https://docs.astral.sh/uv/guides/integration/pytorch/)를 참고하세요. CUDA 실장비 검증은 현재 맥에서 수행하지 않았습니다.
+
+## 채팅 호출
+
+PubMed 없이 가볍게 테스트합니다. 일반 채팅을 외부 MCP 연결 없이 사용하려면 `use_pubmed=false`를 지정합니다.
+
+```sh
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3-0.6b","messages":[{"role":"user","content":"2+2는 얼마야?"}],"max_tokens":64,"temperature":0,"use_pubmed":false}'
+```
+
+Windows PowerShell:
+
+```powershell
+$body = @{
+  model = 'qwen3-0.6b'
+  messages = @(@{ role = 'user'; content = '2+2는 얼마야?' })
+  max_tokens = 64
+  temperature = 0
+  use_pubmed = $false
+} | ConvertTo-Json -Depth 8
+Invoke-RestMethod -Uri 'http://127.0.0.1:8000/v1/chat/completions' -Method Post -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
+```
+
+PubMed 논문 검색과 초록 요약:
+
+```sh
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"qwen3.5-2b","messages":[{"role":"user","content":"PubMed에서 A programmable dual-RNA-guided DNA endonuclease in adaptive bacterial immunity 논문을 1건 검색하고, 검색된 PMID로 초록을 조회한 뒤 한국어 두 문장으로 요약해줘."}],"max_tokens":512,"temperature":0,"use_pubmed":true}'
+```
+
+`model` 생략 시 `qwen3.5-2b`, `max_tokens` 기본 512·범위 1~2048, `temperature` 기본 0.2·범위 0~2, `use_pubmed` 기본 true입니다. 메시지는 system/user/assistant 텍스트를 지원하며 최소 한 개의 user 메시지가 필요합니다. system 메시지는 템플릿 호환을 위해 앞쪽에서 병합합니다. 대화는 서버에 저장하지 않으므로 다음 요청에 필요한 기록을 포함하세요.
+
+응답의 `choices[0].message.content`에 답변이 있고 `tool_calls`에 실행된 도구와 실제 자료가 있습니다. PubMed 답변에는 실제 결과의 PMID 링크를 덧붙입니다. 검색·조회 출처 목록은 모델의 모든 문장이 검증되었다는 뜻은 아닙니다. 작은 모델의 논문 해석과 도구 선택 정확도는 별도 평가가 필요합니다.
+
+비스트리밍 API이며 OpenAI API의 모든 기능을 제공하지 않습니다. Qwen3의 JSON 도구 호출과 Qwen3.5의 공식 XML 도구 호출을 모두 처리합니다. MCP 서버는 NCBI 공식 서버가 아닌 [cyanheads/pubmed-mcp-server](https://github.com/cyanheads/pubmed-mcp-server)의 외부 서버입니다.
+
+### 제한과 오류
+
+검색은 최대 5건, 초록 조회는 최대 3건, 요청당 도구 실행은 총 4회입니다. 도구 결과는 호출당 12,000자 이하로 제한하며 잘림을 표시합니다. 매 생성 단계에서 문맥 한도를 검사합니다. 긴 대화는 명확히 거절하며 자동으로 대화를 삭제하지 않습니다.
+
+| HTTP | 원인 |
+| --- | --- |
+| 422 | 잘못된 메시지/숫자 또는 알 수 없는 모델 |
+| 413 | 입력과 생성 예약 토큰 합이 문맥 한도 초과 |
+| 503 | 모델 파일 또는 지정 장치 없음 |
+| 502 | MCP 오류, 잘못된 도구 호출, 실행 횟수 초과 |
+| 504 | PubMed 연결/호출 30초 시간 제한 |
+| 500 | 모델 로드·생성의 예상 밖 오류 |
+
+오류 응답은 `error.code`, `error.message`, `error.details`를 포함하고, 이미 실행한 도구 기록을 보존합니다. `/health`의 PubMed 상태는 최근 연결/호출에서 확인한 상태이며 최초는 `unknown`입니다. 일반 채팅 준비 상태와 PubMed 준비 상태를 구분합니다.
+
+## Docker — CPU 실행
+
+먼저 호스트에서 모델을 준비하고 포트 8000의 네이티브 서버를 종료하세요.
+
+```sh
+uv run python scripts/prepare_models.py
+docker compose up --build -d
+curl http://127.0.0.1:8000/health
+# 위 일반 채팅 예시에서 qwen3-0.6b를 선택해 CPU 테스트
+docker compose logs -f api
+# 종료
+docker compose down
+```
+
+모델은 `./models:/app/models:ro` 볼륨으로 연결합니다. 이미지에는 원본 모델과 호스트 `.venv`를 넣지 않습니다. Docker 기본 모델도 2B이므로 메모리가 작은 Docker VM에서는 요청에 `model=qwen3-0.6b`를 지정하세요. 2B CPU 사용 시 Docker VM에도 충분한 RAM이 필요합니다. NVIDIA GPU 컨테이너 설정은 이 초기 구성에 포함하지 않습니다.
+
+## 개발·Git
+
+```sh
+uv run pytest -q
+uv lock --check
+git status
+```
+
+로컬 Git `main`에 초기 설정과 구현 커밋을 저장합니다. 원격 저장소는 아직 설정하지 않았습니다. `.venv/`, `models/`, `.env`, 캐시는 Git에서 제외됩니다.
+
+## 실제 검증 기록 — 2026-10-09
+
+장비: Apple M5, RAM 16 GB. Python 3.12.13, PyTorch 2.14.1, Transformers 5.19.0, MCP SDK 1.30.0. 아래 시간은 짧은 동작 확인이며 성능·답변 품질 벤치마크가 아닙니다.
+
+| 검증 | 결과 |
+| --- | --- |
+| 원본 모델 2개 준비·외부 심볼릭 링크 제거 | 확인 |
+| Qwen3-0.6B MPS, 48토큰 상한 | 응답 성공, 첫 로드 포함 약 3.37초 |
+| Qwen3.5-2B MPS, 48토큰 상한 | 응답 성공, 첫 로드 포함 약 8.35초 |
+| Qwen3-0.6B CPU | 응답 성공, 첫 로드 포함 약 2.03초 |
+| HTTP 두 모델 일반 채팅 | 각각 `2+2=4` 응답, HTTP 200 |
+| 실제 PubMed 검색·초록 조회 | 성공, PMID 31542292 |
+| 2B 실제 도구 채팅 | 검색→초록 조회→한국어 요약·PMID 링크, PMID 22745249, 약 29.3초 |
+| 단위·HTTP 계약 테스트 | 56개 통과 |
+| Docker Linux ARM64 CPU 이미지 빌드·기동 | 성공 |
+| Docker Qwen3-0.6B CPU HTTP 채팅 | HTTP 200, `2+2=4`, 첫 로드 포함 약 11.61초 |
+| Windows/Linux 네이티브, NVIDIA CUDA | 실장비 미검증 |
+
+Qwen3.5는 플랫폼 전용 최적화 커널 없이 PyTorch 기본 구현을 사용합니다. 최초 실행 시 커널 대체 경로 안내가 표시될 수 있으며 GPU·CPU별 속도 차이가 있습니다.

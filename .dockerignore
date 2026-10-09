@@ -9,3 +9,6 @@ __pycache__/
 .pytest_cache/
 .superpowers/
 .DS_Store
+.git/
+tests/
+docs/

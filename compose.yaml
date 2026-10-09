@@ -1,0 +1,12 @@
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DEVICE: cpu
+      MODELS_DIR: /app/models
+      MAX_CONTEXT_TOKENS: ${MAX_CONTEXT_TOKENS:-4096}
+      PUBMED_MCP_URL: ${PUBMED_MCP_URL:-https://pubmed.caseyjhand.com/mcp}
+    volumes:
+      - ./models:/app/models:ro
