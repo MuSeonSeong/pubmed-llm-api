@@ -63,6 +63,20 @@ def test_counting_does_not_wait_for_a_running_server(tmp_path):
         server.execute('ROLLBACK')
 
 
+def test_accounts_are_counted_in_the_database_the_app_writes(tmp_path):
+    """The launcher reads what app.storage and scripts/users.py write, with the app holding it open or not."""
+    from app.auth import hash_password
+    from app.storage import Storage
+    from scripts.serve import count_accounts
+    storage = Storage(tmp_path, 1024 * 1024)
+    storage.local_user()
+    assert count_accounts(tmp_path / 'chat.db') == 0
+    storage.add_user('민수', hash_password('password123'))
+    assert count_accounts(tmp_path / 'chat.db') == 1
+    storage.close()  # the last connection removes the WAL files; a read-only check must still work
+    assert count_accounts(tmp_path / 'chat.db') == 1
+
+
 def test_refusal_reasons():
     from scripts.serve import refusal
     assert 'AUTH_ENABLED' in refusal(False, 3)

@@ -247,6 +247,8 @@ uv run python scripts/serve.py                # 2. 계정 모드로 실행해 �
 bash deploy/macos/install-launch-agent.sh     # 3. 로그인하면 자동으로 켜지게 등록 (macOS)
 ```
 
+지금까지 로컬 모드로 쓰던 대화는 `local` 사용자 몫이라 로그인한 계정에는 보이지 않습니다. `uv run python scripts/users.py adopt-local <이름>`으로 대화·설정·이미지를 그 계정으로 옮길 수 있습니다.
+
 마지막 4단계로 Cloudflare Tunnel을 만들어 `https://chat.example.com` 같은 주소를 이 PC의 `http://127.0.0.1:8000`에 연결하면, 친구들은 그 주소에서 로그인해 씁니다.
 
 `scripts/serve.py`는 계정 모드(`AUTH_ENABLED=true`)를 켜고, 로그인할 수 있는 계정이 없으면 시작하지 않으며, `127.0.0.1`에서만 접속을 받고, 서버가 켜져 있는 동안 맥이 잠들지 않게 합니다. 순서별 자세한 설명, 보안 체크리스트, 백업·업데이트·문제 해결, 그리고 저장소로 Redis 대신 SQLite를 쓰는 이유는 [docs/deploy.md](docs/deploy.md)에 있습니다.
@@ -273,8 +275,8 @@ docker compose down
 
 ```sh
 uv run pytest -q
-# 채팅 상태·요청·서식 검증 (Node.js 사용)
-node --test tests/chat.test.mjs
+# 채팅 상태·요청·서식과 서버 동기화 검증 (Node.js 사용)
+node --test tests/chat.test.mjs tests/sync.test.mjs
 uv lock --check
 git status
 ```

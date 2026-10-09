@@ -653,3 +653,15 @@ test('pages carry no inline script, style or event handler, so the CSP can forbi
     assert.ok(html.includes('<script src="/static/theme.js"></script>'), name + ': theme script');
   }
 });
+
+test('the sign-in form is sent only by its script, so the password never ends up in a URL', async () => {
+  const html = await readFile(new URL('../app/static/login.html', import.meta.url), 'utf8');
+  // A native submit (Enter before the script ran, or a failed load) must not use the query string.
+  assert.match(html.match(/<form\b[^>]*>/i)[0], /\smethod="post"/i);
+  assert.match(html.match(/<button\b[^>]*id="login-submit"[^>]*>/i)[0], /\sdisabled\b/);
+  const element = () => ({ hidden: false, disabled: true, textContent: '', addEventListener() {} });
+  const nodes = { 'login-form': element(), 'login-error': element(), 'login-submit': element() };
+  globalThis.document = { getElementById: id => nodes[id] };
+  try { await import('../app/static/login.mjs?enabled'); } finally { delete globalThis.document; }
+  assert.equal(nodes['login-submit'].disabled, false);
+});

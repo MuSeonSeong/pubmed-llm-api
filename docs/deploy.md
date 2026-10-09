@@ -87,6 +87,7 @@ uv run python scripts/users.py add 민수            # 비밀번호를 두 번 �
 uv run python scripts/users.py list                # 계정 목록
 uv run python scripts/users.py passwd 민수         # 비밀번호 바꾸기
 uv run python scripts/users.py remove 민수 --yes   # 계정과 그 계정의 데이터 삭제 (되돌릴 수 없습니다)
+uv run python scripts/users.py adopt-local 민수    # 로컬 모드에서 쓰던 대화·설정·이미지를 이 계정으로 옮기기
 ```
 
 - 이름은 1~32자의 영문·숫자·`_`·`.`·`-`·한글이고 `local`은 쓸 수 없습니다. 비밀번호는 8자 이상이어야 하며 12자 이상을 권합니다.
@@ -99,7 +100,7 @@ uv run python scripts/users.py remove 민수 --yes   # 계정과 그 계정의 �
 
 - 서버 저장이 생기기 전에 브라우저에만 저장했던 대화는, 로그인한 계정에 아직 서버 대화가 하나도 없으면 가져올지 한 번 묻습니다. 가져오면 그 계정의 서버 대화가 되고, 거절하면 다시 묻지 않습니다. 어느 쪽이든 브라우저의 예전 사본은 지우지 않습니다.
 - 브라우저 저장소는 주소마다 따로입니다. 예전에 쓰던 그 브라우저에서 예전과 같은 주소(예: `http://127.0.0.1:8000`)로 열어야 이 안내가 나옵니다. `https://chat.example.com`으로 열면 예전 기록이 보이지 않습니다.
-- 로컬 모드에서 저장한 대화는 `local` 사용자 몫이라 계정 모드에서는 보이지 않습니다. 지워지지는 않으며 로컬 모드로 실행하면 다시 보입니다. 서버로 쓸 계획이라면 처음부터 계정 모드로 쓰세요.
+- 로컬 모드에서 저장한 대화(로컬 모드에서 가져온 예전 기록 포함)는 `local` 사용자 몫이라 계정 모드에서는 보이지 않습니다. 지워지지는 않으며, `uv run python scripts/users.py adopt-local <이름>`으로 대화·설정·이미지를 그 계정으로 옮길 수 있습니다. 같은 대화가 이미 계정에 있으면 계정의 것을 그대로 두고, 설정은 계정에 아직 없을 때만 옮깁니다.
 
 ## 2. 서버 모드로 실행하기
 
@@ -306,7 +307,7 @@ Time Machine도 `data/`를 백업하지만 서버가 쓰는 도중의 사본일 
 ```sh
 launchctl bootout gui/$(id -u)/com.pubmedchat.server     # 서버 멈추기
 mv data data-before-restore                               # 지금 상태는 지우지 말고 옆으로 옮겨 둡니다
-mkdir -p data/logs
+mkdir -m 700 data && mkdir data/logs                      # 앱이 만들 때처럼 나만 읽을 수 있는 폴더로
 cp ~/pubmed-chat-backup/chat-20261009.db data/chat.db     # 복원할 백업 파일
 rsync -a ~/pubmed-chat-backup/files/ data/files/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.pubmedchat.server.plist
@@ -330,7 +331,7 @@ curl http://127.0.0.1:8000/health
 
 - `models.json`이 바뀌었다면 다시 시작하기 전에 `uv run python scripts/prepare_models.py`로 새 모델을 받습니다.
 - 다시 시작하면 진행 중이던 답변은 끊깁니다. 친구들이 쓰지 않는 시간에 하세요.
-- 업데이트 뒤 화면이 깨져 보이면 Cloudflare가 예전 파일을 들고 있는 것입니다. Cloudflare는 `.css`·`.js` 파일을 기본 2시간 동안 캐시합니다. 대시보드의 Caching › Configuration에서 **Purge Everything**으로 비운 뒤 새로고침하세요. Caching › Cache Rules에서 이 주소를 캐시하지 않도록(Bypass cache) 정해 두면 이 문제가 생기지 않습니다.
+- 앱은 화면 파일(`/static/`)에 `Cache-Control: no-cache`를 붙여 보내므로 Cloudflare와 브라우저가 매번 새 버전이 있는지 확인합니다. 그래도 업데이트 뒤 화면이 깨져 보이면 강력 새로고침(⌘⇧R, Ctrl+Shift+R)을 하세요. Cloudflare에 캐시 규칙(Cache Rules)을 따로 만들어 원래 서버의 캐시 설정을 무시하게 했다면, 대시보드의 Caching › Configuration에서 **Purge Everything**으로 비운 뒤 새로고침하세요.
 - cloudflared는 `brew upgrade cloudflared`로 올린 뒤 다시 시작합니다. 대시보드 방식(sudo)이면 `sudo launchctl kickstart -k system/com.cloudflare.cloudflared`, 직접 관리 방식이면 `launchctl kickstart -k gui/$(id -u)/com.cloudflare.cloudflared`입니다.
 
 ## 8. 문제 해결

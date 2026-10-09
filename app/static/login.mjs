@@ -1,6 +1,9 @@
 const form = document.getElementById('login-form');
 const error = document.getElementById('login-error');
 const submit = document.getElementById('login-submit');
+// The page ships the button disabled and the form as POST, so a submit before this script runs (or without it)
+// never puts the password in a URL, where the browser history and the access log would keep it.
+submit.disabled = false;
 
 function showError(text) {
   error.textContent = text;

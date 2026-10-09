@@ -16,7 +16,7 @@
       <div class="brand login-brand"><span class="brand-mark" aria-hidden="true">p<span>+</span></span><span>PubMed<span class="brand-light"> Chat</span></span></div>
       <h1>로그인</h1>
       <p class="login-lead">계정 이름과 비밀번호를 입력해 주세요. 대화 기록은 계정에 저장돼 어느 기기에서든 이어서 볼 수 있어요.</p>
-      <form id="login-form" class="login-form">
+      <form id="login-form" class="login-form" method="post">
         <label class="field">
           <span class="field-label">이름</span>
           <input id="login-name" name="name" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="32" required autofocus>
@@ -26,7 +26,7 @@
           <input id="login-password" name="password" type="password" autocomplete="current-password" required>
         </label>
         <p id="login-error" class="login-error" role="alert" hidden></p>
-        <button id="login-submit" class="primary-button login-submit" type="submit">로그인</button>
+        <button id="login-submit" class="primary-button login-submit" type="submit" disabled>로그인</button>
       </form>
       <p class="login-note">계정은 서버 관리자가 만들어 드려요. 계정이 없거나 비밀번호를 잊었다면 관리자에게 문의해 주세요.</p>
     </div>
