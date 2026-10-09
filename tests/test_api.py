@@ -1,14 +1,18 @@
 import json
+import os
 import pytest
 from fastapi.testclient import TestClient
 from tests.test_chat_service import Generator, PubMed, call
 
 
-def client(outputs=('hello',), *, offline=False):
+def client(outputs=('hello',), *, offline=False, generator=None, base_url='http://testserver', address='testclient',
+           **settings):
+    """An app on fakes; its data lives in the directory tests/conftest.py gives each test."""
     from app.main import create_app
     from app.settings import Settings
-    g,p=Generator(outputs),PubMed(fail=offline)
-    return TestClient(create_app(Settings(device='cpu'),g,p)),g,p
+    g,p=generator or Generator(outputs),PubMed(fail=offline)
+    options={'device':'cpu','data_dir':os.environ['DATA_DIR'],'auth_enabled':False,**settings}
+    return TestClient(create_app(Settings(**options),g,p),base_url=base_url,client=(address,50000)),g,p
 
 
 def test_model_list_is_exact_and_does_not_load():
@@ -112,3 +116,24 @@ def test_streaming_request_is_still_validated_before_streaming():
     with c:
         r=c.post('/v1/chat/completions',json={'messages':[],'stream':True})
         assert r.status_code == 422
+
+
+def test_importing_the_app_creates_no_data_directory(tmp_path):
+    import subprocess
+    import sys
+    from app.catalog import ROOT
+    target=tmp_path/'never-created'
+    done=subprocess.run([sys.executable,'-c','import app.main'],cwd=ROOT,capture_output=True,text=True,
+                        env={**os.environ,'DATA_DIR':str(target)},timeout=300)
+    assert done.returncode == 0, done.stderr
+    assert not target.exists()
+
+
+def test_the_database_appears_only_when_data_is_first_used(data_dir):
+    c,g,p=client()
+    with c:
+        assert c.get('/health').status_code == 200 and c.get('/').status_code == 200
+        assert c.get('/api/session').status_code == 200
+        assert not data_dir.exists()
+        assert c.get('/api/chats').status_code == 200
+        assert (data_dir/'chat.db').is_file()

@@ -5,6 +5,11 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, FiniteFloat, model_validator
 
 MAX_IMAGES = 4
+CHAT_ID = r'^[A-Za-z0-9_-]{1,64}$'
+
+class LoginRequest(BaseModel):
+    name: str = Field(max_length=64)
+    password: str = Field(max_length=1024)
 
 class TextPart(BaseModel):
     type: Literal['text']
@@ -54,6 +59,8 @@ class ChatRequest(BaseModel):
     thinking: bool = False
     # Extend the final assistant message instead of starting a new one; only the added text is returned.
     continue_final: bool = False
+    # The web UI's chat being answered; while it streams, the user's other devices see it as live.
+    chat_id: str | None = Field(default=None, pattern=CHAT_ID)
 
     @model_validator(mode='after')
     def require_user_query(self):

@@ -145,3 +145,22 @@ def test_oversized_request_bodies_are_refused_unread(monkeypatch):
         r = c.post('/v1/chat/completions', json={'messages': [{'role': 'user', 'content': 'x' * 200}]})
         assert r.status_code == 413 and r.json()['error']['code'] == 'request_too_large'
         assert g.messages == []
+
+
+@pytest.mark.parametrize('fmt,mime', [('PNG', 'image/png'), ('JPEG', 'image/jpeg'), ('WEBP', 'image/webp'),
+                                      ('GIF', 'image/gif')])
+def test_uploaded_bytes_are_sniffed_for_their_type(fmt, mime):
+    from app.images import validate_image_bytes
+    assert validate_image_bytes(base64.b64decode(data_url(fmt=fmt).split(',', 1)[1])) == mime
+
+
+def test_uploaded_bytes_are_checked_like_data_urls(monkeypatch):
+    import app.images as images
+    png = base64.b64decode(data_url().split(',', 1)[1])
+    for broken in [png[:-30], b'GIF89a', b'']:  # a truncated file has an intact header but no pixels
+        with pytest.raises(ServiceError) as e:
+            images.validate_image_bytes(broken)
+        assert e.value.code == 'invalid_image'
+    monkeypatch.setattr(images, 'MAX_BYTES', len(png) - 1)
+    with pytest.raises(ServiceError):
+        images.validate_image_bytes(png)
