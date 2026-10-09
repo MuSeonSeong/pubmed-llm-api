@@ -246,3 +246,15 @@ def test_status_reports_whether_generation_is_running(monkeypatch):
     assert obj.status()['busy'] is False
     with obj._lock:
         assert obj.status()['busy'] is True
+
+
+def test_continue_final_uses_the_open_assistant_template(monkeypatch):
+    seen=[]
+    class Recording(Tokenizer):
+        def apply_chat_template(self, messages, **kw):
+            seen.append((kw['add_generation_prompt'], kw.get('continue_final_message', False)))
+            return super().apply_chat_template(messages, **kw)
+    obj=manager(monkeypatch,loader=lambda spec:(Model(),Recording()))
+    asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0))
+    asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0,continue_final=True))
+    assert seen == [(True, False), (False, True)]

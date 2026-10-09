@@ -13,9 +13,10 @@ class Generator:
     def __init__(self,outputs):
         self.outputs=iter(outputs)
         self.messages=[]
-    async def generate(self,model_id,messages,tools,max_tokens,temperature,on_text=None,cancel=None,thinking=False):
+    async def generate(self,model_id,messages,tools,max_tokens,temperature,on_text=None,cancel=None,thinking=False,continue_final=False):
         self.messages.append(list(messages))
         self.thinking=thinking
+        self.continue_final=continue_final
         value=next(self.outputs)
         if isinstance(value,Exception):
             raise value
@@ -358,3 +359,26 @@ def test_null_lists_in_tool_results_do_not_break_the_answer():
             'articles':[{'pmid':'1','authors':None,'journalInfo':None}]})]
     assert [s.pmid for s in collect_sources(traces)] == ['1']
     assert 'PMID [1]' in append_citations('answer',traces)
+
+
+def test_continue_final_extends_the_answer_without_tools_and_keeps_leading_space():
+    import threading
+    from app.chat_service import ChatService
+    from app.schemas import ChatRequest
+    g,p=Generator([' 두 번째 문단입니다.<|im_end|>']),PubMed()
+    request=ChatRequest(messages=[{'role':'user','content':'긴 글'},{'role':'assistant','content':'첫 문단.'}],
+                        continue_final=True,thinking=True,stream=True)
+    events=[]
+    asyncio.run(ChatService(g,p).stream(request,events.append,threading.Event()))
+    assert ''.join(e['content'] for e in events if e['type']=='delta') == ' 두 번째 문단입니다.'
+    assert events[-1]['choices'][0]['message']['content'] == ' 두 번째 문단입니다.'
+    assert g.continue_final is True and g.thinking is False
+    assert p.discoveries == 0
+    assert g.messages[0][-1] == {'role':'assistant','content':'첫 문단.'}
+
+
+def test_continue_final_requires_a_trailing_assistant_message():
+    from pydantic import ValidationError
+    from app.schemas import ChatRequest
+    with pytest.raises(ValidationError):
+        ChatRequest(messages=[{'role':'user','content':'q'}],continue_final=True)

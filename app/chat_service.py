@@ -73,8 +73,11 @@ def clean_text(text: str) -> str:
 MARKERS = ('<tool_call>', '<think>', '</think>', '<|im_end|>', '<|endoftext|>', '<|im_start|>')
 
 
-def visible_text(raw_text: str) -> str:
-    """Text safe to show while generation is still running: no tool calls or unfinished markers."""
+def visible_text(raw_text: str, keep_leading_space: bool = False) -> str:
+    """Text safe to show while generation is still running: no tool calls or unfinished markers.
+
+    A continuation keeps its leading space, which separates it from the text it extends.
+    """
     text = raw_text.split('<tool_call>', 1)[0]
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.S).split('<think>', 1)[0]
     for token in MARKERS:
@@ -82,7 +85,7 @@ def visible_text(raw_text: str) -> str:
     tail = text.rfind('<')
     if tail != -1 and any(marker.startswith(text[tail:]) for marker in MARKERS):
         text = text[:tail]
-    return text.lstrip()
+    return text if keep_leading_space else text.lstrip()
 
 
 def split_reasoning(raw_text: str) -> tuple[str, str | None]:
@@ -203,7 +206,8 @@ class ChatService:
             emit({'type': 'error', 'status': 500, 'error': {
                 'code': 'internal_error', 'message': str(exc) or 'Internal error', 'details': {}}})
 
-    def _text_relay(self, emit: Callable[[dict], None], thinking: bool) -> Callable[[str], None]:
+    def _text_relay(self, emit: Callable[[dict], None], thinking: bool,
+                    continuing: bool = False) -> Callable[[str], None]:
         shown = {'reasoning': '', 'delta': ''}
         started = False
         def send(event: dict) -> None:
@@ -226,7 +230,7 @@ class ChatService:
                 if rest is not None:
                     grow('delta', visible_text(rest))
             else:
-                grow('delta', visible_text(raw_text))
+                grow('delta', visible_text(raw_text, keep_leading_space=continuing))
         return relay
 
     async def _run(self, request: ChatRequest, emit: Callable[[dict], None] | None = None,
@@ -236,7 +240,8 @@ class ChatService:
         traces, reasonings, dropped = [], [], 0
         usage = Usage()
         try:
-            tools = await self.pubmed.tool_schemas() if request.use_pubmed else []
+            # A continuation only extends the text; tool calls cannot start in the middle of an answer.
+            tools = await self.pubmed.tool_schemas() if request.use_pubmed and not request.continue_final else []
             system = [message['content'] for message in messages if message['role'] == 'system']
             messages = [message for message in messages if message['role'] != 'system']
             if tools:
@@ -249,9 +254,13 @@ class ChatService:
                     notify({'type': 'status', 'stage': 'queued'})
                 if state.get('loaded_model') != request.model:
                     notify({'type': 'status', 'stage': 'loading_model', 'model': request.model})
-                stream = {'on_text': self._text_relay(emit, request.thinking), 'cancel': cancel} if emit else {}
-                if request.thinking:
+                continuing = request.continue_final
+                stream = ({'on_text': self._text_relay(emit, request.thinking and not continuing, continuing),
+                           'cancel': cancel} if emit else {})
+                if request.thinking and not continuing:
                     stream['thinking'] = True
+                if continuing:
+                    stream['continue_final'] = True
                 try:
                     result = await self.manager.generate(request.model, messages, tools,
                                                          request.max_tokens, request.temperature, **stream)
@@ -266,6 +275,13 @@ class ChatService:
                 usage.completion_tokens += result.completion_tokens
                 usage.total_tokens = usage.prompt_tokens + usage.completion_tokens
                 raw, reasoning = result.raw_text, None
+                if continuing:
+                    text = visible_text(raw, keep_leading_space=True)
+                    if result.finish_reason != 'cancelled':
+                        text = clean_text('.' + raw)[1:]  # drop markers but keep the leading space
+                    return ChatResponse(model=request.model, choices=[Choice(
+                        message=AssistantMessage(content=text.rstrip()), finish_reason=result.finish_reason)],
+                        dropped_messages=dropped, usage=usage)
                 if request.thinking:
                     reasoning, rest = split_reasoning(raw)
                     raw = rest or ''

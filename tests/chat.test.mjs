@@ -599,3 +599,41 @@ test('pinning toggles, persists and survives reload', () => {
   store.togglePin(chatId);
   assert.equal(new ChatStore(storage).chats.find(c => c.id === chatId).pinned, false);
 });
+
+
+test('continuing a cut-off answer appends to it and sends the partial answer back', async () => {
+  const bodies = [];
+  const store = new ChatStore(memory(), async (_, init) => {
+    bodies.push(JSON.parse(init.body));
+    return bodies.length === 1 ? sse([{ ...done('봄에는', 'length'), usage: { completion_tokens: 3 } }])
+      : sse([{ type: 'delta', content: ' 꽃이' }, { ...done(' 꽃이 핍니다.'), usage: { completion_tokens: 4 } }]);
+  });
+  store.current.thinking = true;
+  await store.send('사계절');
+  const answer = store.current.messages.at(-1);
+  assert.ok(store.canContinue(answer.id));
+  await store.continueAnswer(answer.id);
+  assert.equal(bodies[1].continue_final, true);
+  assert.equal(bodies[1].use_pubmed, false);
+  assert.equal(bodies[1].thinking, undefined);
+  assert.deepEqual(bodies[1].messages.at(-1), { role: 'assistant', content: '봄에는' });
+  assert.equal(store.current.messages.length, 2);
+  assert.equal(answer.content, '봄에는 꽃이 핍니다.');
+  assert.equal(answer.truncated, false);
+  assert.equal(answer.tokens, 7);
+});
+
+test('a failed continuation leaves the answer untouched', async () => {
+  let calls = 0;
+  const store = new ChatStore(memory(), async () => {
+    if (++calls === 2) throw new TypeError('offline');
+    return sse([done('봄에는', 'length')]);
+  });
+  await store.send('사계절');
+  const answer = store.current.messages.at(-1);
+  await store.continueAnswer(answer.id);
+  assert.equal(answer.content, '봄에는');
+  assert.equal(answer.truncated, true);
+  assert.equal(answer.streaming, undefined);
+  assert.ok(store.notice);
+});

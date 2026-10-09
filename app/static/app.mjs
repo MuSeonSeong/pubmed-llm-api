@@ -337,7 +337,7 @@ function renderAssistant(message, chat) {
   if (message.dropped) body.append(element('div', 'truncated-note',
     '대화가 길어 앞부분 메시지 ' + message.dropped + '개는 참고하지 않고 답했어요. 새 주제라면 새 대화를 시작해 보세요.'));
   if (message.truncated) body.append(element('div', 'truncated-note',
-    '답변 길이 한도에 도달했습니다. “이어서 설명해줘”라고 요청하거나 설정에서 답변 길이를 늘려 보세요.'));
+    '답변 길이 한도에 도달했습니다. 아래 “이어서 생성”을 누르거나 설정에서 답변 길이를 늘려 보세요.'));
   if (!message.streaming && message.sources?.length) body.append(sourceCards(message.sources));
   if (!message.streaming && message.toolCalls.length) body.append(toolDetails(message.toolCalls, false));
   article.append(body);
@@ -353,6 +353,13 @@ function renderAssistant(message, chat) {
       next.disabled = index === message.versions.length - 1;
       pager.append(back, element('span', '', (index + 1) + ' / ' + message.versions.length), next);
       actions.append(pager);
+    }
+    if (store.canContinue(message.id)) {
+      const more = element('button', 'continue-button');
+      more.type = 'button';
+      more.append(icon('right'), document.createTextNode('이어서 생성'));
+      more.addEventListener('click', () => { followOutput = true; store.continueAnswer(message.id); });
+      actions.append(more);
     }
     if (store.canRegenerate(message.id)) {
       actions.append(iconButton('refresh', '답변 다시 생성', () => { followOutput = true; store.regenerate(message.id); }));

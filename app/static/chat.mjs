@@ -456,9 +456,24 @@ export class ChatStore {
     return this.request(chat, message);
   }
 
+  canContinue(messageId) {
+    const message = this.current.messages.at(-1);
+    return this.canModify() && message?.id === messageId && message.role === 'assistant'
+      && (message.truncated || message.stopped) && Boolean(message.content.trim())
+      && this.current.messages.at(-2)?.role === 'user';
+  }
+
+  /** Extend a cut-off answer in place; if that fails the answer is left exactly as it was. */
+  async continueAnswer(messageId) {
+    if (!this.canContinue(messageId)) return;
+    const chat = this.current;
+    const target = chat.messages.at(-1);
+    return this.request(chat, chat.messages.at(-2), { continueFrom: target });
+  }
+
   stop() { this.controller?.abort(); }
 
-  async request(chat, message, { versions = null, fallback = null } = {}) {
+  async request(chat, message, { versions = null, fallback = null, continueFrom = null } = {}) {
     this.busy = true;
     this.requestChat = chat;
     let releaseLock = () => {};
@@ -488,8 +503,17 @@ export class ChatStore {
     if (this.settings.systemPrompt.trim()) {
       history.unshift({ role: 'system', content: this.settings.systemPrompt.trim() });
     }
-    const draft = { id: id(), role: 'assistant', content: '', toolCalls: [], streaming: true, model: chat.model };
-    chat.messages.push(draft);
+    const base = continueFrom ? { ...snapshot(continueFrom), content: continueFrom.content } : null;
+    let draft;
+    if (continueFrom) {
+      draft = continueFrom;  // stream straight into the answer being extended
+      delete draft.truncated;
+      delete draft.stopped;
+      draft.streaming = true;
+    } else {
+      draft = { id: id(), role: 'assistant', content: '', toolCalls: [], streaming: true, model: chat.model };
+      chat.messages.push(draft);
+    }
     const controller = new AbortController();
     this.controller = controller;
     let finished = false;
@@ -501,17 +525,28 @@ export class ChatStore {
       const response = await fetcher('/v1/chat/completions', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
         body: JSON.stringify({ model: chat.model, messages: history,
-          max_tokens: chat.thinking ? Math.max(this.settings.maxTokens, THINKING_MIN_TOKENS) : this.settings.maxTokens,
-          temperature: this.settings.temperature, use_pubmed: chat.usePubmed, stream: true,
-          truncate_history: true, ...(chat.thinking ? { thinking: true } : {}) }),
+          max_tokens: chat.thinking && !continueFrom ? Math.max(this.settings.maxTokens, THINKING_MIN_TOKENS)
+            : this.settings.maxTokens,
+          temperature: this.settings.temperature, use_pubmed: chat.usePubmed && !continueFrom, stream: true,
+          truncate_history: true, ...(chat.thinking && !continueFrom ? { thinking: true } : {}),
+          ...(continueFrom ? { continue_final: true } : {}) }),
       });
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
         throw new Error(errorMessage(data.error, response.status));
       }
-      if (!(response.headers?.get('content-type') || '').includes('text/event-stream')) {
-        finish(draft, await response.json());
+      const complete = data => {
+        finish(draft, data);
+        if (base) {  // the server returns only the added text; keep what the answer already had
+          draft.content = base.content + draft.content;
+          for (const key of ['sources', 'reasoning', 'thinkMs', 'dropped']) if (draft[key] === undefined && base[key] !== undefined) draft[key] = base[key];
+          if (!draft.toolCalls.length) draft.toolCalls = base.toolCalls || [];
+          draft.tokens = (base.tokens || 0) + (draft.tokens || 0);
+        }
         finished = true;
+      };
+      if (!(response.headers?.get('content-type') || '').includes('text/event-stream')) {
+        complete(await response.json());
       } else {
         for await (const event of readEvents(response.body)) {
           if (event.type === 'reasoning') {
@@ -533,8 +568,7 @@ export class ChatStore {
               if (call && event.error) call.error = event.error;
             }
           } else if (event.type === 'done') {
-            finish(draft, event);
-            finished = true;
+            complete(event);
           } else if (event.type === 'error') throw new Error(errorMessage(event.error, event.status));
           if (Date.now() - shared > 1500) {  // let other tabs follow the answer as it grows
             shared = Date.now();
@@ -547,7 +581,13 @@ export class ChatStore {
       }
     } catch (error) {
       if (finished) { /* stopped after the complete answer arrived: keep it as finished */ }
-      else if (controller.signal.aborted && draft.content.trim()) draft.stopped = true;
+      else if (base && !(controller.signal.aborted && draft.content.length > base.content.length)) {
+        for (const key of VERSION_FIELDS) delete draft[key];
+        Object.assign(draft, base);  // a failed continuation leaves the answer as it was
+        if (!controller.signal.aborted) this.notice = error instanceof TypeError
+          ? '서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하고 다시 시도해 주세요.'
+          : error.message || '이어서 생성하지 못했습니다.';
+      } else if (controller.signal.aborted && draft.content.trim()) draft.stopped = true;
       else {
         chat.messages.splice(chat.messages.indexOf(draft), 1);
         const reason = controller.signal.aborted ? STOPPED : error instanceof TypeError
@@ -560,7 +600,7 @@ export class ChatStore {
       }
     } finally {
       if (draft.thinkStart && draft.thinkMs === undefined) draft.thinkMs = Date.now() - draft.thinkStart;
-      if (finished) draft.elapsedMs = Date.now() - started;
+      if (finished) draft.elapsedMs = Date.now() - started + (base?.elapsedMs || 0);
       delete draft.thinkStart;
       delete draft.streaming;
       delete draft.stage;
@@ -569,6 +609,7 @@ export class ChatStore {
         draft.versions = [...versions, snapshot(draft)].slice(-MAX_VERSIONS);
         draft.version = draft.versions.length - 1;
       }
+      if (base && draft.versions?.length) draft.versions[draft.version] = snapshot(draft);
       delete message.pending;
       this.busy = false;
       this.requestChat = null;

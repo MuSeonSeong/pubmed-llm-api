@@ -20,11 +20,15 @@ class ChatRequest(BaseModel):
     truncate_history: bool = False
     # Let the model reason before answering; the reasoning is returned separately.
     thinking: bool = False
+    # Extend the final assistant message instead of starting a new one; only the added text is returned.
+    continue_final: bool = False
 
     @model_validator(mode='after')
     def require_user_query(self):
         if not any(message.role == 'user' for message in self.messages):
             raise ValueError('At least one user message is required')
+        if self.continue_final and self.messages[-1].role != 'assistant':
+            raise ValueError('continue_final requires the last message to be from the assistant')
         return self
 
 class ToolTrace(BaseModel):
