@@ -1,10 +1,14 @@
 """FastAPI application used identically by native hosts and CPU containers."""
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+import json
+import math
 from pathlib import Path
+import threading
 import anyio
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from app.catalog import load_catalog
 from app.settings import Settings, ServiceError
@@ -12,6 +16,47 @@ from app.model_manager import ModelManager
 from app.pubmed import PubMedClient
 from app.schemas import ChatRequest, ChatResponse
 from app.chat_service import ChatService
+
+
+class EventStreamResponse(Response):
+    """Server-sent events whose producer is cancelled as soon as the client disconnects."""
+    media_type = 'text/event-stream'
+
+    def __init__(self, produce: Callable[[Callable[[dict], None], threading.Event], Awaitable[None]]):
+        super().__init__(headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
+        # The body length is unknown; a declared Content-Length would truncate the stream.
+        self.raw_headers = [(key, value) for key, value in self.raw_headers if key != b'content-length']
+        self.produce = produce
+
+    async def __call__(self, scope, receive, send):
+        cancel = threading.Event()
+        sender, events = anyio.create_memory_object_stream(math.inf)
+
+        async def run():
+            with sender:
+                await self.produce(sender.send_nowait, cancel)
+
+        async def watch_disconnect():
+            while (await receive())['type'] != 'http.disconnect':
+                pass
+            cancel.set()
+            group.cancel_scope.cancel()
+
+        await send({'type': 'http.response.start', 'status': 200, 'headers': self.raw_headers})
+        async with anyio.create_task_group() as group:
+            group.start_soon(run)
+            group.start_soon(watch_disconnect)
+            try:
+                async with events:
+                    async for event in events:
+                        data = 'data: ' + json.dumps(event, ensure_ascii=False) + '\n\n'
+                        await send({'type': 'http.response.body', 'body': data.encode(), 'more_body': True})
+                await send({'type': 'http.response.body', 'body': b'', 'more_body': False})
+            except OSError:
+                pass  # the client vanished mid-write
+            finally:
+                cancel.set()
+                group.cancel_scope.cancel()
 
 
 def create_app(settings: Settings | None = None, manager: ModelManager | None = None,
@@ -66,6 +111,8 @@ def create_app(settings: Settings | None = None, manager: ModelManager | None = 
     async def chat(request: ChatRequest):
         if request.model not in catalog:
             raise ServiceError('unknown_model', f'Unknown model: {request.model}', 422)
+        if request.stream:
+            return EventStreamResponse(lambda emit, cancel: service.stream(request, emit, cancel))
         return await service.complete(request)
 
     return application

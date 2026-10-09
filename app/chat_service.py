@@ -1,7 +1,10 @@
 """Bounded Qwen tool-call loop; every batch is validated before execution."""
+from collections.abc import Callable
 from dataclasses import dataclass
 import json
 import re
+import threading
+import anyio
 from app.model_manager import ModelManager
 from app.pubmed import PubMedClient, format_tool_result
 from app.schemas import ChatRequest, ChatResponse, Choice, AssistantMessage, ToolTrace
@@ -67,6 +70,25 @@ def clean_text(text: str) -> str:
         text = text.replace(token, '')
     return text.strip()
 
+MARKERS = ('<tool_call>', '<think>', '</think>', '<|im_end|>', '<|endoftext|>', '<|im_start|>')
+
+
+def visible_text(raw_text: str) -> str:
+    """Text safe to show while generation is still running: no tool calls or unfinished markers."""
+    text = raw_text.split('<tool_call>', 1)[0]
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.S).split('<think>', 1)[0]
+    for token in MARKERS:
+        text = text.replace(token, '')
+    tail = text.rfind('<')
+    if tail != -1 and any(marker.startswith(text[tail:]) for marker in MARKERS):
+        text = text[:tail]
+    return text.lstrip()
+
+
+def error_payload(exc: ServiceError) -> dict:
+    return {'code': exc.code, 'message': exc.message, 'details': exc.details}
+
+
 def append_citations(text: str, traces: list[ToolTrace]) -> str:
     pmids = []
     for trace in traces:
@@ -87,6 +109,35 @@ class ChatService:
         self.manager, self.pubmed = manager, pubmed
 
     async def complete(self, request: ChatRequest) -> ChatResponse:
+        return await self._run(request)
+
+    async def stream(self, request: ChatRequest, emit: Callable[[dict], None], cancel: threading.Event) -> None:
+        """Emit progress events on the event loop, ending with exactly one done or error event."""
+        try:
+            response = await self._run(request, emit, cancel)
+            emit({'type': 'done', **response.model_dump()})
+        except ServiceError as exc:
+            emit({'type': 'error', 'status': exc.status_code, 'error': error_payload(exc)})
+        except Exception as exc:
+            emit({'type': 'error', 'status': 500, 'error': {
+                'code': 'internal_error', 'message': str(exc) or 'Internal error', 'details': {}}})
+
+    def _text_relay(self, emit: Callable[[dict], None]) -> Callable[[str], None]:
+        shown = ''
+        def relay(raw_text: str) -> None:  # runs on the generation worker thread
+            nonlocal shown
+            text = visible_text(raw_text)
+            if len(text) > len(shown) and text.startswith(shown):
+                delta, shown = text[len(shown):], text
+                try:
+                    anyio.from_thread.run_sync(emit, {'type': 'delta', 'content': delta})
+                except Exception:
+                    pass  # the client is gone; cancellation stops generation shortly
+        return relay
+
+    async def _run(self, request: ChatRequest, emit: Callable[[dict], None] | None = None,
+                   cancel: threading.Event | None = None) -> ChatResponse:
+        notify = emit or (lambda event: None)
         messages = [message.model_dump() for message in request.messages]
         traces = []
         try:
@@ -98,8 +149,16 @@ class ChatService:
             if system:
                 messages.insert(0, {'role': 'system', 'content': '\n\n'.join(system)})
             while True:
+                if self.manager.status().get('loaded_model') != request.model:
+                    notify({'type': 'status', 'stage': 'loading_model', 'model': request.model})
+                notify({'type': 'status', 'stage': 'generating'})
+                stream = {'on_text': self._text_relay(emit), 'cancel': cancel} if emit else {}
                 result = await self.manager.generate(request.model, messages, tools,
-                                                     request.max_tokens, request.temperature)
+                                                     request.max_tokens, request.temperature, **stream)
+                if result.finish_reason == 'cancelled':
+                    return ChatResponse(model=request.model, choices=[Choice(
+                        message=AssistantMessage(content=visible_text(result.raw_text).strip()),
+                        finish_reason='cancelled')], tool_calls=traces)
                 calls = parse_tool_calls(result.raw_text, tools)
                 if not calls:
                     return ChatResponse(model=request.model, choices=[Choice(
@@ -114,14 +173,18 @@ class ChatService:
                     {'type': 'function', 'function': {'name': call.name, 'arguments': args}}
                     for call, args in zip(calls, validated)]})
                 for call, args in zip(calls, validated):
+                    notify({'type': 'tool', 'status': 'running', 'name': call.name, 'arguments': args})
                     try:
                         data = await self.pubmed.call(call.name, args)
                     except ServiceError as exc:
                         traces.append(ToolTrace(name=call.name, arguments=args, error=exc.message))
+                        notify({'type': 'tool', 'status': 'error', 'name': call.name, 'arguments': args,
+                                'error': exc.message})
                         raise
                     content = format_tool_result(data)
                     # Return the same bounded evidence that the model actually saw.
                     traces.append(ToolTrace(name=call.name, arguments=args, result=json.loads(content)))
+                    notify({'type': 'tool', 'status': 'done', 'name': call.name, 'arguments': args})
                     messages.append({'role': 'tool', 'name': call.name, 'content': content})
         except ServiceError as exc:
             exc.details['tool_calls'] = [trace.model_dump() for trace in traces]

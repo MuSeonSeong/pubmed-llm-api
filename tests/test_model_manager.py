@@ -172,3 +172,57 @@ def test_invalid_shard_index_is_not_ready(tmp_path,index):
     (p/'model.safetensors.index.json').write_text(json.dumps(index))
     manager=ModelManager(Settings(device='cpu',models_dir=tmp_path),load_catalog())
     assert manager.status()['model_files']['qwen3.5-2b'] is False
+
+
+class StreamingModel(Model):
+    def generate(self, **kw):
+        import torch
+        kw['streamer'].put(kw['input_ids'])
+        for token in (42, 99):
+            kw['streamer'].put(torch.tensor([token]))
+        kw['streamer'].end()
+        return super().generate(**kw)
+
+
+def test_streamer_reports_cumulative_completion_text(monkeypatch):
+    obj=manager(monkeypatch,loader=lambda spec:(StreamingModel(),Tokenizer()))
+    seen=[]
+    asyncio.run(obj.generate('qwen3-0.6b',[{'role':'user','content':'hi'}],[],10,0,on_text=seen.append))
+    assert len(seen) == 2
+    assert seen[-1].startswith('<tool_call>')
+
+
+def test_cancel_before_start_skips_generation(monkeypatch):
+    class Never(Model):
+        def generate(self, **kw):
+            raise AssertionError('generation should not start')
+    obj=manager(monkeypatch,loader=lambda spec:(Never(),Tokenizer()))
+    cancel=threading.Event()
+    cancel.set()
+    result=asyncio.run(obj.generate('qwen3-0.6b',[],[],10,0,cancel=cancel))
+    assert result.finish_reason == 'cancelled'
+
+
+def test_cancel_criteria_stops_running_generation():
+    import torch
+    from app.model_manager import CancelCriteria
+    cancel=threading.Event()
+    criteria=CancelCriteria(cancel)
+    ids=torch.ones((1,4),dtype=torch.long)
+    assert not criteria(ids,None).any()
+    cancel.set()
+    assert criteria(ids,None).all()
+
+
+def test_streamer_waits_for_complete_multibyte_characters(monkeypatch):
+    import torch
+    from app.model_manager import TextCallbackStreamer
+    class Partial:
+        def decode(self, ids, skip_special_tokens=False):
+            return '안\ufffd' if len(ids) == 1 else '안녕'
+    seen=[]
+    streamer=TextCallbackStreamer(Partial(),seen.append)
+    streamer.put(torch.ones((1,3)))
+    streamer.put(torch.tensor([1]))
+    streamer.put(torch.tensor([2]))
+    assert seen == ['안녕']

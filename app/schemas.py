@@ -1,4 +1,4 @@
-"""Public non-streaming chat contract."""
+"""Public chat contract; stream=true switches the response to server-sent events."""
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, FiniteFloat, model_validator
 
@@ -13,6 +13,7 @@ class ChatRequest(BaseModel):
     max_tokens: StrictInt = Field(default=512, ge=1, le=2048)
     temperature: FiniteFloat = Field(default=0.2, ge=0, le=2, strict=True)
     use_pubmed: bool = True
+    stream: bool = False
 
     @model_validator(mode='after')
     def require_user_query(self):

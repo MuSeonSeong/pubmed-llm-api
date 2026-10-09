@@ -78,3 +78,37 @@ def test_messages_without_user_query_are_422():
         r=c.post('/v1/chat/completions',json={'messages':[{'role':'system','content':'hello'}],'use_pubmed':False})
         assert r.status_code == 422
         assert g.messages == []
+
+
+def events_from(response):
+    return [json.loads(line[6:]) for line in response.text.split('\n') if line.startswith('data: ')]
+
+
+def test_streaming_chat_returns_server_sent_events():
+    c,g,p=client(['hello there'])
+    with c:
+        r=c.post('/v1/chat/completions',json={'messages':[{'role':'user','content':'hi'}],'use_pubmed':False,'stream':True})
+        assert r.status_code == 200
+        assert r.headers['content-type'].startswith('text/event-stream')
+        assert 'content-length' not in r.headers
+        events=events_from(r)
+        assert ''.join(e['content'] for e in events if e['type']=='delta') == 'hello there'
+        assert events[-1]['type'] == 'done'
+        assert events[-1]['choices'][0]['message']['content'] == 'hello there'
+
+
+def test_streaming_service_error_is_reported_in_stream():
+    c,g,p=client(offline=True)
+    with c:
+        r=c.post('/v1/chat/completions',json={'messages':[{'role':'user','content':'find'}],'stream':True})
+        assert r.status_code == 200
+        events=events_from(r)
+        assert events[-1]['type'] == 'error'
+        assert events[-1]['error']['code'] == 'pubmed_unavailable'
+
+
+def test_streaming_request_is_still_validated_before_streaming():
+    c,g,p=client()
+    with c:
+        r=c.post('/v1/chat/completions',json={'messages':[],'stream':True})
+        assert r.status_code == 422

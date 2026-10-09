@@ -13,11 +13,17 @@ class Generator:
     def __init__(self,outputs):
         self.outputs=iter(outputs)
         self.messages=[]
-    async def generate(self,model_id,messages,tools,max_tokens,temperature):
+    async def generate(self,model_id,messages,tools,max_tokens,temperature,on_text=None,cancel=None):
         self.messages.append(list(messages))
         value=next(self.outputs)
         if isinstance(value,Exception):
             raise value
+        if isinstance(value,GenerationResult):
+            return value
+        if on_text:
+            import anyio
+            # Like the real manager, report cumulative text from a worker thread.
+            await anyio.to_thread.run_sync(lambda:[on_text(value[:i]) for i in range(1,len(value)+1)])
         return GenerationResult(value,'stop',10,5)
     def status(self):
         return {'device':'cpu','loaded_model':None,'model_files':{'qwen3-0.6b':True,'qwen3.5-2b':True}}
@@ -145,3 +151,58 @@ def test_tool_answer_always_contains_grounded_pubmed_link():
     r,_,_=complete([call(),'Summary without citations'])
     assert '31542292' in r.choices[0].message.content
     assert 'https://pubmed.ncbi.nlm.nih.gov/31542292/' in r.choices[0].message.content
+
+
+def stream(outputs,pubmed=None,cancel=None,**kw):
+    import threading
+    from app.chat_service import ChatService
+    from app.schemas import ChatRequest
+    events=[]
+    request=ChatRequest(messages=[{'role':'user','content':'question'}],stream=True,**kw)
+    asyncio.run(ChatService(Generator(outputs),pubmed or PubMed()).stream(request,events.append,cancel or threading.Event()))
+    return events
+
+
+def test_stream_emits_text_deltas_tool_progress_and_final_answer():
+    events=stream([call(),'Answer text<|im_end|>'])
+    kinds=[e['type'] for e in events]
+    assert kinds[-1] == 'done' and kinds.count('done') == 1
+    tools=[(e['status'],e['name']) for e in events if e['type']=='tool']
+    assert tools == [('running',SEARCH),('done',SEARCH)]
+    deltas=''.join(e['content'] for e in events if e['type']=='delta')
+    assert deltas == 'Answer text'
+    assert '<tool_call>' not in deltas
+    final=events[-1]
+    assert final['choices'][0]['message']['content'].startswith('Answer text')
+    assert '31542292' in final['choices'][0]['message']['content']
+    assert len(final['tool_calls']) == 1
+    assert {'type':'status','stage':'loading_model','model':'qwen3.5-2b'} in events
+
+
+def test_stream_failure_ends_with_error_event_and_traces():
+    events=stream([call()*3,call()*2])
+    assert events[-1]['type'] == 'error'
+    assert events[-1]['status'] == 502
+    assert events[-1]['error']['code'] == 'tool_limit'
+    assert len(events[-1]['error']['details']['tool_calls']) == 3
+
+
+def test_cancelled_generation_finishes_with_partial_text():
+    events=stream([GenerationResult('Partial answer <tool_','cancelled',3,2)],use_pubmed=False)
+    assert events[-1]['type'] == 'done'
+    assert events[-1]['choices'][0]['finish_reason'] == 'cancelled'
+    assert events[-1]['choices'][0]['message']['content'] == 'Partial answer'
+
+
+@pytest.mark.parametrize('raw,shown',[
+    ('Hello <tool_call>{"name"', 'Hello '),
+    ('Hello <tool', 'Hello '),
+    ('Hello <|im_e', 'Hello '),
+    ('<think>plan</think>\n\nHi', 'Hi'),
+    ('<think>still thinking', ''),
+    ('a < b and c', 'a < b and c'),
+    ('Done<|im_end|>', 'Done'),
+])
+def test_visible_text_hides_markup_until_it_is_unambiguous(raw,shown):
+    from app.chat_service import visible_text
+    assert visible_text(raw) == shown
