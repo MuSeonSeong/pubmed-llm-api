@@ -1,4 +1,4 @@
-const STORAGE_KEY = 'pubmed-chat.v1';
+const STORAGE_KEY = 'pubmed-chat.v1';  // the browser-only history from before chats lived on the server
 const MODELS = ['qwen3.5-2b', 'qwen3-0.6b'];
 export const MODEL_LABELS = { 'qwen3.5-2b': 'Qwen3.5 · 2B', 'qwen3-0.6b': 'Qwen3 · 0.6B' };
 /** Small local models have a few thousand tokens of context, so attachments are capped. */
@@ -9,7 +9,12 @@ export const VISION_MODELS = ['qwen3.5-2b'];
 export const MAX_IMAGES = 4;  // per request, matching the server
 export const MAX_ATTACHMENTS = 8;  // per message
 const IMAGE_URL = /^data:image\/(?:png|jpeg|webp|gif);base64,[A-Za-z0-9+/=]+$/;
+/** Pictures uploaded to the server are referenced by URL; only older ones are stored inline as data URLs. */
+export const FILE_URL = /^\/api\/files\/([A-Za-z0-9_-]{8,64})$/;
+/** Chat ids the server accepts in its URLs (ids made here are UUIDs). */
+export const CHAT_ID = /^[A-Za-z0-9_-]{1,64}$/;
 export const isImage = file => file?.kind === 'image';
+export const imageSource = file => file.url || file.dataUrl;
 export const DEFAULT_SETTINGS = Object.freeze({ systemPrompt: '', temperature: 0.2, maxTokens: 512 });
 const id = () => globalThis.crypto.randomUUID();
 const freshChat = () => ({ id: id(), title: '새 대화', model: MODELS[0],
@@ -49,6 +54,8 @@ function restoreAttachments(files) {
   return files.filter(file => file && typeof file.name === 'string').map(file => {
     const name = file.name.slice(0, 200);
     if (isImage(file)) {
+      const stored = typeof file.url === 'string' && file.url.match(FILE_URL);
+      if (stored) return { name, kind: 'image', fileId: stored[1], url: file.url };
       // removed: the picture was dropped to free browser storage; only its name remains.
       const dataUrl = typeof file.dataUrl === 'string' && file.dataUrl.length < 4_000_000 && IMAGE_URL.test(file.dataUrl)
         ? file.dataUrl : undefined;
@@ -135,6 +142,15 @@ function restoreSettings(value) {
       ? number(value.maxTokens, 1, 2048, DEFAULT_SETTINGS.maxTokens) : DEFAULT_SETTINGS.maxTokens };
 }
 
+/** Take settings saved elsewhere (the server), checked like stored ones; true if anything changed. */
+export function adoptSettings(store, value) {
+  const settings = restoreSettings(value);
+  if (JSON.stringify(settings) === JSON.stringify(store.settings)) return false;
+  store.settings = settings;
+  store.emit();
+  return true;
+}
+
 /** Validate a stored chat. In-progress requests are kept as-is; settleInterrupted() decides if they died. */
 const MAX_BRANCHES = 10;
 const branchOf = (message, tail) => ({ content: message.content, tail,
@@ -183,18 +199,20 @@ function restoreMessages(list, depth = 0) {
       ...restoreBranches(message, depth) }));
 }
 
-function restoreChat(chat) {
+export function restoreChat(chat) {
   if (!chat || typeof chat.id !== 'string' || typeof chat.title !== 'string'
       || !Array.isArray(chat.messages)) return null;
   const messages = restoreMessages(chat.messages);
+  const rev = Number.isFinite(chat.rev) ? chat.rev : Number(chat.updatedAt) || 0;
   return { id: chat.id, title: chat.title, model: MODELS.includes(chat.model) ? chat.model : MODELS[0],
     usePubmed: chat.usePubmed !== false, thinking: chat.thinking === true, pinned: chat.pinned === true,
     ...(chat.autoTitle === true ? { autoTitle: true } : {}), messages,
     updatedAt: Number(chat.updatedAt) || Date.now(),
-    rev: Number.isFinite(chat.rev) ? chat.rev : Number(chat.updatedAt) || 0 };
+    rev: Math.max(0, Math.floor(rev)) };  // the server compares revisions as integers
 }
 
-const inProgress = chat => chat.messages.some(message => message.pending || message.streaming);
+/** Whether a chat has a question waiting for (or receiving) its answer. */
+export const inProgress = chat => chat.messages.some(message => message.pending || message.streaming);
 const LOCK_PREFIX = 'pubmed-chat:';
 
 /** Turn a request whose tab is gone into a stopped answer or a retryable question; true if changed. */
@@ -227,6 +245,9 @@ function errorMessage(error, status) {
     pubmed_timeout: 'PubMed 연결 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.',
     pubmed_unavailable: 'PubMed에 연결할 수 없습니다. 잠시 후 다시 시도하거나 PubMed 검색을 꺼 주세요.',
     tool_limit: '논문 검색 단계가 너무 많아 중단됐습니다. 요청을 더 구체적으로 줄여 주세요.',
+    invalid_image: '첨부한 이미지를 읽을 수 없습니다. 이미지를 다시 첨부해 주세요.',
+    busy: '이 계정에서 이미 다른 답변을 만들고 있어요. 그 답변이 끝난 뒤 다시 시도해 주세요.',
+    unauthorized: '로그인이 필요합니다. 다시 로그인해 주세요.',
   };
   if (hints[error?.code]) return hints[error.code];
   if (status === 413) return hints.context_overflow;
@@ -279,32 +300,39 @@ export class ChatStore {
    * locks: the Web Locks API. The answering tab holds a lock per chat, so other tabs can tell a request
    * that is still running elsewhere from one whose tab was closed. Without it, requests found in storage
    * are treated as interrupted.
+   * storageKey: where this browser keeps its copy. cacheOnly: that copy only caches the server's, so a
+   * full browser storage costs neither pictures nor a warning.
    */
   constructor(storage = globalThis.localStorage, fetcher = globalThis.fetch,
-    { locks = globalThis.navigator?.locks, autoTitles = false } = {}) {
+    { locks = globalThis.navigator?.locks, autoTitles = false, storageKey = STORAGE_KEY, cacheOnly = false } = {}) {
     this.autoTitles = autoTitles;  // ask the model for a short title after a chat's first answer
     this.storage = storage;
+    this.storageKey = storageKey;
+    this.cacheOnly = cacheOnly;
+    this.cacheFailed = false;  // the last save could not be written to browser storage
     this.fetcher = fetcher;
     this.locks = locks || null;
     this.liveChats = new Set();  // chats another tab is answering right now
+    this.remoteLive = new Set();  // chats the server reports as being answered, possibly on another device
     this.busy = false;
     this.controller = null;
     this.notice = '';
     this.onChange = () => {};
+    this.onSaved = () => {};
     this.storageWarning = '';
     this.chats = [];
     this.deleted = new Set();
     this.requestChat = null;
     this.settings = { ...DEFAULT_SETTINGS };
     try {
-      const saved = JSON.parse(storage.getItem(STORAGE_KEY) || 'null');
+      const saved = JSON.parse(storage.getItem(storageKey) || 'null');
       if (Array.isArray(saved?.chats)) this.chats = saved.chats.map(restoreChat).filter(Boolean);
       if (Array.isArray(saved?.deleted)) this.deleted = new Set(saved.deleted.filter(item => typeof item === 'string'));
       this.settings = restoreSettings(saved?.settings);
       this.activeId = this.chats.some(chat => chat.id === saved?.activeId)
         ? saved.activeId : this.chats[0]?.id;
     } catch {
-      this.storageWarning = '대화 기록을 불러오지 못했습니다. 새 대화로 시작합니다.';
+      if (!cacheOnly) this.storageWarning = '대화 기록을 불러오지 못했습니다. 새 대화로 시작합니다.';
     }
     if (!this.chats.length) {
       this.chats = [freshChat()];
@@ -325,19 +353,23 @@ export class ChatStore {
     chat.rev = Math.max(Date.now(), (chat.rev || 0) + 1);
   }
 
-  /** Ask the browser which chats another tab is still answering; settle the rest. */
+  /**
+   * Ask the browser which chats another tab is still answering; settle the rest. A chat the server
+   * reports as being answered (remoteLive, kept by the sync) counts like a lock held here.
+   */
   async refreshLive() {
-    if (!this.locks) return;
-    let held;
-    try { held = new Set((await this.locks.query()).held.map(lock => lock.name)); } catch { return; }
+    let held = new Set();
+    if (this.locks) {
+      try { held = new Set((await this.locks.query()).held.map(lock => lock.name)); } catch { return; }
+    }
     // The answering tab saves its final state before releasing the lock, so read storage again now:
     // otherwise a released lock could make us settle an older copy than the one already saved.
-    try { this.merge(JSON.parse(this.storage.getItem(STORAGE_KEY) || 'null')); } catch { /* keep what we have */ }
+    try { this.merge(JSON.parse(this.storage.getItem(this.storageKey) || 'null')); } catch { /* keep what we have */ }
     let changed = false;
     const live = new Set();
     for (const chat of this.chats) {
       if (chat === this.requestChat || !inProgress(chat)) continue;
-      if (held.has(LOCK_PREFIX + chat.id)) live.add(chat.id);
+      if (held.has(LOCK_PREFIX + chat.id) || this.remoteLive.has(chat.id)) live.add(chat.id);
       // No touch(): a settled copy must never outrank a real save that arrives later.
       else if (settleInterrupted(chat)) changed = true;
     }
@@ -375,29 +407,35 @@ export class ChatStore {
   /** Called when another tab wrote to storage. */
   sync() {
     try {
-      this.merge(JSON.parse(this.storage.getItem(STORAGE_KEY) || 'null'), { adoptSettings: true });
+      this.merge(JSON.parse(this.storage.getItem(this.storageKey) || 'null'), { adoptSettings: true });
     } catch { return; }
     this.onChange();
     return this.refreshLive();
   }
 
+  /** Write the browser copy, then tell onSaved (the server sync) even if browser storage was full. */
   save() {
-    try { this.merge(JSON.parse(this.storage.getItem(STORAGE_KEY) || 'null')); } catch { /* unreadable: overwrite */ }
+    try { this.merge(JSON.parse(this.storage.getItem(this.storageKey) || 'null')); } catch { /* unreadable: overwrite */ }
     while (true) {
       try {
-        this.storage.setItem(STORAGE_KEY, JSON.stringify({ chats: this.chats, activeId: this.activeId,
+        this.storage.setItem(this.storageKey, JSON.stringify({ chats: this.chats, activeId: this.activeId,
           settings: this.settings, deleted: [...this.deleted].slice(-300) }));
-        return;
+        this.cacheFailed = false;
+        break;
       } catch {
+        this.cacheFailed = true;
+        // Trimming a cache would later upload the trimmed copy over the server's complete one.
+        if (this.cacheOnly) break;
         // Pictures are by far the largest data; give up old ones before giving up the history.
         if (dropOldImages(this.chats, this.activeId)) {
           this.storageWarning = '브라우저 저장 공간이 부족해 오래된 대화의 이미지를 지웠어요.';
           continue;
         }
         this.storageWarning = '브라우저에 기록을 저장할 수 없습니다. 페이지를 닫으면 대화가 사라질 수 있습니다.';
-        return;
+        break;
       }
     }
+    this.onSaved();
   }
 
   emit() { this.save(); this.onChange(); }
@@ -469,6 +507,22 @@ export class ChatStore {
   }
 
   /**
+   * Add chats kept elsewhere (the browser history from before the server) as fresh edits, so the sync
+   * uploads them. Nothing is answering them any more, so interrupted requests are settled first.
+   */
+  importChats(list) {
+    const chats = list.map(restoreChat).filter(Boolean);
+    chats.forEach(settleInterrupted);
+    this.merge({ chats });
+    for (const { id: chatId } of chats) {
+      const chat = this.chats.find(item => item.id === chatId);
+      if (chat && chat !== this.requestChat) this.touch(chat);
+    }
+    this.emit();
+    return chats.length;
+  }
+
+  /**
    * Mark this tab busy and take the chat's lock before changing anything, so a refused request leaves
    * the chat untouched. Returns the lock release, or null when another tab is answering this chat.
    */
@@ -487,7 +541,7 @@ export class ChatStore {
     this.busy = false;
     this.requestChat = null;
     this.liveChats.add(chat.id);
-    this.notice = '다른 탭에서 이 대화의 답변을 만들고 있어요.';
+    this.notice = '다른 탭이나 기기에서 이 대화의 답변을 만들고 있어요.';
     this.onChange();
     return null;
   }
@@ -643,7 +697,7 @@ export class ChatStore {
       const fetcher = this.fetcher;
       const response = await fetcher('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model: chat.model, messages: [{ role: 'user', content: prompt }], max_tokens: 24,
-          temperature: 0.2, use_pubmed: false }) });
+          temperature: 0.2, use_pubmed: false, ...chatIdField(chat) }) });
       if (!response.ok) return;
       const text = (await response.json()).choices?.[0]?.message?.content;
       const title = typeof text === 'string' ? text.split('\n').map(line => line.trim()).find(Boolean) : '';
@@ -665,7 +719,7 @@ export class ChatStore {
     for (const message of [...chat.messages].reverse()) {
       if (message.error) continue;
       for (const file of [...(message.attachments || [])].reverse()) {
-        if (isImage(file) && file.dataUrl && chosen.size < MAX_IMAGES) chosen.add(file);
+        if (isImage(file) && imageSource(file) && chosen.size < MAX_IMAGES) chosen.add(file);
       }
     }
     return chosen;
@@ -718,7 +772,7 @@ export class ChatStore {
           max_tokens: chat.thinking && !continueFrom ? Math.max(this.settings.maxTokens, THINKING_MIN_TOKENS)
             : this.settings.maxTokens,
           temperature: this.settings.temperature, use_pubmed: chat.usePubmed && !continueFrom, stream: true,
-          truncate_history: true, ...(chat.thinking && !continueFrom ? { thinking: true } : {}),
+          truncate_history: true, ...chatIdField(chat), ...(chat.thinking && !continueFrom ? { thinking: true } : {}),
           ...(continueFrom ? { continue_final: true } : {}) }),
       });
       if (!response.ok) {
@@ -828,9 +882,12 @@ function userContent(message, sentImages) {
   const omitted = images.filter(file => !sentImages.has(file)).map(file => '[이미지 생략: ' + file.name + ']');
   const text = [messageText(message), ...omitted].join('\n\n');
   const parts = images.filter(file => sentImages.has(file))
-    .map(file => ({ type: 'image_url', image_url: { url: file.dataUrl } }));
+    .map(file => ({ type: 'image_url', image_url: { url: imageSource(file) } }));  // the server resolves /api/files URLs
   return parts.length ? [...parts, { type: 'text', text }] : text;
 }
+
+/** Tells the server which chat a request answers, so the user's other devices show it as running. */
+const chatIdField = chat => (CHAT_ID.test(chat.id) ? { chat_id: chat.id } : {});
 
 /** Drop picture data, oldest chats first, to fit browser storage; returns whether anything was dropped. */
 function dropOldImages(chats, keepChatId) {

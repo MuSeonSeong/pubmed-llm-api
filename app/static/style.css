@@ -81,10 +81,18 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .chat-action .icon { width: 14px; height: 14px; }
 .chat-row:hover .chat-action, .chat-row:focus-within .chat-action, .chat-row.active .chat-action { opacity: 1; }
 .rename-input { flex: 1; min-width: 0; margin: 3px; padding: 7px 8px; border: 1px solid var(--green); border-radius: 6px; background: var(--surface); font-size: 12.5px; outline: 0; }
-.sidebar-footer { padding: 18px 10px 0; border-top: 1px solid var(--line-2); margin-top: 16px; }
-.local-label { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--ink-2); }
-.local-dot, .status-dot { width: 6px; height: 6px; display: inline-block; border-radius: 50%; background: #6d9d71; }
-.sidebar-footer p { color: var(--faint); font-size: 10.5px; margin: 9px 0 14px; }
+.sidebar-footer { padding: 16px 10px 0; border-top: 1px solid var(--line-2); margin-top: 16px; }
+.local-dot, .status-dot { width: 6px; height: 6px; display: inline-block; border-radius: 50%; background: #6d9d71; flex-shrink: 0; }
+.account-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 28px; }
+.account { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; font-weight: 550; color: var(--ink-2); }
+.account-avatar { width: 24px; height: 24px; flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center; border-radius: 50%; background: var(--green-soft); color: var(--accent-text); font-size: 11px; font-weight: 650; }
+.account-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.logout-button { flex-shrink: 0; padding: 4px 11px; font-size: 11px; }
+.sync-status { display: flex; align-items: center; gap: 7px; margin-top: 9px; font-size: 11px; color: var(--muted); }
+.sync-dot { width: 6px; height: 6px; flex-shrink: 0; border-radius: 50%; background: #6d9d71; }
+.sync-status[data-state="syncing"] .sync-dot { background: var(--warn); animation: pulse 1.3s infinite; }
+.sync-status[data-state="offline"] .sync-dot, .sync-status[data-state="unauthorized"] .sync-dot { background: #c36a53; }
+.sidebar-footer p { color: var(--faint); font-size: 10.5px; line-height: 1.6; margin: 8px 0 12px; word-break: keep-all; }
 .sidebar-footer a { color: var(--muted); text-decoration: none; font-size: 11px; }
 .sidebar-footer a:hover { color: var(--green); }
 .main-panel { min-width: 0; flex: 1; display: flex; flex-direction: column; position: relative; }
@@ -164,6 +172,7 @@ button, a, select, textarea, input { -webkit-tap-highlight-color: transparent; }
 .toggles { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .attach-button { width: 30px; height: 30px; border-radius: 50%; }
 .attach-button .icon { width: 17px; height: 17px; }
+.attach-button.busy { color: var(--green); animation: pulse 1.3s infinite; }
 .composer.dragging { border-color: var(--green); border-style: dashed; background: var(--green-soft); }
 .attachment-list { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
 .message-user .attachment-list { justify-content: flex-end; margin-bottom: 6px; max-width: 85%; }
@@ -277,6 +286,21 @@ kbd { font-family: inherit; font-size: 11px; border: 1px solid var(--line-2); bo
 .setup-notice code { display: block; margin-top: 8px; padding: 8px 10px; border-radius: 7px; background: var(--code-bg); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; user-select: all; overflow-x: auto; white-space: nowrap; }
 .settings-data { display: flex; flex-wrap: wrap; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line); }
 
+/* Sign-in page */
+.login-page { min-height: 100dvh; display: flex; }
+.login-shell { flex: 1; display: flex; align-items: center; justify-content: center; padding: 32px 16px; }
+.login-card { width: min(380px, 100%); background: var(--surface); border: 1px solid var(--line-2); border-radius: 18px; padding: 30px 28px 26px; box-shadow: 0 10px 40px var(--shadow); word-break: keep-all; overflow-wrap: anywhere; }
+.login-brand { margin-bottom: 28px; }
+.login-card h1 { font-size: 21px; font-weight: 650; letter-spacing: -.6px; margin: 0 0 8px; }
+.login-lead { color: var(--muted); font-size: 12.5px; line-height: 1.7; margin: 0 0 22px; }
+.login-form { display: flex; flex-direction: column; gap: 14px; }
+.login-form input { border: 1px solid var(--line-2); border-radius: 9px; background: var(--paper); padding: 10px 12px; font-size: 14px; }
+.login-form input:focus { outline: 0; border-color: var(--green); }
+.login-error { margin: 0; color: var(--danger); font-size: 12.5px; line-height: 1.6; }
+.login-submit { height: 42px; margin-top: 4px; border-radius: 10px; font-size: 13.5px; font-weight: 600; }
+.login-submit:disabled { opacity: .7; }
+.login-note { margin: 18px 0 0; color: var(--faint); font-size: 11.5px; line-height: 1.7; }
+
 .sidebar-backdrop { display: none; }
 .sidebar-collapsed .sidebar { display: none; }
 .sidebar-collapsed #open-sidebar { display: inline-flex !important; }
@@ -318,5 +342,8 @@ kbd { font-family: inherit; font-size: 11px; border: 1px solid var(--line-2); bo
   .composer-note { font-size: 10px; padding: 0 6px; }
   .chat-action { opacity: 1; }
   .scroll-bottom { bottom: 140px; }
+  .login-shell { align-items: flex-start; padding-top: max(24px, 8vh); }
+  .login-card { padding: 24px 20px 22px; border-radius: 16px; }
+  .login-form input { font-size: 16px; }  /* smaller text makes iOS zoom into the field */
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

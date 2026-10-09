@@ -1,5 +1,6 @@
 import { ATTACHMENT_LIMIT, ChatStore, MAX_ATTACHMENTS, MAX_IMAGES, MODEL_LABELS, VISION_MODELS, attachmentTokenBudget,
-  chatMarkdown, estimateTokens, isImage, readAttachments, renderMarkdown, withoutCitationList } from './chat.mjs';
+  chatMarkdown, estimateTokens, imageSource, isImage, readAttachments, renderMarkdown, withoutCitationList } from './chat.mjs';
+import { RemoteSync, forgetCache, importLegacy, legacyChats, skipLegacy, uploadImage } from './sync.mjs';
 
 const $ = id => document.getElementById(id);
 const icon = name => {
@@ -29,8 +30,48 @@ const iconButton = (name, label, onClick) => {
 
 let storage;
 try { storage = window.localStorage; }
-catch { storage = { getItem: () => null, setItem: () => { throw Error('Storage unavailable'); } }; }
-const store = new ChatStore(storage, undefined, { autoTitles: true });
+catch { storage = { getItem: () => null, setItem: () => { throw Error('Storage unavailable'); }, removeItem: () => {} }; }
+
+let leaving = false;
+/** The server answers 401 once a session expired or was signed out: sign in again. */
+function signIn() {
+  if (leaving) return;
+  leaving = true;
+  location.replace('/login');
+}
+
+/** Who is signed in decides whose history this page shows, so nothing starts before the server says. */
+async function loadSession() {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const response = await fetch('/api/session', { cache: 'no-store' });
+      const data = await response.json();
+      if (response.ok && typeof data?.auth_enabled === 'boolean') return data;
+    } catch { /* tried again below */ }
+    setupNotice(['서버에 연결할 수 없습니다. 다시 연결하는 중이에요…']);
+    await new Promise(resolve => setTimeout(resolve, Math.min(2000 * 2 ** attempt, 30000)));
+  }
+}
+
+const session = await loadSession();
+setupNotice(null);
+if (session.auth_enabled && !session.user) {
+  signIn();
+  await new Promise(() => {});  // the page is being replaced
+}
+const accounts = session.auth_enabled;  // false: one implicit user on this PC, no sign-in
+const userName = typeof session.user?.name === 'string' ? session.user.name : 'local';
+
+/** fetch for this server's API; any 401 (sync, answers, uploads, PDFs) leads to the sign-in page. */
+async function api(url, init) {
+  const response = await fetch(url, init);
+  if (response.status === 401) signIn();
+  return response;
+}
+
+const store = new ChatStore(storage, api, { autoTitles: true, storageKey: 'pubmed-chat.v2:' + userName,
+  cacheOnly: true });
+const sync = new RemoteSync(store, { fetcher: api, storage, onStatus: showSyncStatus, onNotice: text => toast(text) });
 const prompt = $('prompt');
 const conversation = $('conversation');
 const THEME_KEY = 'pubmed-chat.theme';
@@ -44,6 +85,7 @@ let followOutput = true;
 let toastTimer;
 let renderQueued = false;
 let pendingFiles = [];
+let attaching = 0;  // attachFiles calls still reading or uploading
 let contextTokens = 8192;  // updated from /health
 let speakingId = null;
 const canSpeak = 'speechSynthesis' in window && 'SpeechSynthesisUtterance' in window;
@@ -143,7 +185,7 @@ function renderHistory() {
     pin.classList.add('chat-action');
     if (chat.pinned) pin.classList.add('pinned');
     const remove = iconButton('trash', chat.title + ' 대화 삭제', () => {
-      if (confirm('이 대화를 삭제할까요? 브라우저에 저장된 기록이 삭제됩니다.')) store.remove(chat.id);
+      if (confirm('이 대화를 삭제할까요? 서버에서 지워져 모든 기기에서 사라집니다.')) store.remove(chat.id);
     });
     remove.classList.add('chat-action');
     remove.disabled = !store.canModify(chat);
@@ -166,11 +208,19 @@ function fileChips(files, onRemove) {
   const list = element('div', 'attachment-list');
   files.forEach((file, index) => {
     const chip = element('span', 'attachment-chip' + (isImage(file) ? ' image-chip' : ''));
-    if (isImage(file) && file.dataUrl) {
+    // A local preview while composing; then the uploaded copy or a base64 raster data URL, as checked on restore.
+    const source = isImage(file) ? file.preview || imageSource(file) : null;
+    if (source) {
       chip.title = file.name;
       const picture = element('img', 'attachment-image');
-      picture.src = file.dataUrl;  // restoreAttachments only keeps base64 raster data URLs
+      picture.src = source;
       picture.alt = file.name;
+      picture.addEventListener('error', () => {  // e.g. the file is gone from the server
+        chip.classList.remove('image-chip');
+        chip.title = file.name + ' · 이미지를 불러오지 못했어요';
+        picture.replaceWith(icon('file'), element('span', 'attachment-name', file.name),
+          element('span', 'attachment-size', '불러올 수 없음'));
+      }, { once: true });
       chip.append(picture);
     } else if (isImage(file)) {
       chip.title = file.name + ' · 저장 공간이 부족해 이미지를 지웠어요';
@@ -529,13 +579,18 @@ function updateScrollButton() {
 function renderPendingFiles() {
   $('attachments').hidden = !pendingFiles.length;
   $('attachments').replaceChildren(...fileChips(pendingFiles, index => {
-    pendingFiles.splice(index, 1);
+    revokePreviews(pendingFiles.splice(index, 1));
     renderPendingFiles();
     updateComposer();
   }).children);
 }
 
-/** Downscale to at most 1024 px and re-encode as JPEG: the model sees ~512 px anyway, and it saves storage. */
+const revokePreviews = files => files.forEach(file => file.preview && URL.revokeObjectURL(file.preview));
+
+/**
+ * Downscale to at most 1024 px and re-encode as JPEG (the model sees ~512 px anyway), then upload it so
+ * chats refer to the server's copy. If the upload fails the picture travels inline inside the chat.
+ */
 async function readImage(file) {
   let bitmap;
   try { bitmap = await createImageBitmap(file); }
@@ -549,7 +604,17 @@ async function readImage(file) {
   context.fillRect(0, 0, canvas.width, canvas.height);
   context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   bitmap.close();
-  return { name: file.name || '붙여넣은 이미지.jpg', kind: 'image', dataUrl: canvas.toDataURL('image/jpeg', 0.85) };
+  const name = file.name || '붙여넣은 이미지.jpg';
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.85));
+  if (blob) {
+    try {
+      return { name, kind: 'image', ...await uploadImage(api, blob), preview: URL.createObjectURL(blob) };
+    } catch (error) {
+      toast(error.code === 'storage_quota' ? '서버의 내 저장 공간이 가득 차서 이미지를 대화에 직접 담았어요.'
+        : '이미지를 서버에 올리지 못해 대화에 직접 담았어요.');
+    }
+  }
+  return { name, kind: 'image', dataUrl: canvas.toDataURL('image/jpeg', 0.85) };
 }
 
 const isPdf = file => file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
@@ -558,7 +623,7 @@ const isPdf = file => file.type === 'application/pdf' || /\.pdf$/i.test(file.nam
 async function readPdf(file) {
   let response;
   try {
-    response = await fetch('/v1/documents/extract', { method: 'POST', body: file,
+    response = await api('/v1/documents/extract', { method: 'POST', body: file,
       headers: { 'Content-Type': 'application/pdf' } });
   } catch { throw new Error('서버에 연결할 수 없어 PDF를 읽지 못했어요.'); }
   const data = await response.json().catch(() => ({}));
@@ -581,6 +646,8 @@ async function attachFiles(files) {
   const used = pendingTexts.reduce((sum, file) => sum + file.text.length, 0);
   const usedTokens = pendingTexts.reduce((sum, file) => sum + estimateTokens(file.text), 0);
   const tokenBudget = attachmentTokenBudget(contextTokens);
+  attaching++;  // uploads take a moment; a message sent meanwhile would leave pictures behind
+  updateComposer();
   try {
     const slots = () => MAX_ATTACHMENTS - pendingFiles.length;
     const room = Math.min(MAX_IMAGES - pendingFiles.filter(isImage).length, slots());
@@ -604,6 +671,7 @@ async function attachFiles(files) {
       }
     }
   } catch (error) { toast(error.message || '파일을 읽을 수 없습니다.'); }
+  attaching--;
   renderPendingFiles();
   updateComposer();
   prompt.focus();
@@ -620,7 +688,8 @@ function announce() {
 function updateComposer() {
   $('send').hidden = store.busy;
   $('stop').hidden = !store.busy;
-  $('send').disabled = store.liveChats.has(store.current.id) || (!prompt.value.trim() && !pendingFiles.length);
+  $('send').disabled = attaching > 0 || store.liveChats.has(store.current.id) || (!prompt.value.trim() && !pendingFiles.length);
+  $('attach').classList.toggle('busy', attaching > 0);
   prompt.style.height = 'auto';
   prompt.style.height = Math.min(prompt.scrollHeight, 220) + 'px';
 }
@@ -643,7 +712,7 @@ function render() {
   $('export-chat').hidden = !chat.messages.length;
   if (store.notice) { toast(store.notice); store.notice = ''; }
   $('attach').disabled = locked;
-  prompt.placeholder = elsewhere ? '다른 탭에서 이 대화의 답변을 만들고 있어요' : '메시지를 입력하세요';
+  prompt.placeholder = elsewhere ? '다른 탭이나 기기에서 이 대화의 답변을 만들고 있어요' : '메시지를 입력하세요';
   $('chat-form').classList.toggle('locked', elsewhere);
   announce();
   renderHistory();
@@ -658,9 +727,10 @@ function scheduleRender() {
 }
 
 store.onChange = scheduleRender;
-window.addEventListener('storage', event => { if (event.key === 'pubmed-chat.v1') store.sync(); });
+window.addEventListener('storage', event => { if (event.key === store.storageKey) store.sync(); });
 $('chat-form').addEventListener('submit', event => {
   event.preventDefault();
+  if (attaching) { toast('첨부를 준비하고 있어요. 잠시 후 보내 주세요.'); return; }
   if (!store.canModify() || (!prompt.value.trim() && !pendingFiles.length)) return;
   if (pendingFiles.some(isImage) && !VISION_MODELS.includes(store.current.model)) {
     store.updateChat({ model: VISION_MODELS[0] });  // never send a picture to a model that cannot see it
@@ -673,7 +743,8 @@ $('chat-form').addEventListener('submit', event => {
   renderPendingFiles();
   followOutput = true;
   updateComposer();
-  store.send(content, files);
+  store.send(content, files);  // keeps the uploaded copies; local previews are no longer shown
+  revokePreviews(files);
   prompt.focus();
 });
 $('stop').addEventListener('click', () => { store.stop(); prompt.focus(); });
@@ -821,7 +892,7 @@ $('export-chats').addEventListener('click', () => {
   'application/json', 'pubmed-chat-' + new Date().toISOString().slice(0, 10) + '.json');
 });
 $('clear-chats').addEventListener('click', () => {
-  if (store.busy || !confirm('모든 대화를 삭제할까요? 이 작업은 되돌릴 수 없습니다.')) return;
+  if (store.busy || !confirm('모든 대화를 삭제할까요? 서버에서 지워져 모든 기기에서 사라지며, 되돌릴 수 없습니다.')) return;
   for (const chat of [...store.chats]) store.remove(chat.id);
   $('settings-dialog').close();
   toast('모든 대화를 삭제했습니다.');
@@ -840,7 +911,7 @@ async function checkServer() {
     const response = await fetch('/health', { signal: AbortSignal.timeout(5000) });
     if (!response.ok) throw Error('offline');
     const health = await response.json();
-    const ready = health.ready_for_chat;
+    const ready = health.ready_for_chat !== false;
     $('server-status').classList.toggle('offline', !ready);
     $('server-status').lastElementChild.textContent = ready ? '서버 연결됨' : '모델 준비 필요';
     if (Number.isInteger(health.inference?.max_context_tokens)) contextTokens = health.inference.max_context_tokens;
@@ -849,18 +920,96 @@ async function checkServer() {
       + ' · 메모리의 모델: ' + (MODEL_LABELS[loaded] || '없음 (첫 질문 때 불러옵니다)')
       + ' · PubMed: ' + ({ available: '연결됨', unavailable: '연결 안 됨' }[health.pubmed?.status] || '확인 전');
     const missing = Object.entries(health.inference?.model_files || {}).filter(([, ok]) => !ok).map(([name]) => name);
-    setupNotice(missing.length ? ['모델 파일이 준비되지 않았습니다: ' + missing.join(', '),
-      '프로젝트 폴더에서 아래 명령을 실행한 뒤 이 페이지를 새로고침하세요.'] : null,
-    missing.length ? 'uv run python scripts/prepare_models.py' : '');
+    // People signing in from elsewhere cannot run commands on the server PC.
+    if (!missing.length) setupNotice(null);
+    else if (accounts) setupNotice(['서버에 모델이 아직 준비되지 않았습니다. 서버 관리자에게 알려 주세요.']);
+    else {
+      setupNotice(['모델 파일이 준비되지 않았습니다: ' + missing.join(', '),
+        '프로젝트 폴더에서 아래 명령을 실행한 뒤 이 페이지를 새로고침하세요.'], 'uv run python scripts/prepare_models.py');
+    }
   } catch {
     $('server-status').classList.add('offline');
     $('server-status').lastElementChild.textContent = '서버 연결 끊김';
-    setupNotice(['서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.'],
-      'uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1');
+    if (accounts) setupNotice(['서버에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.']);
+    else {
+      setupNotice(['서버에 연결할 수 없습니다. 서버가 실행 중인지 확인하세요.'],
+        'uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1');
+    }
   }
 }
+
+const SYNC_TEXT = { synced: '서버에 저장됨', syncing: '저장하는 중…', offline: '오프라인 — 연결되면 저장해요',
+  unauthorized: '다시 로그인해 주세요' };
+let syncTimer;
+function showSyncStatus(status) {
+  if (status === 'unauthorized') signIn();
+  clearTimeout(syncTimer);
+  const show = () => {
+    $('sync-status').dataset.state = status;
+    $('sync-text').textContent = SYNC_TEXT[status];
+  };
+  // Most saves reach the server in a moment; only one that takes a while is worth showing.
+  if (status === 'syncing' && $('sync-status').dataset.state === 'synced') syncTimer = setTimeout(show, 800);
+  else show();
+}
+
+function showAccount() {
+  $('account-name').textContent = accounts ? userName : '이 PC 전용';
+  $('account').title = accounts ? '로그인한 계정' : '로그인 없이 이 PC의 서버를 쓰고 있어요';
+  $('account-avatar').textContent = accounts ? [...userName][0].toUpperCase() : '';
+  $('account-avatar').hidden = !accounts;
+  $('local-dot').hidden = accounts;
+  $('logout').hidden = !accounts;
+  $('history-note').textContent = accounts
+    ? '대화 기록은 서버의 내 계정에 저장돼요. 다른 기기에서 로그인해도 이어서 볼 수 있어요.'
+    : '대화 기록은 이 PC에서 실행 중인 서버에 저장돼요.';
+  $('api-docs').hidden = accounts;
+}
+
+$('logout').addEventListener('click', async () => {
+  if (store.busy) { toast('답변이 끝난 뒤에 로그아웃할 수 있어요.'); return; }
+  if (!await sync.flush() && !confirm('아직 서버에 저장하지 못한 변경이 있어요. 로그아웃하면 이 기기에서 사라져요. 그래도 로그아웃할까요?')) return;
+  let response;
+  try { response = await fetch('/api/logout', { method: 'POST' }); }
+  catch { toast('서버에 연결할 수 없어 로그아웃하지 못했어요.'); return; }
+  if (!response.ok && response.status !== 401) { toast('로그아웃하지 못했어요. 잠시 후 다시 시도해 주세요.'); return; }
+  sync.stop();
+  // Nothing more is cached for this user: a save still on its way would bring the history back.
+  store.storage = sync.storage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+  forgetCache(storage, store.storageKey);
+  signIn();
+});
+
+/** History kept in this browser before chats moved to the server is offered once, if the account is empty. */
+async function offerLegacyImport() {
+  if (!sync.ready || sync.serverChats > 0) return;
+  const count = legacyChats(storage).length;
+  if (!count) return;
+  const target = accounts ? '내 계정(' + userName + ')으로' : '이 PC의 서버로';
+  if (!confirm('이 브라우저에 서버 저장 전의 대화 ' + count + '개가 남아 있어요. ' + target + ' 옮길까요?\n\n'
+    + '취소하면 다시 묻지 않아요.')) {
+    skipLegacy(storage);
+    return;
+  }
+  toast('예전 대화를 옮기고 있어요…');
+  try {
+    const result = await importLegacy(store, { fetcher: api, storage,
+      onProgress: (done, total) => toast('예전 대화의 이미지를 올리고 있어요… ' + done + ' / ' + total) });
+    if (!result) return;
+    const kept = result.images - result.uploaded;
+    toast('예전 대화 ' + result.chats + '개를 옮겼어요.'
+      + (kept ? ' 이미지 ' + kept + '장은 올리지 못해 대화 안에 그대로 담았어요.' : ''));
+  } catch { toast('예전 대화를 옮기지 못했어요.'); }
+}
+
+showAccount();
 render();
 checkServer();
 setInterval(checkServer, 15000);
-store.refreshLive();
-setInterval(() => store.refreshLive(), 4000);  // notices when another tab answering a chat closes
+window.addEventListener('online', () => sync.syncNow());
+sync.start().then(async () => {
+  await offerLegacyImport();
+  // Answers found running at load are settled only now that the server said which ones still are.
+  store.refreshLive();
+  setInterval(() => store.refreshLive(), 4000);  // notices when another tab answering a chat closes
+});

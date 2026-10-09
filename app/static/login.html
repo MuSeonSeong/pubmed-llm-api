@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#faf9f6">
+  <title>로그인 · PubMed Chat</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='12' fill='%231c6758'/%3E%3Cpath d='M13 28V12h8a5 5 0 0 1 0 10h-8' fill='none' stroke='white' stroke-width='3'/%3E%3C/svg%3E">
+  <script src="/static/theme.js"></script>
+  <link rel="stylesheet" href="/static/style.css">
+  <script type="module" src="/static/login.mjs"></script>
+</head>
+<body class="login-page">
+  <main class="login-shell">
+    <div class="login-card">
+      <div class="brand login-brand"><span class="brand-mark" aria-hidden="true">p<span>+</span></span><span>PubMed<span class="brand-light"> Chat</span></span></div>
+      <h1>로그인</h1>
+      <p class="login-lead">계정 이름과 비밀번호를 입력해 주세요. 대화 기록은 계정에 저장돼 어느 기기에서든 이어서 볼 수 있어요.</p>
+      <form id="login-form" class="login-form">
+        <label class="field">
+          <span class="field-label">이름</span>
+          <input id="login-name" name="name" type="text" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" maxlength="32" required autofocus>
+        </label>
+        <label class="field">
+          <span class="field-label">비밀번호</span>
+          <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+        </label>
+        <p id="login-error" class="login-error" role="alert" hidden></p>
+        <button id="login-submit" class="primary-button login-submit" type="submit">로그인</button>
+      </form>
+      <p class="login-note">계정은 서버 관리자가 만들어 드려요. 계정이 없거나 비밀번호를 잊었다면 관리자에게 문의해 주세요.</p>
+    </div>
+  </main>
+  <noscript>로그인하려면 브라우저에서 JavaScript를 켜 주세요.</noscript>
+</body>
+</html>
